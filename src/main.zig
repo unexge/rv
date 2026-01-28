@@ -225,10 +225,13 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        // Determine if file is binary
+        const is_binary = git.isBinaryFile(old_content) or git.isBinaryFile(new_content);
+
         try session.addFile(.{
             .path = try allocator.dupe(u8, file_diff.path),
             .diff = file_diff,
-            .is_binary = false,
+            .is_binary = is_binary,
             .old_content = old_content,
             .new_content = new_content,
         });

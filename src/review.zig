@@ -111,29 +111,6 @@ pub const ReviewSession = struct {
         }
     }
 
-    /// Get comments for a specific file
-    pub fn getCommentsForFile(self: *ReviewSession, file_path: []const u8) []Comment {
-        var count: usize = 0;
-        for (self.comments.items) |comment| {
-            if (std.mem.eql(u8, comment.file_path, file_path)) {
-                count += 1;
-            }
-        }
-
-        if (count == 0) return &.{};
-
-        // Return slice of matching comments (caller should not modify)
-        var result = self.allocator.alloc(Comment, count) catch return &.{};
-        var idx: usize = 0;
-        for (self.comments.items) |comment| {
-            if (std.mem.eql(u8, comment.file_path, file_path)) {
-                result[idx] = comment;
-                idx += 1;
-            }
-        }
-        return result;
-    }
-
     /// Export review to markdown format
     pub fn exportMarkdown(self: *ReviewSession, writer: anytype) !void {
         try writer.writeAll("# Code Review\n\n");
@@ -259,4 +236,60 @@ test "exportMarkdown" {
     try std.testing.expect(std.mem.indexOf(u8, result, "**Comments:** 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "`src/main.zig`") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Line 42") != null);
+}
+
+test "removeComment" {
+    const allocator = std.testing.allocator;
+
+    var session = ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Add two comments
+    try session.addComment(.{
+        .file_path = try allocator.dupe(u8, "file1.zig"),
+        .side = .new,
+        .line_start = 1,
+        .line_end = 1,
+        .text = try allocator.dupe(u8, "Comment 1"),
+        .allocator = allocator,
+    });
+    try session.addComment(.{
+        .file_path = try allocator.dupe(u8, "file2.zig"),
+        .side = .old,
+        .line_start = 5,
+        .line_end = 10,
+        .text = try allocator.dupe(u8, "Comment 2"),
+        .allocator = allocator,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), session.comments.items.len);
+
+    // Remove first comment
+    session.removeComment(0);
+    try std.testing.expectEqual(@as(usize, 1), session.comments.items.len);
+    try std.testing.expectEqualStrings("file2.zig", session.comments.items[0].file_path);
+
+    // Remove remaining comment
+    session.removeComment(0);
+    try std.testing.expectEqual(@as(usize, 0), session.comments.items.len);
+
+    // Remove from empty (should be no-op)
+    session.removeComment(0);
+    try std.testing.expectEqual(@as(usize, 0), session.comments.items.len);
+}
+
+test "file navigation" {
+    const allocator = std.testing.allocator;
+
+    var session = ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // No files - currentFile should return null
+    try std.testing.expect(session.currentFile() == null);
+
+    // Navigation with no files should be no-op
+    session.nextFile();
+    session.prevFile();
+    session.goToFile(5);
+    try std.testing.expectEqual(@as(usize, 0), session.current_file_idx);
 }

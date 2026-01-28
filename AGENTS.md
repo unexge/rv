@@ -23,6 +23,7 @@ zig build test         # Run tests
 - Accept allocator as parameter in functions
 - Keep modules focused and testable
 - Use descriptive names
+- Don't create temporary files to pass information to a different process - handle without temporary files
 
 ## Error Handling
 

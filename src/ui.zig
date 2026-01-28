@@ -6,6 +6,14 @@ const difft = @import("difft.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
+// C library functions for popen (same pattern as git.zig)
+// Using popen for shell command execution as it handles pipes and shell features
+const FILE = opaque {};
+extern fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
+extern fn pclose(stream: *FILE) c_int;
+extern fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *FILE) usize;
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
 pub const UIError = error{
     InitFailed,
     RenderFailed,
@@ -15,6 +23,9 @@ pub const UIError = error{
 const Mode = enum {
     normal,
     comment_input,
+    ask_input,
+    ask_pending,
+    ask_response,
     help,
     file_list,
 };
@@ -50,6 +61,19 @@ pub const UI = struct {
     should_quit: bool = false,
     focus_side: review.CommentSide = .new,
     file_list_cursor: usize = 0,
+    // Ask mode state
+    ask_response: ?[]const u8 = null,
+    ask_scroll_offset: usize = 0,
+    ask_context_file: ?[]const u8 = null,
+    ask_context_lines: ?struct { start: u32, end: u32 } = null,
+    project_path: ?[]const u8 = null,
+    // Async ask state
+    ask_thread: ?std.Thread = null,
+    ask_thread_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    ask_thread_result: ?[]const u8 = null,
+    ask_thread_error: ?[]const u8 = null,
+    ask_pending_prompt: ?[]const u8 = null,
+    spinner_frame: usize = 0,
 
     const InputBuffer = struct {
         buffer: [4096]u8 = undefined,
@@ -85,7 +109,15 @@ pub const UI = struct {
         };
     }
 
+    pub fn setProjectPath(self: *UI, path: []const u8) void {
+        self.project_path = path;
+    }
+
     pub fn deinit(self: *UI) void {
+        // Wait for any pending ask thread to complete
+        if (self.ask_thread) |thread| {
+            thread.join();
+        }
         for (self.diff_lines.items) |line| {
             if (line.content.len > 0) self.allocator.free(line.content);
             if (line.changes.len > 0) {
@@ -96,6 +128,18 @@ pub const UI = struct {
             }
         }
         self.diff_lines.deinit(self.allocator);
+        if (self.ask_response) |resp| {
+            self.allocator.free(resp);
+        }
+        if (self.ask_thread_result) |resp| {
+            self.allocator.free(resp);
+        }
+        if (self.ask_thread_error) |err| {
+            self.allocator.free(err);
+        }
+        if (self.ask_pending_prompt) |prompt| {
+            self.allocator.free(prompt);
+        }
     }
 
     /// Duplicate a changes array, allocating new memory for the array and content strings
@@ -405,6 +449,16 @@ pub const UI = struct {
             .key_press => |key| {
                 try self.handleKeyPress(ctx, key);
             },
+            .tick => {
+                // For ask_pending mode, update spinner and request redraw
+                if (self.mode == .ask_pending) {
+                    self.spinner_frame +%= 1;
+                    // Schedule next tick to keep animation going
+                    try ctx.tick(80, self.widget());
+                    // Request redraw to show updated spinner
+                    ctx.redraw = true;
+                }
+            },
             else => {},
         }
     }
@@ -413,6 +467,9 @@ pub const UI = struct {
         switch (self.mode) {
             .normal => try self.handleNormalKey(ctx, key),
             .comment_input => try self.handleCommentInputKey(ctx, key),
+            .ask_input => try self.handleAskInputKey(ctx, key),
+            .ask_pending => self.handleAskPendingKey(ctx, key),
+            .ask_response => self.handleAskResponseKey(ctx, key),
             .help => self.handleHelpKey(ctx, key),
             .file_list => try self.handleFileListKey(ctx, key),
         }
@@ -476,6 +533,24 @@ pub const UI = struct {
                 self.input_buffer.clear();
                 return ctx.consumeAndRedraw();
             },
+            'a' => {
+                self.mode = .ask_input;
+                self.input_buffer.clear();
+                // Store context for the question
+                if (self.session.currentFile()) |file| {
+                    self.ask_context_file = file.path;
+                }
+                const line_start: u32 = @intCast(self.getLineNumber() orelse 1);
+                const line_end: u32 = if (self.selection_start) |sel|
+                    @intCast(self.getLineNumberAt(sel) orelse line_start)
+                else
+                    line_start;
+                self.ask_context_lines = .{
+                    .start = @min(line_start, line_end),
+                    .end = @max(line_start, line_end),
+                };
+                return ctx.consumeAndRedraw();
+            },
             ' ' => {
                 self.toggleSelection();
                 return ctx.consumeAndRedraw();
@@ -526,6 +601,91 @@ pub const UI = struct {
 
         if (cp >= 32 and cp < 127) {
             self.input_buffer.append(@intCast(cp));
+            return ctx.consumeAndRedraw();
+        }
+    }
+
+    fn handleAskInputKey(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        const cp = key.codepoint;
+
+        if (cp == vaxis.Key.escape) {
+            self.mode = .normal;
+            self.input_buffer.clear();
+            self.clearMessage();
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.enter) {
+            if (self.input_buffer.len > 0) {
+                // Switch to pending mode and start the ask request
+                self.mode = .ask_pending;
+                self.spinner_frame = 0;
+                try self.startAskRequest();
+                // Start the spinner tick immediately
+                try ctx.tick(1, self.widget());
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.backspace) {
+            self.input_buffer.backspace();
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp >= 32 and cp < 127) {
+            self.input_buffer.append(@intCast(cp));
+            return ctx.consumeAndRedraw();
+        }
+    }
+
+    fn handleAskPendingKey(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) void {
+        const cp = key.codepoint;
+
+        // Allow escape to cancel - we'll let the thread finish in background
+        // but ignore its result
+        if (cp == vaxis.Key.escape) {
+            // Note: We can't easily kill the thread, so we just switch mode
+            // The thread will complete and its result will be ignored on next ask
+            self.mode = .normal;
+            self.input_buffer.clear();
+            self.clearMessage();
+            self.setMessage("Ask cancelled", false);
+            return ctx.consumeAndRedraw();
+        }
+    }
+
+    fn handleAskResponseKey(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) void {
+        const cp = key.codepoint;
+
+        if (cp == vaxis.Key.escape or cp == 'q') {
+            self.mode = .normal;
+            self.ask_scroll_offset = 0;
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.up) {
+            if (self.ask_scroll_offset > 0) {
+                self.ask_scroll_offset -= 1;
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.down) {
+            self.ask_scroll_offset += 1;
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.page_up) {
+            if (self.ask_scroll_offset >= 20) {
+                self.ask_scroll_offset -= 20;
+            } else {
+                self.ask_scroll_offset = 0;
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.page_down) {
+            self.ask_scroll_offset += 20;
             return ctx.consumeAndRedraw();
         }
     }
@@ -608,6 +768,301 @@ pub const UI = struct {
         self.selection_start = null;
         self.mode = .normal;
         self.setMessage("Comment added", false);
+    }
+
+    fn startAskRequest(self: *UI) !void {
+        // Build the context message for Pi
+        const file_path = self.ask_context_file orelse "unknown";
+        const lines_start = if (self.ask_context_lines) |l| l.start else 1;
+        const lines_end = if (self.ask_context_lines) |l| l.end else 1;
+        const question = self.input_buffer.slice();
+
+        // Get the selected code content
+        var code_content: std.ArrayList(u8) = .empty;
+        defer code_content.deinit(self.allocator);
+
+        for (self.diff_lines.items) |diff_line| {
+            if (diff_line.line_num) |num| {
+                if (num >= lines_start and num <= lines_end) {
+                    const prefix: u8 = switch (diff_line.line_type) {
+                        .addition => '+',
+                        .deletion => '-',
+                        .context => ' ',
+                    };
+                    try code_content.append(self.allocator, prefix);
+                    try code_content.append(self.allocator, ' ');
+                    try code_content.appendSlice(self.allocator, diff_line.content);
+                    try code_content.append(self.allocator, '\n');
+                }
+            }
+        }
+
+        // Build the full prompt with context
+        const line_range = if (lines_start == lines_end)
+            try std.fmt.allocPrint(self.allocator, "line {d}", .{lines_start})
+        else
+            try std.fmt.allocPrint(self.allocator, "lines {d}-{d}", .{ lines_start, lines_end });
+        defer self.allocator.free(line_range);
+
+        const project_info = if (self.project_path) |p| p else ".";
+
+        const prompt = try std.fmt.allocPrint(self.allocator,
+            \\Context: Code review in project "{s}"
+            \\File: {s}
+            \\Selected {s}:
+            \\```
+            \\{s}```
+            \\
+            \\Question: {s}
+            \\
+            \\Please provide a concise response.
+        , .{ project_info, file_path, line_range, code_content.items, question });
+
+        // Store prompt for thread (don't defer free - thread will use it)
+        if (self.ask_pending_prompt) |old| {
+            self.allocator.free(old);
+        }
+        self.ask_pending_prompt = prompt;
+
+        // Reset thread state
+        self.ask_thread_done.store(false, .release);
+        self.ask_thread_result = null;
+        self.ask_thread_error = null;
+        self.spinner_frame = 0;
+
+        // Spawn thread to do the RPC call
+        self.ask_thread = std.Thread.spawn(.{}, askThreadFn, .{self}) catch {
+            self.mode = .normal;
+            self.setMessage("Failed to start ask thread", true);
+            return;
+        };
+    }
+
+    fn askThreadFn(self: *UI) void {
+        const prompt = self.ask_pending_prompt orelse {
+            self.ask_thread_error = self.allocator.dupe(u8, "No prompt available") catch null;
+            self.ask_thread_done.store(true, .release);
+            return;
+        };
+
+        const response = self.callPiRpc(prompt) catch |err| {
+            self.ask_thread_error = std.fmt.allocPrint(self.allocator, "RPC error: {}", .{err}) catch null;
+            self.ask_thread_done.store(true, .release);
+            return;
+        };
+
+        self.ask_thread_result = response;
+        self.ask_thread_done.store(true, .release);
+    }
+
+    fn callPiRpc(self: *UI, prompt: []const u8) ![]const u8 {
+        // Build the JSON command with proper escaping
+        const json_prompt = try self.jsonEscapeString(prompt);
+        defer self.allocator.free(json_prompt);
+
+        // Get pi binary path from environment or use default
+        const pi_bin: []const u8 = if (getenv("RV_PI_BIN")) |env_ptr|
+            std.mem.sliceTo(env_ptr, 0)
+        else
+            "pi";
+
+        // Build the JSON payload
+        var json_buf: std.ArrayList(u8) = .empty;
+        defer json_buf.deinit(self.allocator);
+
+        try json_buf.appendSlice(self.allocator, "{\"type\":\"prompt\",\"message\":");
+        try json_buf.appendSlice(self.allocator, json_prompt);
+        try json_buf.appendSlice(self.allocator, "}\n");
+
+        // Base64 encode JSON to avoid shell escaping issues
+        const base64 = std.base64.standard;
+        const encoded_len = base64.Encoder.calcSize(json_buf.items.len);
+        const encoded = try self.allocator.alloc(u8, encoded_len);
+        defer self.allocator.free(encoded);
+        _ = base64.Encoder.encode(encoded, json_buf.items);
+
+        // Use base64 decode piped to pi - no temp file needed
+        const cmd = try std.fmt.allocPrint(self.allocator, "echo '{s}' | base64 -d | {s} --mode rpc --no-session 2>&1", .{ encoded, pi_bin });
+        defer self.allocator.free(cmd);
+
+        const cmd_z = try self.allocator.dupeZ(u8, cmd);
+        defer self.allocator.free(cmd_z);
+
+        // Use popen to run the command (consistent with git.zig pattern)
+        const fp = popen(cmd_z.ptr, "r") orelse {
+            return try std.fmt.allocPrint(self.allocator, "Failed to start Pi (popen failed)\nCommand: {s}", .{pi_bin});
+        };
+        defer _ = pclose(fp);
+
+        // Read all output
+        var response_text: std.ArrayList(u8) = .empty;
+        defer response_text.deinit(self.allocator);
+
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = fread(&buf, 1, buf.len, fp);
+            if (n == 0) break;
+            try response_text.appendSlice(self.allocator, buf[0..n]);
+        }
+
+        // Check if we got any output at all
+        if (response_text.items.len == 0) {
+            return try std.fmt.allocPrint(self.allocator, "No output from Pi.\nBinary: {s}\nMake sure 'pi' is installed and accessible.", .{pi_bin});
+        }
+
+        // Check for error responses from Pi
+        var has_error: bool = false;
+        var error_message: ?[]const u8 = null;
+
+        // Parse the response - look for text_delta events and concatenate
+        var final_response: std.ArrayList(u8) = .empty;
+        errdefer final_response.deinit(self.allocator);
+
+        var lines = std.mem.splitScalar(u8, response_text.items, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+
+            // Check for error response
+            if (std.mem.indexOf(u8, line, "\"success\":false")) |_| {
+                has_error = true;
+                // Try to extract error message
+                if (std.mem.indexOf(u8, line, "\"error\":\"")) |err_start| {
+                    const content_start = err_start + 9;
+                    var end = content_start;
+                    while (end < line.len and line[end] != '"') : (end += 1) {}
+                    error_message = line[content_start..end];
+                }
+            }
+
+            // Look for text_delta in message_update events
+            if (std.mem.indexOf(u8, line, "\"text_delta\"")) |_| {
+                // Extract the delta value
+                if (std.mem.indexOf(u8, line, "\"delta\":\"")) |delta_start| {
+                    const content_start = delta_start + 9;
+                    var end = content_start;
+                    var escape_next = false;
+                    while (end < line.len) : (end += 1) {
+                        if (escape_next) {
+                            escape_next = false;
+                            continue;
+                        }
+                        if (line[end] == '\\') {
+                            escape_next = true;
+                            continue;
+                        }
+                        if (line[end] == '"') break;
+                    }
+                    const delta = line[content_start..end];
+                    // Unescape the JSON string
+                    const unescaped = try self.jsonUnescapeString(delta);
+                    defer self.allocator.free(unescaped);
+                    try final_response.appendSlice(self.allocator, unescaped);
+                }
+            }
+        }
+
+        // If we got an error, report it
+        if (has_error) {
+            if (error_message) |msg| {
+                return try std.fmt.allocPrint(self.allocator, "Pi returned an error:\n{s}", .{msg});
+            }
+            return try self.allocator.dupe(u8, "Pi returned an error (unknown)");
+        }
+
+        if (final_response.items.len == 0) {
+            // Show first part of raw output for debugging
+            const preview_len = @min(response_text.items.len, 500);
+            return try std.fmt.allocPrint(self.allocator, 
+                "No text response found in Pi output.\n\nRaw output preview ({d} bytes total):\n{s}{s}", 
+                .{ 
+                    response_text.items.len, 
+                    response_text.items[0..preview_len],
+                    if (response_text.items.len > 500) "\n..." else ""
+                });
+        }
+
+        return try final_response.toOwnedSlice(self.allocator);
+    }
+
+    fn jsonEscapeString(self: *UI, s: []const u8) ![]const u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(self.allocator);
+
+        try result.append(self.allocator, '"');
+        for (s) |c| {
+            switch (c) {
+                '"' => try result.appendSlice(self.allocator, "\\\""),
+                '\\' => try result.appendSlice(self.allocator, "\\\\"),
+                '\n' => try result.appendSlice(self.allocator, "\\n"),
+                '\r' => try result.appendSlice(self.allocator, "\\r"),
+                '\t' => try result.appendSlice(self.allocator, "\\t"),
+                else => {
+                    if (c < 0x20) {
+                        try result.appendSlice(self.allocator, "\\u00");
+                        const hex = "0123456789abcdef";
+                        try result.append(self.allocator, hex[c >> 4]);
+                        try result.append(self.allocator, hex[c & 0xf]);
+                    } else {
+                        try result.append(self.allocator, c);
+                    }
+                },
+            }
+        }
+        try result.append(self.allocator, '"');
+
+        return try result.toOwnedSlice(self.allocator);
+    }
+
+    fn jsonUnescapeString(self: *UI, s: []const u8) ![]const u8 {
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < s.len) {
+            if (s[i] == '\\' and i + 1 < s.len) {
+                switch (s[i + 1]) {
+                    'n' => {
+                        try result.append(self.allocator, '\n');
+                        i += 2;
+                    },
+                    'r' => {
+                        try result.append(self.allocator, '\r');
+                        i += 2;
+                    },
+                    't' => {
+                        try result.append(self.allocator, '\t');
+                        i += 2;
+                    },
+                    '"' => {
+                        try result.append(self.allocator, '"');
+                        i += 2;
+                    },
+                    '\\' => {
+                        try result.append(self.allocator, '\\');
+                        i += 2;
+                    },
+                    'u' => {
+                        // Handle \uXXXX
+                        if (i + 5 < s.len) {
+                            // Simple handling - just skip for now
+                            i += 6;
+                        } else {
+                            try result.append(self.allocator, s[i]);
+                            i += 1;
+                        }
+                    },
+                    else => {
+                        try result.append(self.allocator, s[i]);
+                        i += 1;
+                    },
+                }
+            } else {
+                try result.append(self.allocator, s[i]);
+                i += 1;
+            }
+        }
+
+        return try result.toOwnedSlice(self.allocator);
     }
 
     fn getLineNumber(self: *UI) ?usize {
@@ -753,6 +1208,8 @@ pub const UI = struct {
         return switch (self.mode) {
             .help => self.drawHelp(ctx),
             .file_list => self.drawFileList(ctx),
+            .ask_pending => self.drawAskPending(ctx),
+            .ask_response => self.drawAskResponse(ctx),
             else => self.drawMainView(ctx),
         };
     }
@@ -1033,8 +1490,13 @@ pub const UI = struct {
                 writeString(surface, 9, footer_row, self.input_buffer.slice(), .{});
                 writeString(surface, 0, status_row, "[Enter] submit  [Esc] cancel", dim_style);
             },
+            .ask_input => {
+                writeString(surface, 0, footer_row, "Ask Pi: ", .{ .bold = true, .fg = .{ .rgb = .{ 0xaf, 0x5f, 0xff } } });
+                writeString(surface, 8, footer_row, self.input_buffer.slice(), .{});
+                writeString(surface, 0, status_row, "[Enter] ask  [Esc] cancel", dim_style);
+            },
             else => {
-                writeString(surface, 0, footer_row, "[↑↓] nav  [←→] files  [f/p] page  [c] comment  [Space] select  [l] list  [q] quit  [?] help", dim_style);
+                writeString(surface, 0, footer_row, "[↑↓] nav  [←→] files  [c] comment  [a] ask  [Space] select  [l] list  [q] quit  [?] help", dim_style);
 
                 if (self.message) |msg| {
                     const msg_style: vaxis.Style = .{
@@ -1077,6 +1539,7 @@ pub const UI = struct {
             "",
             "  Actions:",
             "    c                   Add comment at cursor",
+            "    a                   Ask Pi about selected lines",
             "    Space               Start/end line selection",
             "    q                   Quit and export markdown",
             "    ?                   Toggle this help",
@@ -1130,6 +1593,145 @@ pub const UI = struct {
             .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
         };
         writeString(&surface, 2, @intCast(size.height -| 1), "[↑↓] navigate  [Enter] select  [l/Esc] close", dim_style);
+
+        return surface;
+    }
+
+    fn drawAskPending(self: *UI, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+        // Check if thread completed (poll on every draw)
+        if (self.ask_thread_done.load(.acquire)) {
+            // Thread completed, get result
+            if (self.ask_thread) |thread| {
+                thread.join();
+                self.ask_thread = null;
+            }
+            
+            if (self.ask_thread_error) |err| {
+                if (self.ask_response) |old| {
+                    self.allocator.free(old);
+                }
+                self.ask_response = err;
+                self.ask_thread_error = null;
+            } else if (self.ask_thread_result) |result| {
+                if (self.ask_response) |old| {
+                    self.allocator.free(old);
+                }
+                self.ask_response = result;
+                self.ask_thread_result = null;
+            }
+            
+            if (self.ask_pending_prompt) |prompt| {
+                self.allocator.free(prompt);
+                self.ask_pending_prompt = null;
+            }
+            self.ask_thread_done.store(false, .release);
+            
+            self.ask_scroll_offset = 0;
+            self.mode = .ask_response;
+            self.input_buffer.clear();
+            self.selection_start = null;
+            
+            // Draw the response instead
+            return self.drawAskResponse(ctx);
+        }
+
+        const size = ctx.max.size();
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
+
+        const header_style: vaxis.Style = .{
+            .bg = .{ .rgb = .{ 0x5f, 0x00, 0xaf } }, // Purple background
+            .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } },
+            .bold = true,
+        };
+        fillRow(&surface, 0, ' ', header_style);
+        writeString(&surface, 1, 0, "Ask Pi", header_style);
+
+        const center_row = size.height / 2;
+        
+        // Static loading message with dots
+        writeString(&surface, 2, center_row - 1, "⏳ Asking Pi...", .{ 
+            .bold = true,
+            .fg = .{ .rgb = .{ 0xaf, 0x5f, 0xff } }, // Purple text
+        });
+        writeString(&surface, 2, center_row + 1, "Please wait for response", .{
+            .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
+        });
+
+        const dim_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
+        };
+        writeString(&surface, 2, @intCast(size.height -| 1), "[Esc] cancel", dim_style);
+
+        return surface;
+    }
+
+    fn drawAskResponse(self: *UI, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+        const size = ctx.max.size();
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
+
+        // Header
+        const header_style: vaxis.Style = .{
+            .bg = .{ .rgb = .{ 0x5f, 0x00, 0xaf } }, // Purple background
+            .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } },
+            .bold = true,
+        };
+        fillRow(&surface, 0, ' ', header_style);
+
+        var header_buf: [128]u8 = undefined;
+        const file_info = self.ask_context_file orelse "unknown";
+        const lines_info = if (self.ask_context_lines) |l|
+            if (l.start == l.end)
+                std.fmt.bufPrint(&header_buf, " Pi Response - {s}:{d}", .{ file_info, l.start }) catch " Pi Response"
+            else
+                std.fmt.bufPrint(&header_buf, " Pi Response - {s}:{d}-{d}", .{ file_info, l.start, l.end }) catch " Pi Response"
+        else
+            " Pi Response";
+
+        writeString(&surface, 0, 0, lines_info, header_style);
+
+        // Content area
+        const content_height = size.height -| 2;
+        const response = self.ask_response orelse "(No response)";
+
+        // Split response into lines
+        var lines: std.ArrayList([]const u8) = .empty;
+        defer lines.deinit(ctx.arena);
+
+        var line_iter = std.mem.splitScalar(u8, response, '\n');
+        while (line_iter.next()) |line| {
+            // Word wrap long lines
+            if (line.len > size.width -| 4) {
+                var start: usize = 0;
+                while (start < line.len) {
+                    const end = @min(start + size.width -| 4, line.len);
+                    lines.append(ctx.arena, line[start..end]) catch break;
+                    start = end;
+                }
+            } else {
+                lines.append(ctx.arena, line) catch break;
+            }
+        }
+
+        // Clamp scroll offset
+        if (lines.items.len > 0 and self.ask_scroll_offset >= lines.items.len) {
+            self.ask_scroll_offset = lines.items.len - 1;
+        }
+
+        // Draw visible lines
+        var row: u16 = 1;
+        var line_idx = self.ask_scroll_offset;
+        while (row < content_height and line_idx < lines.items.len) : ({
+            row += 1;
+            line_idx += 1;
+        }) {
+            writeString(&surface, 2, row, lines.items[line_idx], .{});
+        }
+
+        // Footer
+        const dim_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
+        };
+        writeString(&surface, 2, @intCast(size.height -| 1), "[↑↓/PgUp/PgDn] scroll  [Esc/q] close", dim_style);
 
         return surface;
     }

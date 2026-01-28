@@ -2,7 +2,7 @@
 
 A local code review tool for the agentic world.
 
-rv shows changes using [Difftastic](https://github.com/Wilfred/difftastic) per file, allows you to add comments, and exports them as a markdown file for the agent to iterate.
+rv shows changes using [Difftastic](https://github.com/Wilfred/difftastic) per file, allows you to add comments, ask questions to [Pi](https://github.com/badlogic/pi-mono), and exports them as a markdown file for the agent to iterate.
 
 ## Build
 

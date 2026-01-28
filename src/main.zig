@@ -250,6 +250,9 @@ pub fn main(init: std.process.Init) !void {
     var tui = ui.UI.init(allocator, &session);
     defer tui.deinit();
 
+    // Set the project path for ask context
+    tui.setProjectPath(repo_root);
+
     var run_error: ?anyerror = null;
     tui.run(init) catch |err| {
         run_error = err;

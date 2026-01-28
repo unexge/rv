@@ -6,6 +6,31 @@ extern fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
 extern fn pclose(stream: *FILE) c_int;
 extern fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *FILE) usize;
 
+/// Escape a string for use in shell double quotes
+fn escapeForShell(allocator: Allocator, input: []const u8) Allocator.Error![]const u8 {
+    // Count special characters that need escaping in double quotes: $ ` \ " !
+    var special_count: usize = 0;
+    for (input) |c| {
+        if (c == '$' or c == '`' or c == '\\' or c == '"' or c == '!') {
+            special_count += 1;
+        }
+    }
+    
+    if (special_count == 0) return try allocator.dupe(u8, input);
+    
+    var result = try allocator.alloc(u8, input.len + special_count);
+    var i: usize = 0;
+    for (input) |c| {
+        if (c == '$' or c == '`' or c == '\\' or c == '"' or c == '!') {
+            result[i] = '\\';
+            i += 1;
+        }
+        result[i] = c;
+        i += 1;
+    }
+    return result;
+}
+
 pub const FileStatus = enum {
     modified,
     added,
@@ -38,7 +63,7 @@ pub const GitError = error{
 } || Allocator.Error;
 
 /// Run a command and capture its output using popen
-fn runCommand(allocator: Allocator, cmd: []const u8) GitError!struct { stdout: []u8, exit_code: u8 } {
+pub fn runCommand(allocator: Allocator, cmd: []const u8) GitError!struct { stdout: []u8, exit_code: u8 } {
     const cmd_z = allocator.dupeZ(u8, cmd) catch return GitError.CommandFailed;
     defer allocator.free(cmd_z);
 
@@ -61,9 +86,12 @@ fn runCommand(allocator: Allocator, cmd: []const u8) GitError!struct { stdout: [
     };
 }
 
-/// Read file content from the filesystem using cat
+/// Read file content from the filesystem
 pub fn readFileContent(allocator: Allocator, path: []const u8) GitError![]const u8 {
-    const cmd = std.fmt.allocPrint(allocator, "cat '{s}' 2>/dev/null", .{path}) catch return GitError.CommandFailed;
+    const escaped_path = try escapeForShell(allocator, path);
+    defer allocator.free(escaped_path);
+    
+    const cmd = std.fmt.allocPrint(allocator, "cat \"{s}\" 2>/dev/null", .{escaped_path}) catch return GitError.CommandFailed;
     defer allocator.free(cmd);
 
     const result = try runCommand(allocator, cmd);
@@ -160,15 +188,18 @@ pub fn runGitDiffWithDifft(
     }
 
     for (changed_files.items) |file| {
+        const escaped_file = try escapeForShell(allocator, file);
+        defer allocator.free(escaped_file);
+
         var difft_cmd: std.ArrayList(u8) = .empty;
         defer difft_cmd.deinit(allocator);
 
         try difft_cmd.appendSlice(allocator, "bash -c 'DFT_UNSTABLE=yes difft --display json <(git show ");
         try difft_cmd.appendSlice(allocator, rev);
         try difft_cmd.appendSlice(allocator, ":\"");
-        try difft_cmd.appendSlice(allocator, file);
+        try difft_cmd.appendSlice(allocator, escaped_file);
         try difft_cmd.appendSlice(allocator, "\") \"");
-        try difft_cmd.appendSlice(allocator, file);
+        try difft_cmd.appendSlice(allocator, escaped_file);
         try difft_cmd.appendSlice(allocator, "\" 2>/dev/null' 2>/dev/null");
 
         const difft_cmd_str = try difft_cmd.toOwnedSlice(allocator);
@@ -245,27 +276,14 @@ fn parseNameStatus(allocator: Allocator, output: []const u8) GitError![]ChangedF
 
 /// Get the contents of a file at a specific revision
 pub fn getFileAtRevision(allocator: Allocator, path: []const u8, rev: []const u8) GitError!?[]const u8 {
-    const cmd = try std.fmt.allocPrint(allocator, "git show {s}:{s} 2>/dev/null", .{ rev, path });
+    const escaped_path = try escapeForShell(allocator, path);
+    defer allocator.free(escaped_path);
+    
+    const cmd = try std.fmt.allocPrint(allocator, "git show \"{s}:{s}\" 2>/dev/null", .{ rev, escaped_path });
     defer allocator.free(cmd);
 
     const result = runCommand(allocator, cmd) catch return null;
     return result.stdout;
-}
-
-/// Get the current working directory file contents
-pub fn getWorkingFile(allocator: Allocator, repo_root: []const u8, path: []const u8) !?[]const u8 {
-    const full_path = try std.fs.path.join(allocator, &.{ repo_root, path });
-    defer allocator.free(full_path);
-
-    const file = std.fs.openFileAbsolute(full_path, .{}) catch |err| {
-        if (err == error.FileNotFound) return null;
-        return err;
-    };
-    defer file.close();
-
-    return file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch |err| {
-        return err;
-    };
 }
 
 /// Check if a file is binary
@@ -299,4 +317,36 @@ test "isBinaryFile" {
     try std.testing.expect(!isBinaryFile("hello world"));
     try std.testing.expect(isBinaryFile("hello\x00world"));
     try std.testing.expect(!isBinaryFile(""));
+}
+
+test "escapeForShell" {
+    const allocator = std.testing.allocator;
+    
+    // No special characters
+    {
+        const result = try escapeForShell(allocator, "simple.txt");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("simple.txt", result);
+    }
+    
+    // Double quotes
+    {
+        const result = try escapeForShell(allocator, "file\"name.txt");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("file\\\"name.txt", result);
+    }
+    
+    // Dollar sign
+    {
+        const result = try escapeForShell(allocator, "file$name.txt");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("file\\$name.txt", result);
+    }
+    
+    // Multiple special chars
+    {
+        const result = try escapeForShell(allocator, "a\"b$c`d\\e!f");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("a\\\"b\\$c\\`d\\\\e\\!f", result);
+    }
 }

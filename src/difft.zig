@@ -1,14 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = std.json;
-const Io = std.Io;
-const Dir = Io.Dir;
-const File = Io.File;
 
-const FILE = opaque {};
-extern fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
-extern fn pclose(stream: *FILE) c_int;
-extern fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *FILE) usize;
+const git = @import("git.zig");
 
 pub const Highlight = enum {
     normal,
@@ -77,37 +71,10 @@ pub const DifftError = error{
     PipeFailed,
 } || Allocator.Error;
 
-/// Run a command using popen
+/// Run a command and return stdout, using git.runCommand internally
 fn runCommand(allocator: Allocator, cmd: []const u8) DifftError![]u8 {
-    const cmd_z = allocator.dupeZ(u8, cmd) catch return DifftError.CommandFailed;
-    defer allocator.free(cmd_z);
-
-    const fp = popen(cmd_z.ptr, "r") orelse return DifftError.PipeFailed;
-
-    var output: std.ArrayList(u8) = .empty;
-
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = fread(&buf, 1, buf.len, fp);
-        if (n == 0) break;
-        output.appendSlice(allocator, buf[0..n]) catch {
-            output.deinit(allocator);
-            _ = pclose(fp);
-            return DifftError.CommandFailed;
-        };
-    }
-
-    // Check exit status - pclose returns the child's exit status shifted
-    // On macOS, the actual exit code is in bits 8-15
-    const raw_status = pclose(fp);
-    const exit_code = @as(c_int, @intCast((raw_status >> 8) & 0xFF));
-
-    if (raw_status < 0 or exit_code > 1) {
-        output.deinit(allocator);
-        return DifftError.CommandFailed;
-    }
-
-    return output.toOwnedSlice(allocator);
+    const result = git.runCommand(allocator, cmd) catch return DifftError.CommandFailed;
+    return result.stdout;
 }
 
 /// Check if difft is installed
@@ -117,17 +84,6 @@ pub fn checkInstalled(allocator: Allocator) !bool {
     };
     defer allocator.free(result);
     return result.len > 0;
-}
-
-/// Run difft on two files and return parsed diff
-pub fn runDifft(allocator: Allocator, old_path: []const u8, new_path: []const u8) DifftError!FileDiff {
-    const cmd = try std.fmt.allocPrint(allocator, "DFT_UNSTABLE=yes difft --display json '{s}' '{s}' 2>/dev/null", .{ old_path, new_path });
-    defer allocator.free(cmd);
-
-    const result = try runCommand(allocator, cmd);
-    defer allocator.free(result);
-
-    return parseJson(allocator, result, new_path);
 }
 
 /// Parse multiple file diffs from git's external diff output (one or more JSON objects)
@@ -284,201 +240,6 @@ pub fn parseGitDiffOutput(allocator: Allocator, json_output: []const u8) DifftEr
     return diffs.toOwnedSlice(allocator);
 }
 
-/// Run difft comparing old content with new file
-pub fn runDifftWithContent(
-    allocator: Allocator,
-    io: Io,
-    old_content: []const u8,
-    new_path: []const u8,
-    language_hint: ?[]const u8,
-) DifftError!FileDiff {
-    const ext_suffix = if (language_hint) |ext| ext else "tmp";
-
-    var tmp_name_buf: [128]u8 = undefined;
-    const tmp_name = std.fmt.bufPrint(&tmp_name_buf, "/tmp/rv_old_content.{s}", .{ext_suffix}) catch return DifftError.CommandFailed;
-
-    const file = Dir.createFileAbsolute(io, tmp_name, .{}) catch return DifftError.CommandFailed;
-    defer Dir.deleteFileAbsolute(io, tmp_name) catch {};
-
-    var write_buf: [4096]u8 = undefined;
-    var writer: File.Writer = .init(file, io, &write_buf);
-    writer.interface.writeAll(old_content) catch {
-        file.close(io);
-        return DifftError.CommandFailed;
-    };
-    writer.flush() catch {};
-    file.close(io);
-
-    return runDifft(allocator, tmp_name, new_path);
-}
-
-/// Run difft comparing two content strings (for commit review)
-pub fn runDifftWithContents(
-    allocator: Allocator,
-    io: Io,
-    old_content: []const u8,
-    new_content: []const u8,
-    language_hint: ?[]const u8,
-    fallback_path: []const u8,
-) DifftError!FileDiff {
-    const ext_suffix = if (language_hint) |ext| ext else "tmp";
-
-    var old_tmp_buf: [128]u8 = undefined;
-    const old_tmp_name = std.fmt.bufPrint(&old_tmp_buf, "/tmp/rv_old_content.{s}", .{ext_suffix}) catch return DifftError.CommandFailed;
-
-    const old_file = Dir.createFileAbsolute(io, old_tmp_name, .{}) catch return DifftError.CommandFailed;
-    defer Dir.deleteFileAbsolute(io, old_tmp_name) catch {};
-    {
-        var old_write_buf: [4096]u8 = undefined;
-        var writer: File.Writer = .init(old_file, io, &old_write_buf);
-        writer.interface.writeAll(old_content) catch {
-            old_file.close(io);
-            return DifftError.CommandFailed;
-        };
-        writer.flush() catch {};
-    }
-    old_file.close(io);
-
-    var new_tmp_buf: [128]u8 = undefined;
-    const new_tmp_name = std.fmt.bufPrint(&new_tmp_buf, "/tmp/rv_new_content.{s}", .{ext_suffix}) catch return DifftError.CommandFailed;
-
-    const new_file = Dir.createFileAbsolute(io, new_tmp_name, .{}) catch return DifftError.CommandFailed;
-    defer Dir.deleteFileAbsolute(io, new_tmp_name) catch {};
-    {
-        var new_write_buf: [4096]u8 = undefined;
-        var writer: File.Writer = .init(new_file, io, &new_write_buf);
-        writer.interface.writeAll(new_content) catch {
-            new_file.close(io);
-            return DifftError.CommandFailed;
-        };
-        writer.flush() catch {};
-    }
-    new_file.close(io);
-
-    var diff = try runDifft(allocator, old_tmp_name, new_tmp_name);
-
-    allocator.free(diff.path);
-    diff.path = try allocator.dupe(u8, fallback_path);
-
-    return diff;
-}
-
-fn parseJson(allocator: Allocator, json_str: []const u8, fallback_path: []const u8) DifftError!FileDiff {
-    if (json_str.len == 0) {
-        return FileDiff{
-            .path = try allocator.dupe(u8, fallback_path),
-            .language = try allocator.dupe(u8, ""),
-            .status = .changed,
-            .chunks = &.{},
-            .allocator = allocator,
-        };
-    }
-
-    const parsed = json.parseFromSlice(json.Value, allocator, json_str, .{}) catch {
-        return DifftError.InvalidJson;
-    };
-    defer parsed.deinit();
-
-    const root = parsed.value;
-
-    const file_obj = switch (root) {
-        .object => |obj| obj,
-        .array => |arr| blk: {
-            if (arr.items.len == 0) {
-                return FileDiff{
-                    .path = try allocator.dupe(u8, fallback_path),
-                    .language = try allocator.dupe(u8, ""),
-                    .status = .changed,
-                    .chunks = &.{},
-                    .allocator = allocator,
-                };
-            }
-            break :blk arr.items[0].object;
-        },
-        else => return DifftError.InvalidJson,
-    };
-
-    const path = if (file_obj.get("path")) |p|
-        try allocator.dupe(u8, p.string)
-    else
-        try allocator.dupe(u8, fallback_path);
-
-    const language = if (file_obj.get("language")) |l|
-        try allocator.dupe(u8, l.string)
-    else
-        try allocator.dupe(u8, "Text");
-
-    const status: DiffStatus = if (file_obj.get("status")) |s| blk: {
-        const status_str = s.string;
-        if (std.mem.eql(u8, status_str, "added")) break :blk .added;
-        if (std.mem.eql(u8, status_str, "removed")) break :blk .removed;
-        break :blk .changed;
-    } else .changed;
-
-    const chunks_json = file_obj.get("chunks") orelse {
-        return FileDiff{
-            .path = path,
-            .language = language,
-            .status = status,
-            .chunks = &.{},
-            .allocator = allocator,
-        };
-    };
-
-    var chunks: std.ArrayList([]const DiffEntry) = .empty;
-    errdefer {
-        for (chunks.items) |chunk| {
-            for (chunk) |entry| {
-                if (entry.lhs) |lhs| {
-                    for (lhs.changes) |change| {
-                        allocator.free(change.content);
-                    }
-                    allocator.free(lhs.changes);
-                }
-                if (entry.rhs) |rhs| {
-                    for (rhs.changes) |change| {
-                        allocator.free(change.content);
-                    }
-                    allocator.free(rhs.changes);
-                }
-            }
-            allocator.free(chunk);
-        }
-        chunks.deinit(allocator);
-    }
-
-    for (chunks_json.array.items) |chunk_json| {
-        var entries: std.ArrayList(DiffEntry) = .empty;
-        errdefer entries.deinit(allocator);
-
-        for (chunk_json.array.items) |entry_json| {
-            const entry_obj = entry_json.object;
-
-            const lhs = if (entry_obj.get("lhs")) |lhs_json|
-                try parseSide(allocator, lhs_json)
-            else
-                null;
-
-            const rhs = if (entry_obj.get("rhs")) |rhs_json|
-                try parseSide(allocator, rhs_json)
-            else
-                null;
-
-            try entries.append(allocator, .{ .lhs = lhs, .rhs = rhs });
-        }
-
-        try chunks.append(allocator, try entries.toOwnedSlice(allocator));
-    }
-
-    return FileDiff{
-        .path = path,
-        .language = language,
-        .status = status,
-        .chunks = try chunks.toOwnedSlice(allocator),
-        .allocator = allocator,
-    };
-}
-
 fn parseSide(allocator: Allocator, side_json: json.Value) DifftError!Side {
     const side_obj = side_json.object;
 
@@ -549,19 +310,16 @@ test "getExtension" {
     try std.testing.expect(getExtension("Makefile") == null);
 }
 
-test "parseJson empty" {
+test "parseGitDiffOutput empty" {
     const allocator = std.testing.allocator;
-    var diff = try parseJson(allocator, "", "test.zig");
-    defer diff.deinit();
-
-    try std.testing.expectEqualStrings("test.zig", diff.path);
-    try std.testing.expectEqual(@as(usize, 0), diff.chunks.len);
+    const diffs = try parseGitDiffOutput(allocator, "");
+    try std.testing.expectEqual(@as(usize, 0), diffs.len);
 }
 
-test "parseJson simple" {
+test "parseGitDiffOutput simple" {
     const allocator = std.testing.allocator;
     const json_input =
-        \\[{
+        \\{
         \\  "path": "src/main.zig",
         \\  "language": "Zig",
         \\  "status": "changed",
@@ -571,14 +329,20 @@ test "parseJson simple" {
         \\      "rhs": {"line_number": 1, "changes": [{"start": 0, "end": 5, "content": "world", "highlight": "novel"}]}
         \\    }
         \\  ]]
-        \\}]
+        \\}
     ;
 
-    var diff = try parseJson(allocator, json_input, "fallback.zig");
-    defer diff.deinit();
+    const diffs = try parseGitDiffOutput(allocator, json_input);
+    defer {
+        for (@constCast(diffs)) |*diff| {
+            diff.deinit();
+        }
+        allocator.free(diffs);
+    }
 
-    try std.testing.expectEqualStrings("src/main.zig", diff.path);
-    try std.testing.expectEqualStrings("Zig", diff.language);
-    try std.testing.expectEqual(DiffStatus.changed, diff.status);
-    try std.testing.expectEqual(@as(usize, 1), diff.chunks.len);
+    try std.testing.expectEqual(@as(usize, 1), diffs.len);
+    try std.testing.expectEqualStrings("src/main.zig", diffs[0].path);
+    try std.testing.expectEqualStrings("Zig", diffs[0].language);
+    try std.testing.expectEqual(DiffStatus.changed, diffs[0].status);
+    try std.testing.expectEqual(@as(usize, 1), diffs[0].chunks.len);
 }

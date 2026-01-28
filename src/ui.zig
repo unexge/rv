@@ -88,13 +88,41 @@ pub const UI = struct {
     pub fn deinit(self: *UI) void {
         for (self.diff_lines.items) |line| {
             if (line.content.len > 0) self.allocator.free(line.content);
+            if (line.changes.len > 0) {
+                for (line.changes) |change| {
+                    if (change.content.len > 0) self.allocator.free(change.content);
+                }
+                self.allocator.free(line.changes);
+            }
         }
         self.diff_lines.deinit(self.allocator);
+    }
+
+    /// Duplicate a changes array, allocating new memory for the array and content strings
+    fn dupeChanges(self: *UI, changes: []const difft.Change) ![]const difft.Change {
+        if (changes.len == 0) return &.{};
+
+        const new_changes = try self.allocator.alloc(difft.Change, changes.len);
+        for (changes, 0..) |change, i| {
+            new_changes[i] = .{
+                .start = change.start,
+                .end = change.end,
+                .content = try self.allocator.dupe(u8, change.content),
+                .highlight = change.highlight,
+            };
+        }
+        return new_changes;
     }
 
     pub fn buildDiffLines(self: *UI) !void {
         for (self.diff_lines.items) |line| {
             if (line.content.len > 0) self.allocator.free(line.content);
+            if (line.changes.len > 0) {
+                for (line.changes) |change| {
+                    if (change.content.len > 0) self.allocator.free(change.content);
+                }
+                self.allocator.free(line.changes);
+            }
         }
         self.diff_lines.clearRetainingCapacity();
 
@@ -230,34 +258,51 @@ pub const UI = struct {
                         continue;
                     }
 
-                    // Compute which parts were deleted/added by comparing old and new content
-                    const deleted_range = computeDeletedRange(old_content, new_content);
-                    const added_range = computeAddedRange(old_content, new_content);
-
-                    // Create changes array for the deleted range
+                    // Use difftastic's semantic changes if available, otherwise compute our own
                     var deleted_changes: []const difft.Change = &.{};
-                    if (deleted_range.start < deleted_range.end) {
-                        const change_array = try self.allocator.alloc(difft.Change, 1);
-                        change_array[0] = .{
-                            .start = deleted_range.start,
-                            .end = deleted_range.end,
-                            .content = "",
-                            .highlight = .novel,
-                        };
-                        deleted_changes = change_array;
+                    var added_changes: []const difft.Change = &.{};
+                    var is_partial_deletion = false;
+                    var is_partial_addition = false;
+
+                    if (entry.lhs.?.changes.len > 0) {
+                        // Use difftastic's semantic highlighting - copy the changes array
+                        deleted_changes = try self.dupeChanges(entry.lhs.?.changes);
+                        // Check if the changes cover the whole line or just parts
+                        is_partial_deletion = isPartialChange(old_content, entry.lhs.?.changes);
+                    } else {
+                        // Fallback: compute which parts were deleted
+                        const deleted_range = computeDeletedRange(old_content, new_content);
+                        if (deleted_range.start < deleted_range.end) {
+                            const change_array = try self.allocator.alloc(difft.Change, 1);
+                            change_array[0] = .{
+                                .start = deleted_range.start,
+                                .end = deleted_range.end,
+                                .content = try self.allocator.dupe(u8, ""),
+                                .highlight = .novel,
+                            };
+                            deleted_changes = change_array;
+                            is_partial_deletion = deleted_range.start > 0 or deleted_range.end < old_content.len;
+                        }
                     }
 
-                    // Create changes array for the added range
-                    var added_changes: []const difft.Change = &.{};
-                    if (added_range.start < added_range.end) {
-                        const change_array = try self.allocator.alloc(difft.Change, 1);
-                        change_array[0] = .{
-                            .start = added_range.start,
-                            .end = added_range.end,
-                            .content = "",
-                            .highlight = .novel,
-                        };
-                        added_changes = change_array;
+                    if (entry.rhs.?.changes.len > 0) {
+                        // Use difftastic's semantic highlighting - copy the changes array
+                        added_changes = try self.dupeChanges(entry.rhs.?.changes);
+                        is_partial_addition = isPartialChange(new_content, entry.rhs.?.changes);
+                    } else {
+                        // Fallback: compute which parts were added
+                        const added_range = computeAddedRange(old_content, new_content);
+                        if (added_range.start < added_range.end) {
+                            const change_array = try self.allocator.alloc(difft.Change, 1);
+                            change_array[0] = .{
+                                .start = added_range.start,
+                                .end = added_range.end,
+                                .content = try self.allocator.dupe(u8, ""),
+                                .highlight = .novel,
+                            };
+                            added_changes = change_array;
+                            is_partial_addition = added_range.start > 0 or added_range.end < new_content.len;
+                        }
                     }
 
                     // Show deletion line (old content with deleted parts highlighted)
@@ -266,7 +311,7 @@ pub const UI = struct {
                         .content = try self.allocator.dupe(u8, old_content),
                         .changes = deleted_changes,
                         .line_type = .deletion,
-                        .is_partial_change = deleted_range.start > 0 or deleted_range.end < old_content.len,
+                        .is_partial_change = is_partial_deletion,
                     });
 
                     // Show addition line (new content with added parts highlighted)
@@ -275,7 +320,7 @@ pub const UI = struct {
                         .content = try self.allocator.dupe(u8, new_content),
                         .changes = added_changes,
                         .line_type = .addition,
-                        .is_partial_change = added_range.start > 0 or added_range.end < new_content.len,
+                        .is_partial_change = is_partial_addition,
                     });
 
                     // Track the new line number for context calculation
@@ -285,10 +330,12 @@ pub const UI = struct {
                     const old_line_idx = entry.lhs.?.line_number;
                     const display_line_num = old_line_idx + 1;
                     const content = if (old_line_idx < old_lines.items.len) old_lines.items[old_line_idx] else "";
+                    // Copy the changes array to avoid double-free
+                    const changes_copy = try self.dupeChanges(entry.lhs.?.changes);
                     try self.diff_lines.append(self.allocator, .{
                         .line_num = display_line_num,
                         .content = try self.allocator.dupe(u8, content),
-                        .changes = entry.lhs.?.changes,
+                        .changes = changes_copy,
                         .line_type = .deletion,
                     });
                 } else if (!has_lhs and has_rhs) {
@@ -296,10 +343,12 @@ pub const UI = struct {
                     const new_line_idx = entry.rhs.?.line_number;
                     const display_line_num = new_line_idx + 1;
                     const content = if (new_line_idx < new_lines.items.len) new_lines.items[new_line_idx] else "";
+                    // Copy the changes array to avoid double-free
+                    const changes_copy = try self.dupeChanges(entry.rhs.?.changes);
                     try self.diff_lines.append(self.allocator, .{
                         .line_num = display_line_num,
                         .content = try self.allocator.dupe(u8, content),
-                        .changes = entry.rhs.?.changes,
+                        .changes = changes_copy,
                         .line_type = .addition,
                     });
                     last_shown_new_line = display_line_num;
@@ -1095,6 +1144,25 @@ pub const UI = struct {
         };
     }
 };
+
+/// Check if the changes only affect part of the line content
+/// Returns true if there are unchanged portions at the start or end of the line
+fn isPartialChange(content: []const u8, changes: []const difft.Change) bool {
+    if (changes.len == 0) return false;
+    if (content.len == 0) return false;
+
+    // Find the min start and max end of all changes
+    var min_start: u32 = std.math.maxInt(u32);
+    var max_end: u32 = 0;
+
+    for (changes) |change| {
+        min_start = @min(min_start, change.start);
+        max_end = @max(max_end, change.end);
+    }
+
+    // If changes don't start at 0 or don't extend to the end, it's partial
+    return min_start > 0 or max_end < content.len;
+}
 
 /// Compute which range of characters in old_content were deleted compared to new_content
 /// Returns the start and end indices of the deleted portion in old_content
@@ -2063,4 +2131,836 @@ test "identical lines are skipped (no false positives)" {
             try std.testing.expect(line.line_type == .context);
         }
     }
+}
+
+test "binary file produces no diff lines" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "binary.png"),
+        .language = try allocator.dupe(u8, "Image"),
+        .status = .changed,
+        .chunks = &.{},
+        .allocator = allocator,
+    };
+
+    // Binary file content (contains null byte)
+    const content = "PNG\x00binary data";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "binary.png"),
+        .diff = file_diff,
+        .is_binary = true, // Marked as binary
+        .old_content = try allocator.dupe(u8, content),
+        .new_content = try allocator.dupe(u8, content),
+    });
+
+    var ui_instance = UI.init(allocator, &session);
+    defer ui_instance.deinit();
+
+    try ui_instance.buildDiffLines();
+
+    // Binary files should produce no diff lines
+    try std.testing.expectEqual(@as(usize, 0), ui_instance.diff_lines.items.len);
+}
+
+// =============================================================================
+// Complex difftastic-style test cases
+// =============================================================================
+
+test "difftastic semantic changes: use difft's character-level changes" {
+    // This test verifies that we use difftastic's semantic change highlighting
+    // instead of computing our own basic text diff
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Create changes that difft would provide - specific semantic tokens
+    // Example: changing variable name from "x" to "a" in "const x = 10;"
+    // difft would highlight only the "x" -> "a" portion, not the whole line
+    const lhs_changes = try allocator.alloc(difft.Change, 1);
+    lhs_changes[0] = .{
+        .start = 6, // "x" starts at position 6
+        .end = 7, // "x" ends at position 7
+        .content = try allocator.dupe(u8, "x"),
+        .highlight = .novel,
+    };
+
+    const rhs_changes = try allocator.alloc(difft.Change, 1);
+    rhs_changes[0] = .{
+        .start = 6, // "a" starts at position 6
+        .end = 7, // "a" ends at position 7
+        .content = try allocator.dupe(u8, "a"),
+        .highlight = .novel,
+    };
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 0, .changes = lhs_changes },
+        .rhs = .{ .line_number = 0, .changes = rhs_changes },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "const x = 10;";
+    const new_content = "const a = 10;";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Should have deletion and addition lines
+    try std.testing.expect(ui.diff_lines.items.len >= 2);
+
+    // Find the deletion line and verify it uses difft's changes
+    var found_deletion_with_changes = false;
+    var found_addition_with_changes = false;
+
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .deletion and line.line_num == 1) {
+            found_deletion_with_changes = true;
+            // Should use difft's semantic change highlighting (position 6-7 for "x")
+            try std.testing.expect(line.changes.len >= 1);
+            // The change should highlight position 6-7 (the "x")
+            try std.testing.expectEqual(@as(u32, 6), line.changes[0].start);
+            try std.testing.expectEqual(@as(u32, 7), line.changes[0].end);
+        }
+        if (line.line_type == .addition and line.line_num == 1) {
+            found_addition_with_changes = true;
+            // Should use difft's semantic change highlighting (position 6-7 for "a")
+            try std.testing.expect(line.changes.len >= 1);
+            try std.testing.expectEqual(@as(u32, 6), line.changes[0].start);
+            try std.testing.expectEqual(@as(u32, 7), line.changes[0].end);
+        }
+    }
+
+    try std.testing.expect(found_deletion_with_changes);
+    try std.testing.expect(found_addition_with_changes);
+}
+
+test "difftastic: multiple semantic changes on same line" {
+    // Test case: multiple variable name changes on the same line
+    // Old: "let result = x + y;"
+    // New: "let sum = a + b;"
+    // difft would highlight: "result" -> "sum", "x" -> "a", "y" -> "b"
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Create changes that difft would provide
+    const lhs_changes = try allocator.alloc(difft.Change, 3);
+    lhs_changes[0] = .{ .start = 4, .end = 10, .content = try allocator.dupe(u8, "result"), .highlight = .novel };
+    lhs_changes[1] = .{ .start = 13, .end = 14, .content = try allocator.dupe(u8, "x"), .highlight = .novel };
+    lhs_changes[2] = .{ .start = 17, .end = 18, .content = try allocator.dupe(u8, "y"), .highlight = .novel };
+
+    const rhs_changes = try allocator.alloc(difft.Change, 3);
+    rhs_changes[0] = .{ .start = 4, .end = 7, .content = try allocator.dupe(u8, "sum"), .highlight = .novel };
+    rhs_changes[1] = .{ .start = 10, .end = 11, .content = try allocator.dupe(u8, "a"), .highlight = .novel };
+    rhs_changes[2] = .{ .start = 14, .end = 15, .content = try allocator.dupe(u8, "b"), .highlight = .novel };
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 0, .changes = lhs_changes },
+        .rhs = .{ .line_number = 0, .changes = rhs_changes },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "let result = x + y;";
+    const new_content = "let sum = a + b;";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Find the deletion line and verify it has all 3 changes
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .deletion and line.line_num == 1) {
+            // Should have 3 separate change highlights
+            try std.testing.expectEqual(@as(usize, 3), line.changes.len);
+            // First change: "result" at position 4-10
+            try std.testing.expectEqual(@as(u32, 4), line.changes[0].start);
+            try std.testing.expectEqual(@as(u32, 10), line.changes[0].end);
+        }
+        if (line.line_type == .addition and line.line_num == 1) {
+            // Should have 3 separate change highlights
+            try std.testing.expectEqual(@as(usize, 3), line.changes.len);
+            // First change: "sum" at position 4-7
+            try std.testing.expectEqual(@as(u32, 4), line.changes[0].start);
+            try std.testing.expectEqual(@as(u32, 7), line.changes[0].end);
+        }
+    }
+}
+
+test "difftastic: line moved to different position (asymmetric line numbers)" {
+    // Test case where lhs and rhs have different line numbers
+    // This happens when lines are inserted/deleted above the change
+    // Old file line 3 corresponds to new file line 5
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const lhs_changes = try allocator.alloc(difft.Change, 1);
+    lhs_changes[0] = .{ .start = 0, .end = 5, .content = try allocator.dupe(u8, "hello"), .highlight = .novel };
+
+    const rhs_changes = try allocator.alloc(difft.Change, 1);
+    rhs_changes[0] = .{ .start = 0, .end = 5, .content = try allocator.dupe(u8, "world"), .highlight = .novel };
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    // lhs line 2 (0-based) corresponds to rhs line 4 (0-based)
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 2, .changes = lhs_changes },
+        .rhs = .{ .line_number = 4, .changes = rhs_changes },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    // Old content has "hello" at line 3 (index 2)
+    const old_content = "line1\nline2\nhello\nline4";
+    // New content has "world" at line 5 (index 4) due to inserted lines
+    const new_content = "line1\nline2\nnew1\nnew2\nworld\nline4";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Verify we show the deletion with old line number and addition with new line number
+    var found_deletion = false;
+    var found_addition = false;
+
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .deletion and std.mem.eql(u8, line.content, "hello")) {
+            found_deletion = true;
+            try std.testing.expectEqual(@as(u32, 3), line.line_num.?); // Display line 3 (1-based)
+        }
+        if (line.line_type == .addition and std.mem.eql(u8, line.content, "world")) {
+            found_addition = true;
+            try std.testing.expectEqual(@as(u32, 5), line.line_num.?); // Display line 5 (1-based)
+        }
+    }
+
+    try std.testing.expect(found_deletion);
+    try std.testing.expect(found_addition);
+}
+
+test "difftastic: pure addition (rhs only)" {
+    // Test case where difft reports only rhs (new line added)
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const rhs_changes = try allocator.alloc(difft.Change, 1);
+    rhs_changes[0] = .{
+        .start = 0,
+        .end = 18,
+        .content = try allocator.dupe(u8, "// new comment line"),
+        .highlight = .novel,
+    };
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    // Only rhs - this is a pure addition
+    try chunk_entries.append(allocator, .{
+        .lhs = null,
+        .rhs = .{ .line_number = 1, .changes = rhs_changes },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "line1\nline3";
+    const new_content = "line1\n// new comment line\nline3";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Find the addition and verify it uses difft's changes
+    var found_addition = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .addition and line.line_num == 2) {
+            found_addition = true;
+            try std.testing.expectEqualStrings("// new comment line", line.content);
+            // Should use difft's provided changes
+            try std.testing.expectEqual(@as(usize, 1), line.changes.len);
+        }
+    }
+    try std.testing.expect(found_addition);
+}
+
+test "difftastic: pure deletion (lhs only)" {
+    // Test case where difft reports only lhs (old line removed)
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const lhs_changes = try allocator.alloc(difft.Change, 1);
+    lhs_changes[0] = .{
+        .start = 0,
+        .end = 22,
+        .content = try allocator.dupe(u8, "// deleted comment line"),
+        .highlight = .novel,
+    };
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    // Only lhs - this is a pure deletion
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 1, .changes = lhs_changes },
+        .rhs = null,
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "line1\n// deleted comment line\nline3";
+    const new_content = "line1\nline3";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Find the deletion and verify it uses difft's changes
+    var found_deletion = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .deletion and line.line_num == 2) {
+            found_deletion = true;
+            try std.testing.expectEqualStrings("// deleted comment line", line.content);
+            // Should use difft's provided changes
+            try std.testing.expectEqual(@as(usize, 1), line.changes.len);
+        }
+    }
+    try std.testing.expect(found_deletion);
+}
+
+test "difftastic: mixed operations in single chunk" {
+    // Complex case: one chunk contains additions, deletions, and modifications
+    // This mimics real difftastic output like:
+    // - Line 1: modified (lhs + rhs)
+    // - Line 2: deleted (lhs only)
+    // - Line 3: added (rhs only)
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    // Entry 1: Modified line (both lhs and rhs at line 0)
+    const mod_lhs_changes = try allocator.alloc(difft.Change, 1);
+    mod_lhs_changes[0] = .{ .start = 0, .end = 3, .content = try allocator.dupe(u8, "old"), .highlight = .novel };
+    const mod_rhs_changes = try allocator.alloc(difft.Change, 1);
+    mod_rhs_changes[0] = .{ .start = 0, .end = 3, .content = try allocator.dupe(u8, "new"), .highlight = .novel };
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 0, .changes = mod_lhs_changes },
+        .rhs = .{ .line_number = 0, .changes = mod_rhs_changes },
+    });
+
+    // Entry 2: Deleted line (only lhs at line 1)
+    const del_lhs_changes = try allocator.alloc(difft.Change, 1);
+    del_lhs_changes[0] = .{ .start = 0, .end = 12, .content = try allocator.dupe(u8, "deleted line"), .highlight = .novel };
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 1, .changes = del_lhs_changes },
+        .rhs = null,
+    });
+
+    // Entry 3: Added line (only rhs at line 1)
+    const add_rhs_changes = try allocator.alloc(difft.Change, 1);
+    add_rhs_changes[0] = .{ .start = 0, .end = 10, .content = try allocator.dupe(u8, "added line"), .highlight = .novel };
+
+    try chunk_entries.append(allocator, .{
+        .lhs = null,
+        .rhs = .{ .line_number = 1, .changes = add_rhs_changes },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "old text\ndeleted line\nend";
+    const new_content = "new text\nadded line\nend";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Count the different types of lines
+    var deletion_count: usize = 0;
+    var addition_count: usize = 0;
+
+    for (ui.diff_lines.items) |line| {
+        switch (line.line_type) {
+            .deletion => deletion_count += 1,
+            .addition => addition_count += 1,
+            .context => {},
+        }
+    }
+
+    // Should have:
+    // - 2 deletions (one from modification, one from pure deletion)
+    // - 2 additions (one from modification, one from pure addition)
+    try std.testing.expectEqual(@as(usize, 2), deletion_count);
+    try std.testing.expectEqual(@as(usize, 2), addition_count);
+}
+
+test "isPartialChange detects partial changes correctly" {
+    // Test isPartialChange helper function
+    const content = "Hello, world!"; // 13 chars
+
+    // Full line change (0 to 13)
+    const full_change = [_]difft.Change{.{
+        .start = 0,
+        .end = 13,
+        .content = "",
+        .highlight = .novel,
+    }};
+    try std.testing.expect(!isPartialChange(content, &full_change));
+
+    // Partial change at start (0 to 5)
+    const start_change = [_]difft.Change{.{
+        .start = 0,
+        .end = 5,
+        .content = "",
+        .highlight = .novel,
+    }};
+    try std.testing.expect(isPartialChange(content, &start_change));
+
+    // Partial change in middle (5 to 10)
+    const middle_change = [_]difft.Change{.{
+        .start = 5,
+        .end = 10,
+        .content = "",
+        .highlight = .novel,
+    }};
+    try std.testing.expect(isPartialChange(content, &middle_change));
+
+    // Partial change at end (10 to 13)
+    const end_change = [_]difft.Change{.{
+        .start = 10,
+        .end = 13,
+        .content = "",
+        .highlight = .novel,
+    }};
+    try std.testing.expect(isPartialChange(content, &end_change));
+
+    // Multiple changes covering the whole line
+    const multi_changes = [_]difft.Change{
+        .{ .start = 0, .end = 5, .content = "", .highlight = .novel },
+        .{ .start = 5, .end = 13, .content = "", .highlight = .novel },
+    };
+    try std.testing.expect(!isPartialChange(content, &multi_changes));
+
+    // Empty changes array
+    const empty_changes: []const difft.Change = &.{};
+    try std.testing.expect(!isPartialChange(content, empty_changes));
+}
+
+test "unicode content handling" {
+    // Test that unicode characters are handled correctly
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const lhs_changes = try allocator.alloc(difft.Change, 1);
+    lhs_changes[0] = .{ .start = 0, .end = 5, .content = try allocator.dupe(u8, "hello"), .highlight = .novel };
+
+    const rhs_changes = try allocator.alloc(difft.Change, 1);
+    rhs_changes[0] = .{ .start = 0, .end = 5, .content = try allocator.dupe(u8, "héllo"), .highlight = .novel };
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 0, .changes = lhs_changes },
+        .rhs = .{ .line_number = 0, .changes = rhs_changes },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "hello world 日本語";
+    const new_content = "héllo world 日本語";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Should have deletion and addition
+    var found_deletion = false;
+    var found_addition = false;
+
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .deletion) {
+            found_deletion = true;
+            try std.testing.expect(std.mem.indexOf(u8, line.content, "hello") != null);
+        }
+        if (line.line_type == .addition) {
+            found_addition = true;
+            try std.testing.expect(std.mem.indexOf(u8, line.content, "héllo") != null);
+        }
+    }
+
+    try std.testing.expect(found_deletion);
+    try std.testing.expect(found_addition);
+}
+
+test "empty file to non-empty file" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "new_file.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .added,
+        .chunks = &.{},
+        .allocator = allocator,
+    };
+
+    const old_content = "";
+    const new_content = "line1\nline2\nline3";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "new_file.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // All lines should be additions
+    try std.testing.expectEqual(@as(usize, 3), ui.diff_lines.items.len);
+    for (ui.diff_lines.items) |line| {
+        try std.testing.expect(line.line_type == .addition);
+    }
+}
+
+test "non-empty file to empty file" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "deleted_file.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .removed,
+        .chunks = &.{},
+        .allocator = allocator,
+    };
+
+    const old_content = "line1\nline2\nline3";
+    const new_content = "";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "deleted_file.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // All lines should be deletions
+    try std.testing.expectEqual(@as(usize, 3), ui.diff_lines.items.len);
+    for (ui.diff_lines.items) |line| {
+        try std.testing.expect(line.line_type == .deletion);
+    }
+}
+
+test "whitespace-only changes" {
+    // Test handling of whitespace changes (tabs, spaces)
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const lhs_changes = try allocator.alloc(difft.Change, 1);
+    lhs_changes[0] = .{ .start = 0, .end = 4, .content = try allocator.dupe(u8, "    "), .highlight = .novel }; // 4 spaces
+
+    const rhs_changes = try allocator.alloc(difft.Change, 1);
+    rhs_changes[0] = .{ .start = 0, .end = 1, .content = try allocator.dupe(u8, "\t"), .highlight = .novel }; // 1 tab
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 0, .changes = lhs_changes },
+        .rhs = .{ .line_number = 0, .changes = rhs_changes },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "    indented";
+    const new_content = "\tindented";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Should have deletion and addition
+    var found_deletion = false;
+    var found_addition = false;
+
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .deletion) {
+            found_deletion = true;
+            try std.testing.expect(std.mem.startsWith(u8, line.content, "    ")); // 4 spaces
+        }
+        if (line.line_type == .addition) {
+            found_addition = true;
+            try std.testing.expect(std.mem.startsWith(u8, line.content, "\t")); // tab
+        }
+    }
+
+    try std.testing.expect(found_deletion);
+    try std.testing.expect(found_addition);
+}
+
+test "very long lines" {
+    // Test handling of very long lines
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Create a very long line (1000 chars)
+    var long_line_buf: [1000]u8 = undefined;
+    @memset(&long_line_buf, 'x');
+
+    var new_line_buf: [1000]u8 = undefined;
+    @memset(&new_line_buf, 'y');
+
+    const old_content = try allocator.dupe(u8, &long_line_buf);
+    defer allocator.free(old_content);
+    const new_content = try allocator.dupe(u8, &new_line_buf);
+    defer allocator.free(new_content);
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 0, .changes = &.{} },
+        .rhs = .{ .line_number = 0, .changes = &.{} },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "long.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "long.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Should have deletion and addition
+    var found_deletion = false;
+    var found_addition = false;
+
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .deletion) {
+            found_deletion = true;
+            try std.testing.expectEqual(@as(usize, 1000), line.content.len);
+        }
+        if (line.line_type == .addition) {
+            found_addition = true;
+            try std.testing.expectEqual(@as(usize, 1000), line.content.len);
+        }
+    }
+
+    try std.testing.expect(found_deletion);
+    try std.testing.expect(found_addition);
 }

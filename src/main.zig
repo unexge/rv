@@ -12,6 +12,7 @@ const Args = struct {
     commit: ?[]const u8 = null,
     paths: []const []const u8 = &.{},
     help: bool = false,
+    err: ?[]const u8 = null,
 };
 
 fn parseArgs(allocator: Allocator, args: []const []const u8) !Args {
@@ -28,10 +29,14 @@ fn parseArgs(allocator: Allocator, args: []const []const u8) !Args {
             i += 1;
             if (i < args.len) {
                 result.commit = args[i];
+            } else {
+                result.err = "--commit requires a revision argument";
             }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             result.help = true;
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            result.err = "Unknown option";
+        } else {
             try paths.append(allocator, arg);
         }
     }
@@ -87,6 +92,13 @@ pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(allocator);
 
     const args = try parseArgs(allocator, argv);
+
+    if (args.err) |err_msg| {
+        try stderr.print("Error: {s}\n", .{err_msg});
+        try stderr.writeAll("Run 'rv --help' for usage.\n");
+        try stderr.flush();
+        std.process.exit(1);
+    }
 
     if (args.help) {
         try printUsage(stdout);
@@ -262,6 +274,7 @@ test "parseArgs" {
         defer allocator.free(args.paths);
         try std.testing.expect(args.staged);
         try std.testing.expect(!args.help);
+        try std.testing.expect(args.err == null);
     }
 
     {
@@ -275,4 +288,26 @@ test "parseArgs" {
         defer allocator.free(args.paths);
         try std.testing.expectEqual(@as(usize, 2), args.paths.len);
     }
+
+    // Missing commit value
+    {
+        const args = try parseArgs(allocator, &.{ "rv", "--commit" });
+        defer allocator.free(args.paths);
+        try std.testing.expect(args.err != null);
+    }
+
+    // Unknown option
+    {
+        const args = try parseArgs(allocator, &.{ "rv", "--unknown" });
+        defer allocator.free(args.paths);
+        try std.testing.expect(args.err != null);
+    }
+}
+
+// Reference all module tests to include them in the test build
+comptime {
+    _ = git;
+    _ = difft;
+    _ = review;
+    _ = ui;
 }

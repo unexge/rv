@@ -4,9 +4,37 @@ const json = std.json;
 
 const git = @import("git.zig");
 
+/// Highlight type from difftastic's semantic analysis
+/// Maps to difftastic's JSON "highlight" field values
 pub const Highlight = enum {
+    // Unchanged/normal content
     normal,
+    // Novel/changed content (generic change marker)
     novel,
+    // Semantic token types from difftastic
+    delimiter, // Brackets, parens, etc.
+    string, // String literals
+    type_, // Type names
+    comment, // Comments
+    keyword, // Language keywords
+    tree_sitter_error, // Parse errors
+
+    /// Returns true if this highlight represents a novel/changed token
+    /// In difftastic's JSON output, any token in the "changes" array is novel,
+    /// but the highlight field tells us what *kind* of token it is for syntax coloring
+    pub fn isNovel(self: Highlight) bool {
+        // All highlight types in the changes array are novel tokens
+        // The enum value tells us the syntax category for coloring
+        return self != .normal;
+    }
+
+    /// Returns true if this is a syntax-significant highlight (for semantic coloring)
+    pub fn isSemantic(self: Highlight) bool {
+        return switch (self) {
+            .delimiter, .string, .type_, .comment, .keyword => true,
+            else => false,
+        };
+    }
 };
 
 pub const Change = struct {
@@ -27,9 +55,10 @@ pub const DiffEntry = struct {
 };
 
 pub const DiffStatus = enum {
-    changed,
-    added,
-    removed,
+    unchanged, // No changes (difftastic may output this)
+    changed, // File has modifications
+    added, // File was created (difftastic: "created")
+    removed, // File was deleted (difftastic: "deleted")
 };
 
 pub const FileDiff = struct {
@@ -174,6 +203,12 @@ pub fn parseGitDiffOutput(allocator: Allocator, json_output: []const u8) DifftEr
 
         const status: DiffStatus = if (file_obj.get("status")) |s| blk: {
             const status_str = s.string;
+            // Map difftastic status values to our enum
+            // difftastic uses: "unchanged", "changed", "created", "deleted"
+            if (std.mem.eql(u8, status_str, "created")) break :blk .added;
+            if (std.mem.eql(u8, status_str, "deleted")) break :blk .removed;
+            if (std.mem.eql(u8, status_str, "unchanged")) break :blk .unchanged;
+            // Handle legacy/alternative naming
             if (std.mem.eql(u8, status_str, "added")) break :blk .added;
             if (std.mem.eql(u8, status_str, "removed")) break :blk .removed;
             break :blk .changed;
@@ -276,8 +311,17 @@ fn parseSide(allocator: Allocator, side_json: json.Value) DifftError!Side {
                 try allocator.dupe(u8, "");
 
             const highlight: Highlight = if (change_obj.get("highlight")) |h| blk: {
-                if (std.mem.eql(u8, h.string, "novel")) break :blk .novel;
-                break :blk .normal;
+                const hs = h.string;
+                // Map difftastic's highlight types to our enum
+                if (std.mem.eql(u8, hs, "delimiter")) break :blk .delimiter;
+                if (std.mem.eql(u8, hs, "string")) break :blk .string;
+                if (std.mem.eql(u8, hs, "type")) break :blk .type_;
+                if (std.mem.eql(u8, hs, "comment")) break :blk .comment;
+                if (std.mem.eql(u8, hs, "keyword")) break :blk .keyword;
+                if (std.mem.eql(u8, hs, "tree_sitter_error")) break :blk .tree_sitter_error;
+                if (std.mem.eql(u8, hs, "normal")) break :blk .normal;
+                // Default case: treat as novel (changed) - difft outputs this for actual changes
+                break :blk .novel;
             } else .normal;
 
             try changes.append(allocator, .{
@@ -345,4 +389,178 @@ test "parseGitDiffOutput simple" {
     try std.testing.expectEqualStrings("Zig", diffs[0].language);
     try std.testing.expectEqual(DiffStatus.changed, diffs[0].status);
     try std.testing.expectEqual(@as(usize, 1), diffs[0].chunks.len);
+}
+
+test "parseGitDiffOutput semantic highlights" {
+    const allocator = std.testing.allocator;
+    // Test JSON with semantic highlight types from difftastic
+    const json_input =
+        \\{
+        \\  "path": "test.rs",
+        \\  "language": "Rust",
+        \\  "status": "changed",
+        \\  "chunks": [[
+        \\    {
+        \\      "lhs": {"line_number": 1, "changes": [
+        \\        {"start": 0, "end": 2, "content": "fn", "highlight": "keyword"},
+        \\        {"start": 3, "end": 7, "content": "main", "highlight": "normal"},
+        \\        {"start": 7, "end": 8, "content": "(", "highlight": "delimiter"},
+        \\        {"start": 8, "end": 9, "content": ")", "highlight": "delimiter"}
+        \\      ]},
+        \\      "rhs": {"line_number": 1, "changes": [
+        \\        {"start": 0, "end": 3, "content": "pub", "highlight": "keyword"},
+        \\        {"start": 4, "end": 6, "content": "fn", "highlight": "keyword"},
+        \\        {"start": 7, "end": 11, "content": "main", "highlight": "normal"}
+        \\      ]}
+        \\    },
+        \\    {
+        \\      "lhs": {"line_number": 2, "changes": [
+        \\        {"start": 4, "end": 17, "content": "\"Hello World\"", "highlight": "string"}
+        \\      ]},
+        \\      "rhs": {"line_number": 2, "changes": [
+        \\        {"start": 4, "end": 12, "content": "\"Hi Rust\"", "highlight": "string"}
+        \\      ]}
+        \\    },
+        \\    {
+        \\      "lhs": {"line_number": 3, "changes": [
+        \\        {"start": 0, "end": 20, "content": "// old comment here", "highlight": "comment"}
+        \\      ]},
+        \\      "rhs": {"line_number": 3, "changes": [
+        \\        {"start": 0, "end": 20, "content": "// new comment here", "highlight": "comment"}
+        \\      ]}
+        \\    },
+        \\    {
+        \\      "lhs": {"line_number": 4, "changes": [
+        \\        {"start": 4, "end": 7, "content": "i32", "highlight": "type"}
+        \\      ]},
+        \\      "rhs": {"line_number": 4, "changes": [
+        \\        {"start": 4, "end": 7, "content": "u64", "highlight": "type"}
+        \\      ]}
+        \\    }
+        \\  ]]
+        \\}
+    ;
+
+    const diffs = try parseGitDiffOutput(allocator, json_input);
+    defer {
+        for (@constCast(diffs)) |*diff| {
+            diff.deinit();
+        }
+        allocator.free(diffs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), diffs.len);
+    try std.testing.expectEqual(@as(usize, 1), diffs[0].chunks.len);
+
+    const entries = diffs[0].chunks[0];
+    try std.testing.expectEqual(@as(usize, 4), entries.len);
+
+    // First entry: keyword test
+    const entry1 = entries[0];
+    try std.testing.expect(entry1.lhs != null);
+    try std.testing.expectEqual(@as(usize, 4), entry1.lhs.?.changes.len);
+    try std.testing.expectEqual(Highlight.keyword, entry1.lhs.?.changes[0].highlight);
+    try std.testing.expectEqual(Highlight.normal, entry1.lhs.?.changes[1].highlight);
+    try std.testing.expectEqual(Highlight.delimiter, entry1.lhs.?.changes[2].highlight);
+
+    // Second entry: string test
+    const entry2 = entries[1];
+    try std.testing.expect(entry2.lhs != null);
+    try std.testing.expectEqual(Highlight.string, entry2.lhs.?.changes[0].highlight);
+
+    // Third entry: comment test
+    const entry3 = entries[2];
+    try std.testing.expect(entry3.lhs != null);
+    try std.testing.expectEqual(Highlight.comment, entry3.lhs.?.changes[0].highlight);
+
+    // Fourth entry: type test
+    const entry4 = entries[3];
+    try std.testing.expect(entry4.lhs != null);
+    try std.testing.expectEqual(Highlight.type_, entry4.lhs.?.changes[0].highlight);
+}
+
+test "Highlight.isNovel" {
+    try std.testing.expect(!Highlight.normal.isNovel());
+    try std.testing.expect(Highlight.novel.isNovel());
+    try std.testing.expect(Highlight.keyword.isNovel());
+    try std.testing.expect(Highlight.string.isNovel());
+    try std.testing.expect(Highlight.comment.isNovel());
+    try std.testing.expect(Highlight.type_.isNovel());
+    try std.testing.expect(Highlight.delimiter.isNovel());
+    try std.testing.expect(Highlight.tree_sitter_error.isNovel());
+}
+
+test "Highlight.isSemantic" {
+    try std.testing.expect(!Highlight.normal.isSemantic());
+    try std.testing.expect(!Highlight.novel.isSemantic());
+    try std.testing.expect(Highlight.keyword.isSemantic());
+    try std.testing.expect(Highlight.string.isSemantic());
+    try std.testing.expect(Highlight.comment.isSemantic());
+    try std.testing.expect(Highlight.type_.isSemantic());
+    try std.testing.expect(Highlight.delimiter.isSemantic());
+    try std.testing.expect(!Highlight.tree_sitter_error.isSemantic());
+}
+
+test "parseGitDiffOutput difftastic status values" {
+    const allocator = std.testing.allocator;
+
+    // Test "created" status (difftastic's term for new files)
+    {
+        const json_input =
+            \\{"path": "new.txt", "language": "Text", "status": "created", "chunks": []}
+        ;
+        const diffs = try parseGitDiffOutput(allocator, json_input);
+        defer {
+            for (@constCast(diffs)) |*diff| {
+                diff.deinit();
+            }
+            allocator.free(diffs);
+        }
+        try std.testing.expectEqual(DiffStatus.added, diffs[0].status);
+    }
+
+    // Test "deleted" status
+    {
+        const json_input =
+            \\{"path": "old.txt", "language": "Text", "status": "deleted", "chunks": []}
+        ;
+        const diffs = try parseGitDiffOutput(allocator, json_input);
+        defer {
+            for (@constCast(diffs)) |*diff| {
+                diff.deinit();
+            }
+            allocator.free(diffs);
+        }
+        try std.testing.expectEqual(DiffStatus.removed, diffs[0].status);
+    }
+
+    // Test "unchanged" status
+    {
+        const json_input =
+            \\{"path": "same.txt", "language": "Text", "status": "unchanged", "chunks": []}
+        ;
+        const diffs = try parseGitDiffOutput(allocator, json_input);
+        defer {
+            for (@constCast(diffs)) |*diff| {
+                diff.deinit();
+            }
+            allocator.free(diffs);
+        }
+        try std.testing.expectEqual(DiffStatus.unchanged, diffs[0].status);
+    }
+
+    // Test "changed" status
+    {
+        const json_input =
+            \\{"path": "mod.txt", "language": "Text", "status": "changed", "chunks": []}
+        ;
+        const diffs = try parseGitDiffOutput(allocator, json_input);
+        defer {
+            for (@constCast(diffs)) |*diff| {
+                diff.deinit();
+            }
+            allocator.free(diffs);
+        }
+        try std.testing.expectEqual(DiffStatus.changed, diffs[0].status);
+    }
 }

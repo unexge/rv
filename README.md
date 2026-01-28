@@ -7,8 +7,7 @@ rv shows changes using [Difftastic](https://github.com/Wilfred/difftastic) per f
 ## Build
 
 ```bash
-$ zig build
-¢ this is new.
+$ zig build                       # Build the rv binary
 $ zig-out/bin/rv                  # Review working directory changes
 $ zig-out/bin/rv --staged         # Review staged changes
 $ zig-out/bin/rv -c HEAD~1        # Review specific commit

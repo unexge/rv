@@ -32,9 +32,12 @@ const Mode = enum {
 
 /// Represents a single line in the unified diff view
 const DiffLine = struct {
-    line_num: ?u32,
+    old_line_num: ?u32 = null, // Line number in old file (LHS)
+    new_line_num: ?u32 = null, // Line number in new file (RHS)
     content: []const u8,
+    old_content: ?[]const u8 = null, // For modifications: the old content (shown struck through or dimmed)
     changes: []const difft.Change = &.{},
+    old_changes: []const difft.Change = &.{}, // Changes highlighting for old content
     line_type: LineType,
     selectable: bool = true,
     is_partial_change: bool = false, // True if only part of line changed (unchanged parts shown in white)
@@ -43,6 +46,7 @@ const DiffLine = struct {
         context, // Unchanged line (shown with space prefix)
         addition, // Added line (shown with + prefix)
         deletion, // Deleted line (shown with - prefix)
+        modification, // Modified line (shown with ~ prefix, both old and new)
     };
 };
 
@@ -120,11 +124,20 @@ pub const UI = struct {
         }
         for (self.diff_lines.items) |line| {
             if (line.content.len > 0) self.allocator.free(line.content);
+            if (line.old_content) |oc| {
+                if (oc.len > 0) self.allocator.free(oc);
+            }
             if (line.changes.len > 0) {
                 for (line.changes) |change| {
                     if (change.content.len > 0) self.allocator.free(change.content);
                 }
                 self.allocator.free(line.changes);
+            }
+            if (line.old_changes.len > 0) {
+                for (line.old_changes) |change| {
+                    if (change.content.len > 0) self.allocator.free(change.content);
+                }
+                self.allocator.free(line.old_changes);
             }
         }
         self.diff_lines.deinit(self.allocator);
@@ -161,11 +174,20 @@ pub const UI = struct {
     pub fn buildDiffLines(self: *UI) !void {
         for (self.diff_lines.items) |line| {
             if (line.content.len > 0) self.allocator.free(line.content);
+            if (line.old_content) |oc| {
+                if (oc.len > 0) self.allocator.free(oc);
+            }
             if (line.changes.len > 0) {
                 for (line.changes) |change| {
                     if (change.content.len > 0) self.allocator.free(change.content);
                 }
                 self.allocator.free(line.changes);
+            }
+            if (line.old_changes.len > 0) {
+                for (line.old_changes) |change| {
+                    if (change.content.len > 0) self.allocator.free(change.content);
+                }
+                self.allocator.free(line.old_changes);
             }
         }
         self.diff_lines.clearRetainingCapacity();
@@ -188,12 +210,13 @@ pub const UI = struct {
             try new_lines.append(self.allocator, line);
         }
 
-        if (file.diff.chunks.len == 0 and (file.diff.status == .removed or file.diff.status == .added)) {
+        if (file.diff.chunks.len == 0 and (file.diff.status == .removed or file.diff.status == .added or file.diff.status == .unchanged)) {
             if (file.diff.status == .removed) {
                 for (old_lines.items, 0..) |line, idx| {
                     const line_num: u32 = @intCast(idx + 1);
                     try self.diff_lines.append(self.allocator, .{
-                        .line_num = line_num,
+                        .old_line_num = line_num,
+                        .new_line_num = null,
                         .content = try self.allocator.dupe(u8, line),
                         .changes = &.{},
                         .line_type = .deletion,
@@ -203,41 +226,75 @@ pub const UI = struct {
                 for (new_lines.items, 0..) |line, idx| {
                     const line_num: u32 = @intCast(idx + 1);
                     try self.diff_lines.append(self.allocator, .{
-                        .line_num = line_num,
+                        .old_line_num = null,
+                        .new_line_num = line_num,
                         .content = try self.allocator.dupe(u8, line),
                         .changes = &.{},
                         .line_type = .addition,
+                    });
+                }
+            } else if (file.diff.status == .unchanged) {
+                // For unchanged files, show all lines as context
+                for (new_lines.items, 0..) |line, idx| {
+                    const line_num: u32 = @intCast(idx + 1);
+                    try self.diff_lines.append(self.allocator, .{
+                        .old_line_num = line_num,
+                        .new_line_num = line_num,
+                        .content = try self.allocator.dupe(u8, line),
+                        .changes = &.{},
+                        .line_type = .context,
                     });
                 }
             }
         }
 
         const CONTEXT_LINES: u32 = 3;
+        var last_shown_old_line: u32 = 0;
         var last_shown_new_line: u32 = 0;
+        // Track the offset between old and new line numbers
+        // offset = new_line - old_line for corresponding lines
+        // Positive offset means lines were added, negative means deleted
+        var line_offset: i32 = 0;
 
         for (file.diff.chunks) |chunk| {
             // difft uses 0-based line numbers, we need 1-based for display
-            var first_line_in_chunk_0based: u32 = std.math.maxInt(u32);
-            var last_line_in_chunk_0based: u32 = 0;
+            // Track boundaries for both LHS (old) and RHS (new) separately
+            var first_old_line_0based: u32 = std.math.maxInt(u32);
+            var last_old_line_0based: u32 = 0;
+            var first_new_line_0based: u32 = std.math.maxInt(u32);
+            var last_new_line_0based: u32 = 0;
+            var has_old_lines = false;
+            var has_new_lines = false;
 
             for (chunk) |entry| {
+                if (entry.lhs) |lhs| {
+                    first_old_line_0based = @min(first_old_line_0based, lhs.line_number);
+                    last_old_line_0based = @max(last_old_line_0based, lhs.line_number);
+                    has_old_lines = true;
+                }
                 if (entry.rhs) |rhs| {
-                    first_line_in_chunk_0based = @min(first_line_in_chunk_0based, rhs.line_number);
-                    last_line_in_chunk_0based = @max(last_line_in_chunk_0based, rhs.line_number);
-                } else if (entry.lhs) |lhs| {
-                    first_line_in_chunk_0based = @min(first_line_in_chunk_0based, lhs.line_number);
-                    last_line_in_chunk_0based = @max(last_line_in_chunk_0based, lhs.line_number);
+                    first_new_line_0based = @min(first_new_line_0based, rhs.line_number);
+                    last_new_line_0based = @max(last_new_line_0based, rhs.line_number);
+                    has_new_lines = true;
                 }
             }
 
             // Convert to 1-based display line numbers
-            const first_line_in_chunk = first_line_in_chunk_0based + 1;
-            const last_line_in_chunk = last_line_in_chunk_0based + 1;
+            const first_old_line = if (has_old_lines) first_old_line_0based + 1 else 0;
+            const first_new_line = if (has_new_lines) first_new_line_0based + 1 else 0;
+            const last_new_line = if (has_new_lines) last_new_line_0based + 1 else 0;
 
-            const context_start = if (first_line_in_chunk > CONTEXT_LINES) first_line_in_chunk - CONTEXT_LINES else 1;
-            if (last_shown_new_line > 0 and context_start > last_shown_new_line + 1) {
+            // Calculate context boundaries based on new file (for unified view)
+            const context_start_new = if (first_new_line > CONTEXT_LINES) first_new_line - CONTEXT_LINES else 1;
+            const context_start_old = if (first_old_line > CONTEXT_LINES) first_old_line - CONTEXT_LINES else 1;
+
+            // Show separator if there's a gap from the last shown content
+            const effective_context_start = if (has_new_lines) context_start_new else context_start_old;
+            const effective_last_shown = if (has_new_lines) last_shown_new_line else last_shown_old_line;
+            if (effective_last_shown > 0 and effective_context_start > effective_last_shown + 1) {
                 try self.diff_lines.append(self.allocator, .{
-                    .line_num = null,
+                    .old_line_num = null,
+                    .new_line_num = null,
                     .content = try self.allocator.dupe(u8, "..."),
                     .changes = &.{},
                     .line_type = .context,
@@ -245,33 +302,54 @@ pub const UI = struct {
                 });
             }
 
-            if (context_start < first_line_in_chunk) {
-                for (context_start..first_line_in_chunk) |line_num_usize| {
-                    const line_num: u32 = @intCast(line_num_usize);
-                    if (line_num <= last_shown_new_line) continue; // Skip if already shown
+            // Show context lines before the chunk
+            // For context lines, we need to compute the corresponding old line number
+            // using the current offset between old and new line numbers
+            if (has_new_lines and context_start_new < first_new_line) {
+                for (context_start_new..first_new_line) |line_num_usize| {
+                    const new_line_num: u32 = @intCast(line_num_usize);
+                    if (new_line_num <= last_shown_new_line) continue; // Skip if already shown
 
-                    const idx = line_num - 1;
+                    // Compute old line number based on current offset
+                    const old_line_num: u32 = if (line_offset >= 0)
+                        new_line_num -| @as(u32, @intCast(line_offset))
+                    else
+                        new_line_num + @as(u32, @intCast(-line_offset));
+
+                    const idx = new_line_num - 1;
                     const content = if (idx < new_lines.items.len) new_lines.items[idx] else "";
                     try self.diff_lines.append(self.allocator, .{
-                        .line_num = line_num,
+                        .old_line_num = old_line_num,
+                        .new_line_num = new_line_num,
                         .content = try self.allocator.dupe(u8, content),
                         .changes = &.{},
                         .line_type = .context,
                     });
-                    last_shown_new_line = line_num;
+                    last_shown_new_line = new_line_num;
+                    last_shown_old_line = old_line_num;
                 }
             }
-
-            // Sort entries by LHS line number (or RHS if no LHS) to display in order
+            // Sort entries by line number to display in order
+            // Use max of LHS and RHS line numbers to handle interleaving properly
             var sorted_entries: std.ArrayList(struct {
                 const Self = @This();
                 idx: usize,
                 sort_key: u32,
+                lhs_line: ?u32,
+                rhs_line: ?u32,
             }) = .empty;
             defer sorted_entries.deinit(self.allocator);
             for (chunk, 0..) |entry, idx| {
-                const sort_key = if (entry.lhs) |lhs| lhs.line_number else (if (entry.rhs) |rhs| rhs.line_number else 0);
-                try sorted_entries.append(self.allocator, .{ .idx = idx, .sort_key = sort_key });
+                const lhs_line = if (entry.lhs) |lhs| lhs.line_number else null;
+                const rhs_line = if (entry.rhs) |rhs| rhs.line_number else null;
+                // Sort by the line number that exists, preferring RHS for unified view
+                const sort_key = rhs_line orelse lhs_line orelse 0;
+                try sorted_entries.append(self.allocator, .{
+                    .idx = idx,
+                    .sort_key = sort_key,
+                    .lhs_line = lhs_line,
+                    .rhs_line = rhs_line,
+                });
             }
             std.mem.sort(@TypeOf(sorted_entries.items[0]), sorted_entries.items, {}, struct {
                 fn lessThan(_: void, a: @TypeOf(sorted_entries.items[0]), b: @TypeOf(sorted_entries.items[0])) bool {
@@ -279,10 +357,46 @@ pub const UI = struct {
                 }
             }.lessThan);
 
+            // Track the last displayed lines for both old and new to fill in gaps
+            var last_displayed_old_line: u32 = if (context_start_old > 1) context_start_old - 1 else 0;
+            var last_displayed_new_line: u32 = if (context_start_new > 1) context_start_new - 1 else 0;
+
             for (sorted_entries.items) |entry_info| {
                 const entry = chunk[entry_info.idx];
                 const has_lhs = entry.lhs != null;
                 const has_rhs = entry.rhs != null;
+
+                // Get the current entry's new line number (1-based for display)
+                const current_new_line: u32 = if (entry.rhs) |rhs| rhs.line_number + 1 else 0;
+
+                // Fill in context lines between entries (using new file for unified view)
+                // Only fill gaps in the new file lines since that's our primary view
+                if (has_rhs and current_new_line > last_displayed_new_line + 1) {
+                    const gap_start = last_displayed_new_line + 1;
+                    const gap_end = current_new_line;
+                    for (gap_start..gap_end) |line_num_usize| {
+                        const new_line_num: u32 = @intCast(line_num_usize);
+                        if (new_line_num <= last_shown_new_line) continue;
+
+                        // Compute old line number based on current offset
+                        const old_line_num: u32 = if (line_offset >= 0)
+                            new_line_num -| @as(u32, @intCast(line_offset))
+                        else
+                            new_line_num + @as(u32, @intCast(-line_offset));
+
+                        const idx = new_line_num - 1;
+                        const content = if (idx < new_lines.items.len) new_lines.items[idx] else "";
+                        try self.diff_lines.append(self.allocator, .{
+                            .old_line_num = old_line_num,
+                            .new_line_num = new_line_num,
+                            .content = try self.allocator.dupe(u8, content),
+                            .changes = &.{},
+                            .line_type = .context,
+                        });
+                        last_shown_new_line = new_line_num;
+                        last_shown_old_line = old_line_num;
+                    }
+                }
 
                 if (has_lhs and has_rhs) {
                     // Both sides present - modified line
@@ -298,7 +412,10 @@ pub const UI = struct {
 
                     // Skip if there's no actual change
                     if (std.mem.eql(u8, old_content, new_content)) {
+                        last_shown_old_line = @max(last_shown_old_line, old_line_idx + 1);
                         last_shown_new_line = @max(last_shown_new_line, new_line_idx + 1);
+                        last_displayed_old_line = old_display_line_num;
+                        last_displayed_new_line = new_display_line_num;
                         continue;
                     }
 
@@ -349,26 +466,25 @@ pub const UI = struct {
                         }
                     }
 
-                    // Show deletion line (old content with deleted parts highlighted)
+                    // Create a unified modification line showing both old and new content
                     try self.diff_lines.append(self.allocator, .{
-                        .line_num = old_display_line_num,
-                        .content = try self.allocator.dupe(u8, old_content),
-                        .changes = deleted_changes,
-                        .line_type = .deletion,
-                        .is_partial_change = is_partial_deletion,
+                        .old_line_num = old_display_line_num,
+                        .new_line_num = new_display_line_num,
+                        .content = try self.allocator.dupe(u8, new_content), // New content is primary
+                        .old_content = try self.allocator.dupe(u8, old_content), // Old content for reference
+                        .changes = added_changes, // Highlights for new content
+                        .old_changes = deleted_changes, // Highlights for old content
+                        .line_type = .modification,
+                        .is_partial_change = is_partial_deletion or is_partial_addition,
                     });
 
-                    // Show addition line (new content with added parts highlighted)
-                    try self.diff_lines.append(self.allocator, .{
-                        .line_num = new_display_line_num,
-                        .content = try self.allocator.dupe(u8, new_content),
-                        .changes = added_changes,
-                        .line_type = .addition,
-                        .is_partial_change = is_partial_addition,
-                    });
-
-                    // Track the new line number for context calculation
+                    // Track both old and new line numbers for context calculation
+                    last_shown_old_line = @max(last_shown_old_line, old_line_idx + 1);
                     last_shown_new_line = @max(last_shown_new_line, new_line_idx + 1);
+                    last_displayed_old_line = old_display_line_num;
+                    last_displayed_new_line = new_display_line_num;
+                    // Update offset: for modifications, offset changes if line numbers differ
+                    line_offset = @as(i32, @intCast(new_display_line_num)) - @as(i32, @intCast(old_display_line_num));
                 } else if (has_lhs and !has_rhs) {
                     // Deletion only - difft uses 0-based indexing
                     const old_line_idx = entry.lhs.?.line_number;
@@ -377,11 +493,17 @@ pub const UI = struct {
                     // Copy the changes array to avoid double-free
                     const changes_copy = try self.dupeChanges(entry.lhs.?.changes);
                     try self.diff_lines.append(self.allocator, .{
-                        .line_num = display_line_num,
+                        .old_line_num = display_line_num,
+                        .new_line_num = null, // Deletion only: no new line
                         .content = try self.allocator.dupe(u8, content),
                         .changes = changes_copy,
                         .line_type = .deletion,
                     });
+                    // Track old line for deletions
+                    last_shown_old_line = @max(last_shown_old_line, display_line_num);
+                    last_displayed_old_line = display_line_num;
+                    // Deletion: old line removed, so offset decreases (new lines are "behind")
+                    line_offset -= 1;
                 } else if (!has_lhs and has_rhs) {
                     // Addition only - difft uses 0-based indexing
                     const new_line_idx = entry.rhs.?.line_number;
@@ -390,32 +512,44 @@ pub const UI = struct {
                     // Copy the changes array to avoid double-free
                     const changes_copy = try self.dupeChanges(entry.rhs.?.changes);
                     try self.diff_lines.append(self.allocator, .{
-                        .line_num = display_line_num,
+                        .old_line_num = null, // Addition only: no old line
+                        .new_line_num = display_line_num,
                         .content = try self.allocator.dupe(u8, content),
                         .changes = changes_copy,
                         .line_type = .addition,
                     });
                     last_shown_new_line = display_line_num;
+                    last_displayed_new_line = display_line_num;
+                    // Addition: new line added, so offset increases
+                    line_offset += 1;
                 }
             }
 
+            // Add trailing context lines after the chunk (use new file)
             const new_lines_count: u32 = @intCast(new_lines.items.len);
-            const context_end = @min(last_line_in_chunk + CONTEXT_LINES, new_lines_count);
-            // Only add context after if we have lines to show (context_end > last_line_in_chunk)
-            if (context_end > last_line_in_chunk) {
-                for (last_line_in_chunk + 1..context_end + 1) |line_num_usize| {
-                    const line_num: u32 = @intCast(line_num_usize);
-                    if (line_num <= last_shown_new_line) continue; // Skip if already shown
+            const context_end_new = @min(last_new_line + CONTEXT_LINES, new_lines_count);
+            if (has_new_lines and context_end_new > last_new_line) {
+                for (last_new_line + 1..context_end_new + 1) |line_num_usize| {
+                    const new_line_num: u32 = @intCast(line_num_usize);
+                    if (new_line_num <= last_shown_new_line) continue; // Skip if already shown
 
-                    const idx = line_num - 1;
+                    // Compute old line number based on current offset
+                    const old_line_num: u32 = if (line_offset >= 0)
+                        new_line_num -| @as(u32, @intCast(line_offset))
+                    else
+                        new_line_num + @as(u32, @intCast(-line_offset));
+
+                    const idx = new_line_num - 1;
                     const content = if (idx < new_lines.items.len) new_lines.items[idx] else "";
                     try self.diff_lines.append(self.allocator, .{
-                        .line_num = line_num,
+                        .old_line_num = old_line_num,
+                        .new_line_num = new_line_num,
                         .content = try self.allocator.dupe(u8, content),
                         .changes = &.{},
                         .line_type = .context,
                     });
-                    last_shown_new_line = line_num;
+                    last_shown_new_line = new_line_num;
+                    last_shown_old_line = old_line_num;
                 }
             }
         }
@@ -782,15 +916,25 @@ pub const UI = struct {
         defer code_content.deinit(self.allocator);
 
         for (self.diff_lines.items) |diff_line| {
-            if (diff_line.line_num) |num| {
+            // Use new_line_num for additions/context, old_line_num for deletions
+            const line_num = diff_line.new_line_num orelse diff_line.old_line_num;
+            if (line_num) |num| {
                 if (num >= lines_start and num <= lines_end) {
                     const prefix: u8 = switch (diff_line.line_type) {
                         .addition => '+',
                         .deletion => '-',
+                        .modification => '~',
                         .context => ' ',
                     };
                     try code_content.append(self.allocator, prefix);
                     try code_content.append(self.allocator, ' ');
+                    // For modifications, show both old and new content
+                    if (diff_line.line_type == .modification) {
+                        if (diff_line.old_content) |old| {
+                            try code_content.appendSlice(self.allocator, old);
+                            try code_content.appendSlice(self.allocator, " → ");
+                        }
+                    }
                     try code_content.appendSlice(self.allocator, diff_line.content);
                     try code_content.append(self.allocator, '\n');
                 }
@@ -1072,7 +1216,8 @@ pub const UI = struct {
     fn getLineNumberAt(self: *UI, idx: usize) ?usize {
         if (idx >= self.diff_lines.items.len) return null;
         const line = self.diff_lines.items[idx];
-        return if (line.line_num) |n| n else null;
+        // Prefer new line number, fall back to old line number
+        return if (line.new_line_num) |n| n else if (line.old_line_num) |n| n else null;
     }
 
     fn moveCursorDown(self: *UI) void {
@@ -1309,6 +1454,8 @@ pub const UI = struct {
             // If partial change but no specific changes marked, treat entire line as changed
             var style: vaxis.Style = .{};
             var novel_style: vaxis.Style = .{};
+            var old_style: vaxis.Style = .{}; // Style for old content in modifications
+            var old_novel_style: vaxis.Style = .{}; // Style for changed parts in old content
             const has_specific_changes = diff_line.changes.len > 0;
             const prefix: u8 = switch (diff_line.line_type) {
                 .addition => blk: {
@@ -1331,6 +1478,18 @@ pub const UI = struct {
                     novel_style.bold = true;
                     break :blk '-';
                 },
+                .modification => blk: {
+                    // Modification: show new content in green, old content struck through in red
+                    style.fg = .{ .rgb = .{ 0x00, 0xd7, 0x00 } }; // Green for new content
+                    novel_style.fg = .{ .rgb = .{ 0x00, 0xd7, 0x00 } };
+                    novel_style.bold = true;
+                    old_style.fg = .{ .rgb = .{ 0xd7, 0x00, 0x00 } }; // Red for old content
+                    old_style.strikethrough = true; // Strike through old content
+                    old_novel_style.fg = .{ .rgb = .{ 0xd7, 0x00, 0x00 } };
+                    old_novel_style.bold = true;
+                    old_novel_style.strikethrough = true;
+                    break :blk '~';
+                },
                 .context => blk: {
                     style.fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } }; // Gray for context
                     novel_style = style;
@@ -1344,40 +1503,96 @@ pub const UI = struct {
                 style.bg = .{ .rgb = .{ 0x30, 0x30, 0x50 } }; // Subtle highlight
             }
 
-            // Line number style (dimmed)
-            var line_num_style: vaxis.Style = .{
+            // Line number styles
+            const dim_style: vaxis.Style = .{
                 .fg = .{ .rgb = .{ 0x60, 0x60, 0x60 } },
             };
-            if (is_selected) {
-                line_num_style.reverse = true;
-            }
+            const red_line_num_style: vaxis.Style = .{
+                .fg = .{ .rgb = .{ 0xd7, 0x00, 0x00 } },
+            };
+            const green_line_num_style: vaxis.Style = .{
+                .fg = .{ .rgb = .{ 0x00, 0xd7, 0x00 } },
+            };
+            const yellow_line_num_style: vaxis.Style = .{
+                .fg = .{ .rgb = .{ 0xd7, 0xd7, 0x00 } }, // Yellow for modifications
+            };
 
             const display_row = row + 1; // +1 for header
             var col: u16 = 0;
 
-            // Line number (5 chars)
+            // Old line number (4 chars) - red for deletions, yellow for modifications, dim for context
             var num_buf: [8]u8 = undefined;
-            if (diff_line.line_num) |num| {
-                const num_str = std.fmt.bufPrint(&num_buf, "{d:>5}", .{num}) catch "     ";
+            const old_num_style = if (is_selected)
+                vaxis.Style{ .reverse = true }
+            else if (diff_line.line_type == .deletion)
+                red_line_num_style
+            else if (diff_line.line_type == .modification)
+                yellow_line_num_style
+            else
+                dim_style;
+
+            if (diff_line.old_line_num) |num| {
+                const num_str = std.fmt.bufPrint(&num_buf, "{d:>4}", .{num}) catch "    ";
                 for (num_str) |c| {
                     if (col < width) {
                         surface.writeCell(col, display_row, .{
                             .char = .{ .grapheme = grapheme(c) },
-                            .style = line_num_style,
+                            .style = old_num_style,
                         });
                         col += 1;
                     }
                 }
             } else {
-                while (col < 5 and col < width) : (col += 1) {
+                // Blank for additions (no old line)
+                while (col < 4 and col < width) : (col += 1) {
                     surface.writeCell(col, display_row, .{
                         .char = .{ .grapheme = grapheme(' ') },
-                        .style = line_num_style,
+                        .style = dim_style,
                     });
                 }
             }
 
-            // Space after line number
+            // Space between line numbers
+            if (col < width) {
+                surface.writeCell(col, display_row, .{
+                    .char = .{ .grapheme = grapheme(' ') },
+                    .style = dim_style,
+                });
+                col += 1;
+            }
+
+            // New line number (4 chars) - green for additions, yellow for modifications, dim for context
+            const new_num_style = if (is_selected)
+                vaxis.Style{ .reverse = true }
+            else if (diff_line.line_type == .addition)
+                green_line_num_style
+            else if (diff_line.line_type == .modification)
+                yellow_line_num_style
+            else
+                dim_style;
+
+            if (diff_line.new_line_num) |num| {
+                const num_str = std.fmt.bufPrint(&num_buf, "{d:>4}", .{num}) catch "    ";
+                for (num_str) |c| {
+                    if (col < width) {
+                        surface.writeCell(col, display_row, .{
+                            .char = .{ .grapheme = grapheme(c) },
+                            .style = new_num_style,
+                        });
+                        col += 1;
+                    }
+                }
+            } else {
+                // Blank for deletions (no new line)
+                while (col < 9 and col < width) : (col += 1) {
+                    surface.writeCell(col, display_row, .{
+                        .char = .{ .grapheme = grapheme(' ') },
+                        .style = dim_style,
+                    });
+                }
+            }
+
+            // Space after line numbers
             if (col < width) {
                 surface.writeCell(col, display_row, .{
                     .char = .{ .grapheme = grapheme(' ') },
@@ -1404,14 +1619,40 @@ pub const UI = struct {
                 col += 1;
             }
 
-            // Content (preserving indentation)
-            var content = diff_line.content;
-            // Strip trailing newlines only
-            while (content.len > 0 and (content[content.len - 1] == '\n' or content[content.len - 1] == '\r')) {
-                content = content[0 .. content.len - 1];
-            }
+            // Content rendering
+            if (diff_line.line_type == .modification) {
+                // For modifications: show inline diff with unchanged parts once,
+                // deleted parts in red/strikethrough, added parts in green
+                if (diff_line.old_content) |old_content_raw| {
+                    var old_content = old_content_raw;
+                    while (old_content.len > 0 and (old_content[old_content.len - 1] == '\n' or old_content[old_content.len - 1] == '\r')) {
+                        old_content = old_content[0 .. old_content.len - 1];
+                    }
 
-            self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection);
+                    var new_content = diff_line.content;
+                    while (new_content.len > 0 and (new_content[new_content.len - 1] == '\n' or new_content[new_content.len - 1] == '\r')) {
+                        new_content = new_content[0 .. new_content.len - 1];
+                    }
+
+                    col = self.writeInlineDiff(surface, display_row, col, old_content, new_content, diff_line.old_changes, diff_line.changes, width -| col, style, is_selected or in_selection);
+                } else {
+                    // No old content, just show new content as addition
+                    var content = diff_line.content;
+                    while (content.len > 0 and (content[content.len - 1] == '\n' or content[content.len - 1] == '\r')) {
+                        content = content[0 .. content.len - 1];
+                    }
+                    self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection);
+                }
+            } else {
+                // Regular line (addition, deletion, context)
+                var content = diff_line.content;
+                // Strip trailing newlines only
+                while (content.len > 0 and (content[content.len - 1] == '\n' or content[content.len - 1] == '\r')) {
+                    content = content[0 .. content.len - 1];
+                }
+
+                self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection);
+            }
         }
     }
 
@@ -1429,6 +1670,21 @@ pub const UI = struct {
         novel_style: vaxis.Style,
         is_selected: bool,
     ) void {
+        _ = self.writeContentWithHighlightAndReturn(surface, row, start_col, content, changes, max_width, base_style, novel_style, is_selected);
+    }
+
+    fn writeContentWithHighlightAndReturn(
+        self: *UI,
+        surface: *vxfw.Surface,
+        row: u16,
+        start_col: u16,
+        content: []const u8,
+        changes: []const difft.Change,
+        max_width: u16,
+        base_style: vaxis.Style,
+        novel_style: vaxis.Style,
+        is_selected: bool,
+    ) u16 {
         _ = self;
 
         var col = start_col;
@@ -1439,16 +1695,21 @@ pub const UI = struct {
         for (content) |c| {
             if (col >= start_col + max_width) break;
 
-            // Determine if this character is in a changed region
-            var is_novel = false;
-            for (changes) |change| {
+            // Determine if this character is in a changed region and get its highlight type
+            var current_change: ?*const difft.Change = null;
+            for (changes) |*change| {
                 if (char_idx >= change.start and char_idx < change.end) {
-                    is_novel = true;
+                    current_change = change;
                     break;
                 }
             }
 
-            const style = if (is_novel and !is_selected) novel_style else base_style;
+            // Compute the style based on whether this is a novel token and its semantic type
+            const style = if (current_change != null and !is_selected) blk: {
+                const change = current_change.?;
+                // Apply semantic highlighting if available, otherwise use novel_style
+                break :blk getSemanticStyle(change.highlight, novel_style);
+            } else base_style;
 
             if (c == '\t') {
                 // Expand tab to spaces (to next tab stop)
@@ -1472,6 +1733,216 @@ pub const UI = struct {
             }
             char_idx += 1;
         }
+        return col;
+    }
+
+    /// Write an inline diff showing unchanged parts once, deletions in red/strikethrough,
+    /// and additions in green. This creates a compact view like: "const -x-+a+ = 10;"
+    fn writeInlineDiff(
+        self: *UI,
+        surface: *vxfw.Surface,
+        row: u16,
+        start_col: u16,
+        old_content: []const u8,
+        new_content: []const u8,
+        old_changes: []const difft.Change,
+        new_changes: []const difft.Change,
+        max_width: u16,
+        base_style: vaxis.Style,
+        is_selected: bool,
+    ) u16 {
+        _ = self;
+        _ = old_changes;
+        _ = new_changes;
+        _ = base_style;
+        var col = start_col;
+
+        // Styles for different parts
+        const deletion_style: vaxis.Style = if (is_selected) .{ .reverse = true } else .{
+            .fg = .{ .rgb = .{ 0xff, 0x5f, 0x5f } }, // Red
+            .strikethrough = true,
+        };
+        const addition_style: vaxis.Style = if (is_selected) .{ .reverse = true } else .{
+            .fg = .{ .rgb = .{ 0x5f, 0xd7, 0x5f } }, // Green
+        };
+        // Unchanged parts should be gray/dim, not inherit the modification color
+        const unchanged_style: vaxis.Style = if (is_selected) .{ .reverse = true } else .{
+            .fg = .{ .rgb = .{ 0x9e, 0x9e, 0x9e } }, // Gray for unchanged parts
+        };
+
+        // Compute the actual diff by finding common prefix and suffix
+        // This is more reliable than using difftastic's change markers which may mark entire lines
+
+        // Find common prefix length
+        var prefix_len: usize = 0;
+        while (prefix_len < old_content.len and prefix_len < new_content.len) {
+            if (old_content[prefix_len] != new_content[prefix_len]) break;
+            prefix_len += 1;
+        }
+
+        // Find common suffix length (but don't overlap with prefix)
+        var suffix_len: usize = 0;
+        while (suffix_len < old_content.len - prefix_len and suffix_len < new_content.len - prefix_len) {
+            const old_idx = old_content.len - 1 - suffix_len;
+            const new_idx = new_content.len - 1 - suffix_len;
+            if (old_content[old_idx] != new_content[new_idx]) break;
+            suffix_len += 1;
+        }
+
+        // The differing parts
+        const old_diff_start = prefix_len;
+        const old_diff_end = old_content.len - suffix_len;
+        const new_diff_start = prefix_len;
+        const new_diff_end = new_content.len - suffix_len;
+
+        // Render common prefix (unchanged)
+        for (old_content[0..prefix_len]) |c| {
+            if (col >= start_col + max_width) break;
+            if (c == '\t') {
+                var spaces: u16 = 0;
+                while (spaces < TAB_WIDTH and col < start_col + max_width) : (spaces += 1) {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = " " },
+                        .style = unchanged_style,
+                    });
+                    col += 1;
+                }
+            } else {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = grapheme(c) },
+                    .style = unchanged_style,
+                });
+                col += 1;
+            }
+        }
+
+        // Render deleted part (from old content) in red with strikethrough
+        for (old_content[old_diff_start..old_diff_end]) |c| {
+            if (col >= start_col + max_width) break;
+            if (c == '\t') {
+                var spaces: u16 = 0;
+                while (spaces < TAB_WIDTH and col < start_col + max_width) : (spaces += 1) {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = " " },
+                        .style = deletion_style,
+                    });
+                    col += 1;
+                }
+            } else {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = grapheme(c) },
+                    .style = deletion_style,
+                });
+                col += 1;
+            }
+        }
+
+        // Render added part (from new content) in green
+        for (new_content[new_diff_start..new_diff_end]) |c| {
+            if (col >= start_col + max_width) break;
+            if (c == '\t') {
+                var spaces: u16 = 0;
+                while (spaces < TAB_WIDTH and col < start_col + max_width) : (spaces += 1) {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = " " },
+                        .style = addition_style,
+                    });
+                    col += 1;
+                }
+            } else {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = grapheme(c) },
+                    .style = addition_style,
+                });
+                col += 1;
+            }
+        }
+
+        // Render common suffix (unchanged)
+        if (suffix_len > 0) {
+            for (new_content[new_content.len - suffix_len ..]) |c| {
+                if (col >= start_col + max_width) break;
+                if (c == '\t') {
+                    var spaces: u16 = 0;
+                    while (spaces < TAB_WIDTH and col < start_col + max_width) : (spaces += 1) {
+                        surface.writeCell(col, row, .{
+                            .char = .{ .grapheme = " " },
+                            .style = unchanged_style,
+                        });
+                        col += 1;
+                    }
+                } else {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = grapheme(c) },
+                        .style = unchanged_style,
+                    });
+                    col += 1;
+                }
+            }
+        }
+
+        return col;
+    }
+
+    /// Get semantic syntax highlighting style based on difftastic's highlight type
+    /// Combines the base novel color (red/green) with semantic token styling
+    fn getSemanticStyle(highlight: difft.Highlight, novel_style: vaxis.Style) vaxis.Style {
+        var style = novel_style;
+
+        switch (highlight) {
+            .string => {
+                // Strings: warm orange/yellow tint
+                style.fg = blendSemanticColor(novel_style.fg, .{ .rgb = .{ 0xff, 0xd7, 0x00 } });
+            },
+            .comment => {
+                // Comments: dimmed/italic appearance
+                style.italic = true;
+                style.fg = blendSemanticColor(novel_style.fg, .{ .rgb = .{ 0x87, 0x87, 0x87 } });
+            },
+            .keyword => {
+                // Keywords: bold with slight blue tint
+                style.bold = true;
+                style.fg = blendSemanticColor(novel_style.fg, .{ .rgb = .{ 0x87, 0xaf, 0xff } });
+            },
+            .type_ => {
+                // Types: cyan tint
+                style.fg = blendSemanticColor(novel_style.fg, .{ .rgb = .{ 0x00, 0xd7, 0xd7 } });
+            },
+            .delimiter => {
+                // Delimiters: slightly dimmed
+                style.fg = blendSemanticColor(novel_style.fg, .{ .rgb = .{ 0xaf, 0xaf, 0xaf } });
+            },
+            .tree_sitter_error => {
+                // Parse errors: underlined
+                style.ul_style = .single;
+            },
+            .novel, .normal => {
+                // Default: use the novel_style as-is
+            },
+        }
+
+        return style;
+    }
+
+    /// Blend a semantic color with the base diff color (red/green)
+    /// This keeps the diff indication while adding semantic meaning
+    fn blendSemanticColor(base: vaxis.Color, semantic: vaxis.Color) vaxis.Color {
+        const base_rgb = switch (base) {
+            .rgb => |rgb| rgb,
+            else => return semantic, // If not RGB, just use semantic color
+        };
+        const semantic_rgb = switch (semantic) {
+            .rgb => |rgb| rgb,
+            else => return base,
+        };
+
+        // Blend: 60% base (diff color) + 40% semantic color
+        // This maintains visibility of add/delete while showing token type
+        return .{ .rgb = .{
+            @intCast((@as(u16, base_rgb[0]) * 6 + @as(u16, semantic_rgb[0]) * 4) / 10),
+            @intCast((@as(u16, base_rgb[1]) * 6 + @as(u16, semantic_rgb[1]) * 4) / 10),
+            @intCast((@as(u16, base_rgb[2]) * 6 + @as(u16, semantic_rgb[2]) * 4) / 10),
+        } };
     }
 
     fn drawFooter(self: *UI, surface: *vxfw.Surface) void {
@@ -1956,39 +2427,37 @@ test "context lines added around changes" {
 
     try ui.buildDiffLines();
 
-    // Should have: 3 context lines before (3-5), 2 modified lines (deletion + addition for line 6), and 3 context lines after (7-9)
-    // Total: 3 + 2 + 3 = 8 lines
-    try std.testing.expect(ui.diff_lines.items.len == 8);
+    // Should have: 3 context lines before (3-5), 1 modification line for line 6, and 3 context lines after (7-9)
+    // Total: 3 + 1 + 3 = 7 lines
+    try std.testing.expect(ui.diff_lines.items.len == 7);
 
     // Lines 3, 4, 5 should be context (before the change at display line 6)
-    try std.testing.expectEqual(ui.diff_lines.items[0].line_num, 3);
+    try std.testing.expectEqual(ui.diff_lines.items[0].new_line_num, 3);
     try std.testing.expect(ui.diff_lines.items[0].line_type == .context);
 
-    try std.testing.expectEqual(ui.diff_lines.items[1].line_num, 4);
+    try std.testing.expectEqual(ui.diff_lines.items[1].new_line_num, 4);
     try std.testing.expect(ui.diff_lines.items[1].line_type == .context);
 
-    try std.testing.expectEqual(ui.diff_lines.items[2].line_num, 5);
+    try std.testing.expectEqual(ui.diff_lines.items[2].new_line_num, 5);
     try std.testing.expect(ui.diff_lines.items[2].line_type == .context);
 
-    // Line 6 is shown as deletion (old content)
-    try std.testing.expectEqual(ui.diff_lines.items[3].line_num, 6);
-    try std.testing.expect(ui.diff_lines.items[3].line_type == .deletion);
-    try std.testing.expectEqualStrings("old line 6", ui.diff_lines.items[3].content);
-
-    // Line 6 is also shown as addition (new content)
-    try std.testing.expectEqual(ui.diff_lines.items[4].line_num, 6);
-    try std.testing.expect(ui.diff_lines.items[4].line_type == .addition);
-    try std.testing.expectEqualStrings("new line 6", ui.diff_lines.items[4].content);
+    // Line 6 is shown as unified modification (both old and new content)
+    try std.testing.expectEqual(ui.diff_lines.items[3].old_line_num, 6);
+    try std.testing.expectEqual(ui.diff_lines.items[3].new_line_num, 6);
+    try std.testing.expect(ui.diff_lines.items[3].line_type == .modification);
+    try std.testing.expectEqualStrings("new line 6", ui.diff_lines.items[3].content);
+    try std.testing.expect(ui.diff_lines.items[3].old_content != null);
+    try std.testing.expectEqualStrings("old line 6", ui.diff_lines.items[3].old_content.?);
 
     // Lines 7, 8, 9 should be context (after the change)
-    try std.testing.expectEqual(ui.diff_lines.items[5].line_num, 7);
+    try std.testing.expectEqual(ui.diff_lines.items[4].new_line_num, 7);
+    try std.testing.expect(ui.diff_lines.items[4].line_type == .context);
+
+    try std.testing.expectEqual(ui.diff_lines.items[5].new_line_num, 8);
     try std.testing.expect(ui.diff_lines.items[5].line_type == .context);
 
-    try std.testing.expectEqual(ui.diff_lines.items[6].line_num, 8);
+    try std.testing.expectEqual(ui.diff_lines.items[6].new_line_num, 9);
     try std.testing.expect(ui.diff_lines.items[6].line_type == .context);
-
-    try std.testing.expectEqual(ui.diff_lines.items[7].line_num, 9);
-    try std.testing.expect(ui.diff_lines.items[7].line_type == .context);
 }
 
 test "context lines handle file boundaries" {
@@ -2044,29 +2513,29 @@ test "context lines handle file boundaries" {
 
     // difft line 1 (0-based) = display line 2
     // context_start = max(1, 2 - 3) = 1
-    // Should have: 1 context line before (line 1), 2 modified lines (deletion + addition for line 2), 3 context lines after (3-5)
-    // Total: 1 + 2 + 3 = 6 lines
-    try std.testing.expect(ui.diff_lines.items.len == 6);
+    // Should have: 1 context line before (line 1), 1 modification line for line 2, 3 context lines after (3-5)
+    // Total: 1 + 1 + 3 = 5 lines
+    try std.testing.expect(ui.diff_lines.items.len == 5);
 
-    try std.testing.expectEqual(ui.diff_lines.items[0].line_num, 1);
+    try std.testing.expectEqual(ui.diff_lines.items[0].new_line_num, 1);
     try std.testing.expect(ui.diff_lines.items[0].line_type == .context);
 
-    try std.testing.expectEqual(ui.diff_lines.items[1].line_num, 2);
-    try std.testing.expect(ui.diff_lines.items[1].line_type == .deletion);
-    try std.testing.expectEqualStrings("old line 2", ui.diff_lines.items[1].content);
+    // Modification has both line numbers
+    try std.testing.expectEqual(ui.diff_lines.items[1].old_line_num, 2);
+    try std.testing.expectEqual(ui.diff_lines.items[1].new_line_num, 2);
+    try std.testing.expect(ui.diff_lines.items[1].line_type == .modification);
+    try std.testing.expectEqualStrings("new line 2", ui.diff_lines.items[1].content);
+    try std.testing.expect(ui.diff_lines.items[1].old_content != null);
+    try std.testing.expectEqualStrings("old line 2", ui.diff_lines.items[1].old_content.?);
 
-    try std.testing.expectEqual(ui.diff_lines.items[2].line_num, 2);
-    try std.testing.expect(ui.diff_lines.items[2].line_type == .addition);
-    try std.testing.expectEqualStrings("new line 2", ui.diff_lines.items[2].content);
+    try std.testing.expectEqual(ui.diff_lines.items[2].new_line_num, 3);
+    try std.testing.expect(ui.diff_lines.items[2].line_type == .context);
 
-    try std.testing.expectEqual(ui.diff_lines.items[3].line_num, 3);
+    try std.testing.expectEqual(ui.diff_lines.items[3].new_line_num, 4);
     try std.testing.expect(ui.diff_lines.items[3].line_type == .context);
 
-    try std.testing.expectEqual(ui.diff_lines.items[4].line_num, 4);
+    try std.testing.expectEqual(ui.diff_lines.items[4].new_line_num, 5);
     try std.testing.expect(ui.diff_lines.items[4].line_type == .context);
-
-    try std.testing.expectEqual(ui.diff_lines.items[5].line_num, 5);
-    try std.testing.expect(ui.diff_lines.items[5].line_type == .context);
 }
 
 test "separator shown between distant chunks" {
@@ -2141,7 +2610,7 @@ test "separator shown between distant chunks" {
 
     var separator_found = false;
     for (ui.diff_lines.items) |line| {
-        if (line.line_num == null and std.mem.eql(u8, line.content, "...")) {
+        if (line.old_line_num == null and line.new_line_num == null and std.mem.eql(u8, line.content, "...")) {
             separator_found = true;
             break;
         }
@@ -2199,7 +2668,7 @@ test "partial file deletion shows content" {
     // Find the deletion line (difft line 5 = display line 6)
     var deletion_found = false;
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion and line.line_num == 6) {
+        if (line.line_type == .deletion or line.line_type == .modification and line.new_line_num == 6 or line.old_line_num == 6) {
             deletion_found = true;
             // Verify it has content
             try std.testing.expectEqualStrings("deleted line", line.content);
@@ -2258,7 +2727,7 @@ test "deleted comment line shows content" {
     // Find the deletion line (difft line 2 = display line 3)
     var deletion_found = false;
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion and line.line_num == 3) {
+        if (line.line_type == .deletion or line.line_type == .modification and line.new_line_num == 3 or line.old_line_num == 3) {
             deletion_found = true;
             // Verify it has the comment content
             try std.testing.expectEqualStrings("// comment line", line.content);
@@ -2317,7 +2786,7 @@ test "blank line deletion shows empty content" {
     // Find the deletion line (difft line 2 = display line 3, should be empty string for blank line)
     var deletion_found = false;
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion and line.line_num == 3) {
+        if (line.line_type == .deletion or line.line_type == .modification and line.new_line_num == 3 or line.old_line_num == 3) {
             deletion_found = true;
             // Blank line deletion should have empty content
             try std.testing.expectEqualStrings("", line.content);
@@ -2373,23 +2842,22 @@ test "modified line shows both deletion and addition" {
 
     try ui.buildDiffLines();
 
-    // Modified lines show BOTH deletion (old content) and addition (new content)
-    var found_old_content = false;
-    var found_new_content = false;
+    // Modified lines now show as a unified modification with both old and new content
+    var found_modification = false;
 
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion and std.mem.eql(u8, line.content, "old content here")) {
-            found_old_content = true;
-            try std.testing.expectEqual(line.line_num, 6); // Display line 6
-        }
-        if (line.line_type == .addition and std.mem.eql(u8, line.content, "new content here")) {
-            found_new_content = true;
-            try std.testing.expectEqual(line.line_num, 6); // Display line 6
+        if (line.line_type == .modification) {
+            found_modification = true;
+            // New content is in .content, old content is in .old_content
+            try std.testing.expectEqualStrings("new content here", line.content);
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expectEqualStrings("old content here", line.old_content.?);
+            try std.testing.expectEqual(line.old_line_num, 6);
+            try std.testing.expectEqual(line.new_line_num, 6);
         }
     }
 
-    try std.testing.expect(found_old_content);
-    try std.testing.expect(found_new_content);
+    try std.testing.expect(found_modification);
 }
 
 test "context lines use correct 1-based line numbers" {
@@ -2449,7 +2917,7 @@ test "context lines use correct 1-based line numbers" {
     var found_line_8_addition = false;
 
     for (ui.diff_lines.items) |line| {
-        if (line.line_num) |num| {
+        if (line.new_line_num orelse line.old_line_num) |num| {
             if (num == 5 and line.line_type == .context) found_line_5 = true;
             if (num == 6 and line.line_type == .context) found_line_6 = true;
             if (num == 7 and line.line_type == .context) found_line_7 = true;
@@ -2525,7 +2993,7 @@ test "separator lines are not selectable" {
     // Find the separator line
     var separator_idx: ?usize = null;
     for (ui.diff_lines.items, 0..) |line, i| {
-        if (line.line_num == null and std.mem.eql(u8, line.content, "...")) {
+        if (line.old_line_num == null and line.new_line_num == null and std.mem.eql(u8, line.content, "...")) {
             separator_idx = i;
             break;
         }
@@ -2653,33 +3121,22 @@ test "modified line with partial change has correct changes arrays" {
 
     try ui_instance.buildDiffLines();
 
-    // Should have two diff lines (deletion + addition)
-    try std.testing.expect(ui_instance.diff_lines.items.len >= 2);
+    // Should have at least one modification line
+    try std.testing.expect(ui_instance.diff_lines.items.len >= 1);
 
-    // Find the deletion line
-    var found_deletion = false;
-    var found_addition = false;
+    // Find the modification line
+    var found_modification = false;
     for (ui_instance.diff_lines.items) |line| {
-        if (line.line_type == .deletion and line.line_num == 1) {
-            found_deletion = true;
-            // Should be marked as partial change
-            try std.testing.expect(line.is_partial_change);
-            // Should have a changes array marking the deleted portion
-            try std.testing.expect(line.changes.len == 1);
-            // The deleted portion starts at "Hello world" (11 chars)
-            try std.testing.expectEqual(@as(u32, 11), line.changes[0].start);
-            try std.testing.expectEqual(@as(u32, 34), line.changes[0].end);
-        }
-        if (line.line_type == .addition and line.line_num == 1) {
-            found_addition = true;
-            // Addition line should NOT be marked as partial change (nothing was added, only deleted)
-            try std.testing.expect(!line.is_partial_change);
-            // No changes to highlight in new content (it's all unchanged)
-            try std.testing.expect(line.changes.len == 0);
+        if (line.line_type == .modification and line.old_line_num == 1 and line.new_line_num == 1) {
+            found_modification = true;
+            // New content should be the shortened line
+            try std.testing.expectEqualStrings("Hello world", line.content);
+            // Old content should be the original longer line
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expectEqualStrings("Hello world, this part was deleted", line.old_content.?);
         }
     }
-    try std.testing.expect(found_deletion);
-    try std.testing.expect(found_addition);
+    try std.testing.expect(found_modification);
 }
 
 test "identical lines are skipped (no false positives)" {
@@ -2728,7 +3185,7 @@ test "identical lines are skipped (no false positives)" {
     // Should NOT have any deletion or addition lines for the "identical line"
     // because old_content == new_content for that line
     for (ui_instance.diff_lines.items) |line| {
-        if (line.line_num == 3) { // display line 3 = index 2
+        if (line.new_line_num == 3 or line.old_line_num == 3) { // display line 3 = index 2
             // If this line appears, it should only be context, not deletion/addition
             try std.testing.expect(line.line_type == .context);
         }
@@ -2836,33 +3293,28 @@ test "difftastic semantic changes: use difft's character-level changes" {
 
     try ui.buildDiffLines();
 
-    // Should have deletion and addition lines
-    try std.testing.expect(ui.diff_lines.items.len >= 2);
+    // Should have at least one line (modification)
+    try std.testing.expect(ui.diff_lines.items.len >= 1);
 
-    // Find the deletion line and verify it uses difft's changes
-    var found_deletion_with_changes = false;
-    var found_addition_with_changes = false;
+    // Find the modification line and verify it uses difft's changes
+    var found_modification = false;
 
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion and line.line_num == 1) {
-            found_deletion_with_changes = true;
-            // Should use difft's semantic change highlighting (position 6-7 for "x")
-            try std.testing.expect(line.changes.len >= 1);
-            // The change should highlight position 6-7 (the "x")
-            try std.testing.expectEqual(@as(u32, 6), line.changes[0].start);
-            try std.testing.expectEqual(@as(u32, 7), line.changes[0].end);
-        }
-        if (line.line_type == .addition and line.line_num == 1) {
-            found_addition_with_changes = true;
-            // Should use difft's semantic change highlighting (position 6-7 for "a")
+        if (line.line_type == .modification and line.old_line_num == 1 and line.new_line_num == 1) {
+            found_modification = true;
+            // New content should be "const a = 10;"
+            try std.testing.expectEqualStrings("const a = 10;", line.content);
+            // Old content should be "const x = 10;"
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expectEqualStrings("const x = 10;", line.old_content.?);
+            // Should use difft's semantic change highlighting (position 6-7 for the changed char)
             try std.testing.expect(line.changes.len >= 1);
             try std.testing.expectEqual(@as(u32, 6), line.changes[0].start);
             try std.testing.expectEqual(@as(u32, 7), line.changes[0].end);
         }
     }
 
-    try std.testing.expect(found_deletion_with_changes);
-    try std.testing.expect(found_addition_with_changes);
+    try std.testing.expect(found_modification);
 }
 
 test "difftastic: multiple semantic changes on same line" {
@@ -2922,23 +3374,25 @@ test "difftastic: multiple semantic changes on same line" {
 
     try ui.buildDiffLines();
 
-    // Find the deletion line and verify it has all 3 changes
+    // Find the modification line and verify it has the changes
+    var found_modification = false;
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion and line.line_num == 1) {
-            // Should have 3 separate change highlights
-            try std.testing.expectEqual(@as(usize, 3), line.changes.len);
-            // First change: "result" at position 4-10
-            try std.testing.expectEqual(@as(u32, 4), line.changes[0].start);
-            try std.testing.expectEqual(@as(u32, 10), line.changes[0].end);
-        }
-        if (line.line_type == .addition and line.line_num == 1) {
-            // Should have 3 separate change highlights
+        if (line.line_type == .modification and line.old_line_num == 1 and line.new_line_num == 1) {
+            found_modification = true;
+            // New content changes should have 3 separate highlights
             try std.testing.expectEqual(@as(usize, 3), line.changes.len);
             // First change: "sum" at position 4-7
             try std.testing.expectEqual(@as(u32, 4), line.changes[0].start);
             try std.testing.expectEqual(@as(u32, 7), line.changes[0].end);
+            
+            // Old content changes should also have 3 separate highlights
+            try std.testing.expectEqual(@as(usize, 3), line.old_changes.len);
+            // First change: "result" at position 4-10
+            try std.testing.expectEqual(@as(u32, 4), line.old_changes[0].start);
+            try std.testing.expectEqual(@as(u32, 10), line.old_changes[0].end);
         }
     }
+    try std.testing.expect(found_modification);
 }
 
 test "difftastic: line moved to different position (asymmetric line numbers)" {
@@ -2995,23 +3449,23 @@ test "difftastic: line moved to different position (asymmetric line numbers)" {
 
     try ui.buildDiffLines();
 
-    // Verify we show the deletion with old line number and addition with new line number
-    var found_deletion = false;
-    var found_addition = false;
+    // With unified modifications, even asymmetric line numbers get combined
+    // The modification shows old content "hello" becoming "world"
+    var found_modification = false;
 
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion and std.mem.eql(u8, line.content, "hello")) {
-            found_deletion = true;
-            try std.testing.expectEqual(@as(u32, 3), line.line_num.?); // Display line 3 (1-based)
-        }
-        if (line.line_type == .addition and std.mem.eql(u8, line.content, "world")) {
-            found_addition = true;
-            try std.testing.expectEqual(@as(u32, 5), line.line_num.?); // Display line 5 (1-based)
+        if (line.line_type == .modification) {
+            found_modification = true;
+            try std.testing.expectEqualStrings("world", line.content);
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expectEqualStrings("hello", line.old_content.?);
+            // Old line was 3 (0-based 2 + 1), new line is 5 (0-based 4 + 1)
+            try std.testing.expectEqual(@as(u32, 3), line.old_line_num.?);
+            try std.testing.expectEqual(@as(u32, 5), line.new_line_num.?);
         }
     }
 
-    try std.testing.expect(found_deletion);
-    try std.testing.expect(found_addition);
+    try std.testing.expect(found_modification);
 }
 
 test "difftastic: pure addition (rhs only)" {
@@ -3069,7 +3523,7 @@ test "difftastic: pure addition (rhs only)" {
     // Find the addition and verify it uses difft's changes
     var found_addition = false;
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .addition and line.line_num == 2) {
+        if ((line.line_type == .addition or line.line_type == .modification) and (line.new_line_num == 2)) {
             found_addition = true;
             try std.testing.expectEqualStrings("// new comment line", line.content);
             // Should use difft's provided changes
@@ -3134,7 +3588,7 @@ test "difftastic: pure deletion (lhs only)" {
     // Find the deletion and verify it uses difft's changes
     var found_deletion = false;
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion and line.line_num == 2) {
+        if (line.line_type == .deletion or line.line_type == .modification and line.new_line_num == 2 or line.old_line_num == 2) {
             found_deletion = true;
             try std.testing.expectEqualStrings("// deleted comment line", line.content);
             // Should use difft's provided changes
@@ -3218,20 +3672,24 @@ test "difftastic: mixed operations in single chunk" {
     // Count the different types of lines
     var deletion_count: usize = 0;
     var addition_count: usize = 0;
+    var modification_count: usize = 0;
 
     for (ui.diff_lines.items) |line| {
         switch (line.line_type) {
             .deletion => deletion_count += 1,
             .addition => addition_count += 1,
+            .modification => modification_count += 1,
             .context => {},
         }
     }
 
-    // Should have:
-    // - 2 deletions (one from modification, one from pure deletion)
-    // - 2 additions (one from modification, one from pure addition)
-    try std.testing.expectEqual(@as(usize, 2), deletion_count);
-    try std.testing.expectEqual(@as(usize, 2), addition_count);
+    // With unified modifications, we should have:
+    // - 1 modification (the modified line is now unified)
+    // - 1 deletion (pure deletion)
+    // - 1 addition (pure addition)
+    try std.testing.expectEqual(@as(usize, 1), modification_count);
+    try std.testing.expectEqual(@as(usize, 1), deletion_count);
+    try std.testing.expectEqual(@as(usize, 1), addition_count);
 }
 
 test "isPartialChange detects partial changes correctly" {
@@ -3335,23 +3793,21 @@ test "unicode content handling" {
 
     try ui.buildDiffLines();
 
-    // Should have deletion and addition
-    var found_deletion = false;
-    var found_addition = false;
+    // Should have a modification with old_content="hello..." and content="héllo..."
+    var found_modification = false;
 
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion) {
-            found_deletion = true;
-            try std.testing.expect(std.mem.indexOf(u8, line.content, "hello") != null);
-        }
-        if (line.line_type == .addition) {
-            found_addition = true;
+        if (line.line_type == .modification) {
+            found_modification = true;
+            // New content should have "héllo"
             try std.testing.expect(std.mem.indexOf(u8, line.content, "héllo") != null);
+            // Old content should have "hello" 
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expect(std.mem.indexOf(u8, line.old_content.?, "hello") != null);
         }
     }
 
-    try std.testing.expect(found_deletion);
-    try std.testing.expect(found_addition);
+    try std.testing.expect(found_modification);
 }
 
 test "empty file to non-empty file" {
@@ -3424,7 +3880,7 @@ test "non-empty file to empty file" {
     // All lines should be deletions
     try std.testing.expectEqual(@as(usize, 3), ui.diff_lines.items.len);
     for (ui.diff_lines.items) |line| {
-        try std.testing.expect(line.line_type == .deletion);
+        try std.testing.expect(line.line_type == .deletion or line.line_type == .modification);
     }
 }
 
@@ -3477,23 +3933,21 @@ test "whitespace-only changes" {
 
     try ui.buildDiffLines();
 
-    // Should have deletion and addition
-    var found_deletion = false;
-    var found_addition = false;
+    // Should have a modification
+    var found_modification = false;
 
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion) {
-            found_deletion = true;
-            try std.testing.expect(std.mem.startsWith(u8, line.content, "    ")); // 4 spaces
-        }
-        if (line.line_type == .addition) {
-            found_addition = true;
-            try std.testing.expect(std.mem.startsWith(u8, line.content, "\t")); // tab
+        if (line.line_type == .modification) {
+            found_modification = true;
+            // New content should start with tab
+            try std.testing.expect(std.mem.startsWith(u8, line.content, "\t"));
+            // Old content should start with 4 spaces
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expect(std.mem.startsWith(u8, line.old_content.?, "    "));
         }
     }
 
-    try std.testing.expect(found_deletion);
-    try std.testing.expect(found_addition);
+    try std.testing.expect(found_modification);
 }
 
 test "very long lines" {
@@ -3548,21 +4002,466 @@ test "very long lines" {
 
     try ui.buildDiffLines();
 
-    // Should have deletion and addition
-    var found_deletion = false;
-    var found_addition = false;
+    // Should have a modification
+    var found_modification = false;
 
     for (ui.diff_lines.items) |line| {
-        if (line.line_type == .deletion) {
-            found_deletion = true;
+        if (line.line_type == .modification) {
+            found_modification = true;
+            // New content (1000 y's)
             try std.testing.expectEqual(@as(usize, 1000), line.content.len);
-        }
-        if (line.line_type == .addition) {
-            found_addition = true;
-            try std.testing.expectEqual(@as(usize, 1000), line.content.len);
+            // Old content (1000 x's)
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expectEqual(@as(usize, 1000), line.old_content.?.len);
         }
     }
 
-    try std.testing.expect(found_deletion);
+    try std.testing.expect(found_modification);
+}
+
+// =============================================================================
+// Inline diff tests - verify unchanged/deleted/added parts are identified correctly
+// =============================================================================
+
+test "inline diff: addition at end of line" {
+    // Test that adding content at the end shows prefix as unchanged
+    // Old: "$ zig build"
+    // New: "$ zig build  # Build the binary"
+    // Expected: "$ zig build" unchanged (gray), "  # Build the binary" added (green)
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 0, .changes = &.{} },
+        .rhs = .{ .line_number = 0, .changes = &.{} },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "$ zig build";
+    const new_content = "$ zig build  # Build the binary";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Find the modification line
+    var found_modification = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .modification) {
+            found_modification = true;
+            // The modification should have both old and new content
+            try std.testing.expectEqualStrings("$ zig build  # Build the binary", line.content);
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expectEqualStrings("$ zig build", line.old_content.?);
+        }
+    }
+    try std.testing.expect(found_modification);
+}
+
+test "inline diff: modification in middle of line" {
+    // Test that changing content in the middle shows prefix and suffix as unchanged
+    // Old: "const x = 10;"
+    // New: "const y = 10;"
+    // Expected: "const " unchanged, "x" deleted, "y" added, " = 10;" unchanged
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 0, .changes = &.{} },
+        .rhs = .{ .line_number = 0, .changes = &.{} },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "const x = 10;";
+    const new_content = "const y = 10;";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Find the modification line and verify structure
+    var found_modification = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .modification) {
+            found_modification = true;
+            try std.testing.expectEqualStrings("const y = 10;", line.content);
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expectEqualStrings("const x = 10;", line.old_content.?);
+            // Both lines have same length, only 1 char differs at position 6
+        }
+    }
+    try std.testing.expect(found_modification);
+}
+
+test "inline diff: deletion at beginning of line" {
+    // Test that removing content from the beginning shows suffix as unchanged
+    // Old: "    indented line"
+    // New: "indented line"
+    // Expected: "    " deleted, "indented line" unchanged
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 0, .changes = &.{} },
+        .rhs = .{ .line_number = 0, .changes = &.{} },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "    indented line";
+    const new_content = "indented line";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    var found_modification = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .modification) {
+            found_modification = true;
+            try std.testing.expectEqualStrings("indented line", line.content);
+            try std.testing.expect(line.old_content != null);
+            try std.testing.expectEqualStrings("    indented line", line.old_content.?);
+        }
+    }
+    try std.testing.expect(found_modification);
+}
+
+// =============================================================================
+// Line number offset tests - verify old/new line numbers track correctly
+// =============================================================================
+
+test "line numbers: additions shift subsequent line numbers" {
+    // When lines are added, context lines after should show different old/new numbers
+    // Old file: line1, line2, line3
+    // New file: line1, NEW_LINE, line2, line3
+    // After the addition, "line2" should show old=2, new=3
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    // Addition at line 2 (0-based: 1)
+    try chunk_entries.append(allocator, .{
+        .lhs = null,
+        .rhs = .{ .line_number = 1, .changes = &.{} },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "line1\nline2\nline3\nline4\nline5";
+    const new_content = "line1\nNEW_LINE\nline2\nline3\nline4\nline5";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Check that the addition is at new line 2
+    var found_addition = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .addition and line.new_line_num == 2) {
+            found_addition = true;
+            try std.testing.expectEqualStrings("NEW_LINE", line.content);
+            try std.testing.expect(line.old_line_num == null); // Addition has no old line
+        }
+    }
     try std.testing.expect(found_addition);
+
+    // Check context lines after the addition have offset line numbers
+    // "line2" content should be at old=2, new=3
+    var found_line2_context = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .context and std.mem.eql(u8, line.content, "line2")) {
+            found_line2_context = true;
+            try std.testing.expectEqual(@as(u32, 2), line.old_line_num.?);
+            try std.testing.expectEqual(@as(u32, 3), line.new_line_num.?);
+        }
+    }
+    try std.testing.expect(found_line2_context);
+}
+
+test "line numbers: deletions shift subsequent line numbers" {
+    // When lines are deleted, context lines after should show different old/new numbers
+    // Old file: line1, DELETED, line2, line3
+    // New file: line1, line2, line3
+    // After the deletion, "line2" should show old=3, new=2
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    // Deletion at old line 2 (0-based: 1)
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 1, .changes = &.{} },
+        .rhs = null,
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "line1\nDELETED\nline2\nline3\nline4\nline5";
+    const new_content = "line1\nline2\nline3\nline4\nline5";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Check that the deletion is at old line 2
+    var found_deletion = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .deletion and line.old_line_num == 2) {
+            found_deletion = true;
+            try std.testing.expectEqualStrings("DELETED", line.content);
+            try std.testing.expect(line.new_line_num == null); // Deletion has no new line
+        }
+    }
+    try std.testing.expect(found_deletion);
+}
+
+test "line numbers: multiple additions accumulate offset" {
+    // Multiple additions should accumulate the offset
+    // Old file: line1, line2
+    // New file: line1, NEW1, NEW2, line2
+    // "line2" should show old=2, new=4 (offset of 2)
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    // Two additions at lines 2 and 3 (0-based: 1 and 2)
+    try chunk_entries.append(allocator, .{
+        .lhs = null,
+        .rhs = .{ .line_number = 1, .changes = &.{} },
+    });
+    try chunk_entries.append(allocator, .{
+        .lhs = null,
+        .rhs = .{ .line_number = 2, .changes = &.{} },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "line1\nline2\nline3\nline4\nline5";
+    const new_content = "line1\nNEW1\nNEW2\nline2\nline3\nline4\nline5";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Check that additions are present
+    var addition_count: usize = 0;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .addition) {
+            addition_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), addition_count);
+
+    // Check context line "line2" has correct offset (old=2, new=4)
+    var found_line2 = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .context and std.mem.eql(u8, line.content, "line2")) {
+            found_line2 = true;
+            try std.testing.expectEqual(@as(u32, 2), line.old_line_num.?);
+            try std.testing.expectEqual(@as(u32, 4), line.new_line_num.?);
+        }
+    }
+    try std.testing.expect(found_line2);
+}
+
+test "line numbers: modification preserves line mapping" {
+    // A modification (same line changed) should update offset based on actual positions
+    // Old file line 3: "old content"
+    // New file line 5: "new content" (due to additions above)
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var chunk_entries: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries.deinit(allocator);
+
+    // Modification: old line 2 (0-based) maps to new line 4 (0-based)
+    try chunk_entries.append(allocator, .{
+        .lhs = .{ .line_number = 2, .changes = &.{} },
+        .rhs = .{ .line_number = 4, .changes = &.{} },
+    });
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .language = try allocator.dupe(u8, "Text"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    const old_content = "line1\nline2\nold content\nline4";
+    const new_content = "line1\nline2\nnew1\nnew2\nnew content\nline4";
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.txt"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, old_content),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Find the modification and verify line numbers
+    var found_modification = false;
+    for (ui.diff_lines.items) |line| {
+        if (line.line_type == .modification) {
+            found_modification = true;
+            // Old line 3 (1-based), new line 5 (1-based)
+            try std.testing.expectEqual(@as(u32, 3), line.old_line_num.?);
+            try std.testing.expectEqual(@as(u32, 5), line.new_line_num.?);
+        }
+    }
+    try std.testing.expect(found_modification);
 }

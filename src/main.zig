@@ -6,6 +6,7 @@ const git = @import("git.zig");
 const difft = @import("difft.zig");
 const review = @import("review.zig");
 const ui = @import("ui.zig");
+const highlight = @import("highlight.zig");
 
 const Args = struct {
     staged: bool = false,
@@ -316,4 +317,5 @@ comptime {
     _ = difft;
     _ = review;
     _ = ui;
+    _ = highlight;
 }

@@ -40,6 +40,10 @@
             .url = "https://github.com/jacobsandlund/uucode/archive/refs/heads/zig-0.16.zip",
             .hash = "uucode-0.1.0-ZZjBPphWUABH_ChjdEku1Vplc1Y107C0GvgGJk8HrX8Z",
         },
+        .tree_sitter = .{
+            .url = "https://github.com/unexge/tree-sitter/releases/download/master-6d28d2794b3af3f9c460904e380f7b285f0bd694/source.tar.gz",
+            .hash = "tree_sitter-0.22.4-150-g7e3f5726-z0LhyNmG1y4GHySNfq-zZiKK6fpJvicYxMg08_R4hxTL",
+        },
     },
     .paths = .{
         "build.zig",

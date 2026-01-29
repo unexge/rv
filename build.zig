@@ -9,6 +9,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const tree_sitter = b.dependency("tree_sitter", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "rv",
         .root_module = b.createModule(.{
@@ -18,6 +23,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("vaxis", vaxis.module("vaxis"));
+    exe.root_module.addImport("treez", tree_sitter.module("treez"));
 
     b.installArtifact(exe);
 

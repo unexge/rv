@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const review = @import("review.zig");
 const difft = @import("difft.zig");
+const highlight = @import("highlight.zig");
 
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
@@ -41,6 +42,7 @@ const DiffLine = struct {
     line_type: LineType,
     selectable: bool = true,
     is_partial_change: bool = false, // True if only part of line changed (unchanged parts shown in white)
+    content_byte_offset: u32 = 0, // Byte offset of this line in the new file content (for syntax highlighting)
 
     const LineType = enum {
         context, // Unchanged line (shown with space prefix)
@@ -65,6 +67,9 @@ pub const UI = struct {
     should_quit: bool = false,
     focus_side: review.CommentSide = .new,
     file_list_cursor: usize = 0,
+    // Syntax highlighting
+    highlighter: ?highlight.Highlighter = null,
+    syntax_spans: []const highlight.HighlightSpan = &.{},
     // Ask mode state
     ask_response: ?[]const u8 = null,
     ask_scroll_offset: usize = 0,
@@ -153,6 +158,13 @@ pub const UI = struct {
         if (self.ask_pending_prompt) |prompt| {
             self.allocator.free(prompt);
         }
+        // Clean up syntax highlighting
+        if (self.syntax_spans.len > 0) {
+            self.allocator.free(self.syntax_spans);
+        }
+        if (self.highlighter) |*hl| {
+            hl.deinit();
+        }
     }
 
     /// Duplicate a changes array, allocating new memory for the array and content strings
@@ -192,22 +204,53 @@ pub const UI = struct {
         }
         self.diff_lines.clearRetainingCapacity();
 
+        // Clean up old syntax highlighting
+        if (self.syntax_spans.len > 0) {
+            self.allocator.free(self.syntax_spans);
+            self.syntax_spans = &.{};
+        }
+        if (self.highlighter) |*hl| {
+            hl.deinit();
+            self.highlighter = null;
+        }
+
         const file = self.session.currentFile() orelse return;
         if (file.is_binary) return;
+
+        // Initialize syntax highlighter for this file
+        if (highlight.Language.fromPath(file.path)) |lang| {
+            if (highlight.Highlighter.init(self.allocator, lang)) |hl| {
+                self.highlighter = hl;
+                // Highlight the new content (what we display for context lines)
+                if (self.highlighter.?.highlight(file.new_content)) |spans| {
+                    self.syntax_spans = spans;
+                } else |_| {
+                    // Highlighting failed, continue without it
+                }
+            } else |_| {
+                // Language not supported or init failed
+            }
+        }
 
         var old_lines: std.ArrayList([]const u8) = .empty;
         defer old_lines.deinit(self.allocator);
         var new_lines: std.ArrayList([]const u8) = .empty;
         defer new_lines.deinit(self.allocator);
+        var new_line_offsets: std.ArrayList(u32) = .empty;
+        defer new_line_offsets.deinit(self.allocator);
 
         var old_iter = std.mem.splitScalar(u8, file.old_content, '\n');
         while (old_iter.next()) |line| {
             try old_lines.append(self.allocator, line);
         }
 
+        // Track byte offsets for each line in new content
+        var byte_offset: u32 = 0;
         var new_iter = std.mem.splitScalar(u8, file.new_content, '\n');
         while (new_iter.next()) |line| {
             try new_lines.append(self.allocator, line);
+            try new_line_offsets.append(self.allocator, byte_offset);
+            byte_offset += @intCast(line.len + 1); // +1 for newline
         }
 
         if (file.diff.chunks.len == 0 and (file.diff.status == .removed or file.diff.status == .added or file.diff.status == .unchanged)) {
@@ -225,24 +268,28 @@ pub const UI = struct {
             } else if (file.diff.status == .added) {
                 for (new_lines.items, 0..) |line, idx| {
                     const line_num: u32 = @intCast(idx + 1);
+                    const offset = if (idx < new_line_offsets.items.len) new_line_offsets.items[idx] else 0;
                     try self.diff_lines.append(self.allocator, .{
                         .old_line_num = null,
                         .new_line_num = line_num,
                         .content = try self.allocator.dupe(u8, line),
                         .changes = &.{},
                         .line_type = .addition,
+                        .content_byte_offset = offset,
                     });
                 }
             } else if (file.diff.status == .unchanged) {
                 // For unchanged files, show all lines as context
                 for (new_lines.items, 0..) |line, idx| {
                     const line_num: u32 = @intCast(idx + 1);
+                    const offset = if (idx < new_line_offsets.items.len) new_line_offsets.items[idx] else 0;
                     try self.diff_lines.append(self.allocator, .{
                         .old_line_num = line_num,
                         .new_line_num = line_num,
                         .content = try self.allocator.dupe(u8, line),
                         .changes = &.{},
                         .line_type = .context,
+                        .content_byte_offset = offset,
                     });
                 }
             }
@@ -1116,13 +1163,7 @@ pub const UI = struct {
         if (final_response.items.len == 0) {
             // Show first part of raw output for debugging
             const preview_len = @min(response_text.items.len, 500);
-            return try std.fmt.allocPrint(self.allocator, 
-                "No text response found in Pi output.\n\nRaw output preview ({d} bytes total):\n{s}{s}", 
-                .{ 
-                    response_text.items.len, 
-                    response_text.items[0..preview_len],
-                    if (response_text.items.len > 500) "\n..." else ""
-                });
+            return try std.fmt.allocPrint(self.allocator, "No text response found in Pi output.\n\nRaw output preview ({d} bytes total):\n{s}{s}", .{ response_text.items.len, response_text.items[0..preview_len], if (response_text.items.len > 500) "\n..." else "" });
         }
 
         return try final_response.toOwnedSlice(self.allocator);
@@ -1641,7 +1682,13 @@ pub const UI = struct {
                     while (content.len > 0 and (content[content.len - 1] == '\n' or content[content.len - 1] == '\r')) {
                         content = content[0 .. content.len - 1];
                     }
-                    self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection);
+                    const byte_offset = if (diff_line.content_byte_offset > 0)
+                        diff_line.content_byte_offset
+                    else if (diff_line.new_line_num) |ln|
+                        self.computeLineByteOffset(ln)
+                    else
+                        0;
+                    self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection, byte_offset, diff_line.line_type);
                 }
             } else {
                 // Regular line (addition, deletion, context)
@@ -1651,7 +1698,13 @@ pub const UI = struct {
                     content = content[0 .. content.len - 1];
                 }
 
-                self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection);
+                const byte_offset = if (diff_line.content_byte_offset > 0)
+                    diff_line.content_byte_offset
+                else if (diff_line.new_line_num) |ln|
+                    self.computeLineByteOffset(ln)
+                else
+                    0;
+                self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection, byte_offset, diff_line.line_type);
             }
         }
     }
@@ -1669,8 +1722,10 @@ pub const UI = struct {
         base_style: vaxis.Style,
         novel_style: vaxis.Style,
         is_selected: bool,
+        content_byte_offset: u32,
+        line_type: DiffLine.LineType,
     ) void {
-        _ = self.writeContentWithHighlightAndReturn(surface, row, start_col, content, changes, max_width, base_style, novel_style, is_selected);
+        _ = self.writeContentWithHighlightAndReturn(surface, row, start_col, content, changes, max_width, base_style, novel_style, is_selected, content_byte_offset, line_type);
     }
 
     fn writeContentWithHighlightAndReturn(
@@ -1684,8 +1739,12 @@ pub const UI = struct {
         base_style: vaxis.Style,
         novel_style: vaxis.Style,
         is_selected: bool,
+        content_byte_offset: u32,
+        line_type: DiffLine.LineType,
     ) u16 {
-        _ = self;
+        // Background colors for additions/deletions
+        const addition_bg: vaxis.Color = .{ .rgb = .{ 0x1a, 0x3d, 0x1a } }; // Dark green
+        const deletion_bg: vaxis.Color = .{ .rgb = .{ 0x3d, 0x1a, 0x1a } }; // Dark red
 
         var col = start_col;
         var char_idx: u32 = 0;
@@ -1695,21 +1754,46 @@ pub const UI = struct {
         for (content) |c| {
             if (col >= start_col + max_width) break;
 
-            // Determine if this character is in a changed region and get its highlight type
-            var current_change: ?*const difft.Change = null;
+            // Global byte position in the file
+            const global_byte_pos = content_byte_offset + char_idx;
+
+            // Determine if this character is in a changed region
+            var in_change = false;
             for (changes) |*change| {
                 if (char_idx >= change.start and char_idx < change.end) {
-                    current_change = change;
+                    in_change = true;
                     break;
                 }
             }
 
-            // Compute the style based on whether this is a novel token and its semantic type
-            const style = if (current_change != null and !is_selected) blk: {
-                const change = current_change.?;
-                // Apply semantic highlighting if available, otherwise use novel_style
-                break :blk getSemanticStyle(change.highlight, novel_style);
-            } else base_style;
+            // Compute the style:
+            // 1. Start with syntax highlighting if available
+            // 2. Apply background color for additions/deletions
+            // 3. Override foreground for changed regions in modifications
+            var style = if (!is_selected) self.getSyntaxStyle(global_byte_pos, base_style) else base_style;
+
+            // Apply background for additions/deletions
+            if (!is_selected) {
+                switch (line_type) {
+                    .addition => {
+                        style.bg = addition_bg;
+                    },
+                    .deletion => {
+                        style.bg = deletion_bg;
+                    },
+                    .modification => {
+                        // For modifications, highlight changed parts with background
+                        if (in_change) {
+                            style.bg = addition_bg;
+                            // Use novel_style foreground for changed parts
+                            style.fg = novel_style.fg;
+                        }
+                    },
+                    .context => {
+                        // Keep syntax highlighting only
+                    },
+                }
+            }
 
             if (c == '\t') {
                 // Expand tab to spaces (to next tab stop)
@@ -1734,6 +1818,76 @@ pub const UI = struct {
             char_idx += 1;
         }
         return col;
+    }
+
+    /// Get syntax highlighting style for a byte position
+    fn getSyntaxStyle(self: *UI, byte_pos: u32, base_style: vaxis.Style) vaxis.Style {
+        // Binary search could be faster but linear is fine for now
+        for (self.syntax_spans) |span| {
+            if (byte_pos >= span.start_byte and byte_pos < span.end_byte) {
+                return highlightToStyle(span.highlight, base_style);
+            }
+        }
+        return base_style;
+    }
+
+    /// Compute byte offset for a given line number in new content
+    fn computeLineByteOffset(self: *UI, line_num: u32) u32 {
+        const file = self.session.currentFile() orelse return 0;
+        const content = file.new_content;
+
+        var offset: u32 = 0;
+        var current_line: u32 = 1;
+
+        for (content, 0..) |c, i| {
+            if (current_line == line_num) {
+                return @intCast(i);
+            }
+            if (c == '\n') {
+                current_line += 1;
+            }
+            offset = @intCast(i + 1);
+        }
+
+        return if (current_line == line_num) offset else 0;
+    }
+
+    /// Convert highlight type to vaxis style
+    fn highlightToStyle(hl: highlight.HighlightType, base_style: vaxis.Style) vaxis.Style {
+        var style = base_style;
+        switch (hl) {
+            .keyword => {
+                style.fg = .{ .rgb = .{ 0xc5, 0x8a, 0xff } }; // Purple
+                style.bold = true;
+            },
+            .type_ => {
+                style.fg = .{ .rgb = .{ 0x00, 0xd7, 0xd7 } }; // Cyan
+            },
+            .function => {
+                style.fg = .{ .rgb = .{ 0x61, 0xaf, 0xef } }; // Blue
+            },
+            .string => {
+                style.fg = .{ .rgb = .{ 0x98, 0xc3, 0x79 } }; // Green
+            },
+            .number => {
+                style.fg = .{ .rgb = .{ 0xd1, 0x9a, 0x66 } }; // Orange
+            },
+            .comment => {
+                style.fg = .{ .rgb = .{ 0x5c, 0x63, 0x70 } }; // Gray
+                style.italic = true;
+            },
+            .constant => {
+                style.fg = .{ .rgb = .{ 0xe5, 0xc0, 0x7b } }; // Yellow
+            },
+            .operator, .punctuation => {
+                style.fg = .{ .rgb = .{ 0xab, 0xb2, 0xbf } }; // Light gray
+            },
+            .variable => {
+                // Keep base style for variables
+            },
+            .none => {},
+        }
+        return style;
     }
 
     /// Write an inline diff showing unchanged parts once, deletions in red/strikethrough,
@@ -1886,10 +2040,10 @@ pub const UI = struct {
 
     /// Get semantic syntax highlighting style based on difftastic's highlight type
     /// Combines the base novel color (red/green) with semantic token styling
-    fn getSemanticStyle(highlight: difft.Highlight, novel_style: vaxis.Style) vaxis.Style {
+    fn getSemanticStyle(hl_type: difft.Highlight, novel_style: vaxis.Style) vaxis.Style {
         var style = novel_style;
 
-        switch (highlight) {
+        switch (hl_type) {
             .string => {
                 // Strings: warm orange/yellow tint
                 style.fg = blendSemanticColor(novel_style.fg, .{ .rgb = .{ 0xff, 0xd7, 0x00 } });
@@ -2076,7 +2230,7 @@ pub const UI = struct {
                 thread.join();
                 self.ask_thread = null;
             }
-            
+
             if (self.ask_thread_error) |err| {
                 if (self.ask_response) |old| {
                     self.allocator.free(old);
@@ -2090,18 +2244,18 @@ pub const UI = struct {
                 self.ask_response = result;
                 self.ask_thread_result = null;
             }
-            
+
             if (self.ask_pending_prompt) |prompt| {
                 self.allocator.free(prompt);
                 self.ask_pending_prompt = null;
             }
             self.ask_thread_done.store(false, .release);
-            
+
             self.ask_scroll_offset = 0;
             self.mode = .ask_response;
             self.input_buffer.clear();
             self.selection_start = null;
-            
+
             // Draw the response instead
             return self.drawAskResponse(ctx);
         }
@@ -2118,9 +2272,9 @@ pub const UI = struct {
         writeString(&surface, 1, 0, "Ask Pi", header_style);
 
         const center_row = size.height / 2;
-        
+
         // Static loading message with dots
-        writeString(&surface, 2, center_row - 1, "⏳ Asking Pi...", .{ 
+        writeString(&surface, 2, center_row - 1, "⏳ Asking Pi...", .{
             .bold = true,
             .fg = .{ .rgb = .{ 0xaf, 0x5f, 0xff } }, // Purple text
         });
@@ -3384,7 +3538,7 @@ test "difftastic: multiple semantic changes on same line" {
             // First change: "sum" at position 4-7
             try std.testing.expectEqual(@as(u32, 4), line.changes[0].start);
             try std.testing.expectEqual(@as(u32, 7), line.changes[0].end);
-            
+
             // Old content changes should also have 3 separate highlights
             try std.testing.expectEqual(@as(usize, 3), line.old_changes.len);
             // First change: "result" at position 4-10
@@ -3801,7 +3955,7 @@ test "unicode content handling" {
             found_modification = true;
             // New content should have "héllo"
             try std.testing.expect(std.mem.indexOf(u8, line.content, "héllo") != null);
-            // Old content should have "hello" 
+            // Old content should have "hello"
             try std.testing.expect(line.old_content != null);
             try std.testing.expect(std.mem.indexOf(u8, line.old_content.?, "hello") != null);
         }

@@ -15,9 +15,9 @@ fn escapeForShell(allocator: Allocator, input: []const u8) Allocator.Error![]con
             special_count += 1;
         }
     }
-    
+
     if (special_count == 0) return try allocator.dupe(u8, input);
-    
+
     var result = try allocator.alloc(u8, input.len + special_count);
     var i: usize = 0;
     for (input) |c| {
@@ -90,7 +90,7 @@ pub fn runCommand(allocator: Allocator, cmd: []const u8) GitError!struct { stdou
 pub fn readFileContent(allocator: Allocator, path: []const u8) GitError![]const u8 {
     const escaped_path = try escapeForShell(allocator, path);
     defer allocator.free(escaped_path);
-    
+
     const cmd = std.fmt.allocPrint(allocator, "cat \"{s}\" 2>/dev/null", .{escaped_path}) catch return GitError.CommandFailed;
     defer allocator.free(cmd);
 
@@ -278,7 +278,7 @@ fn parseNameStatus(allocator: Allocator, output: []const u8) GitError![]ChangedF
 pub fn getFileAtRevision(allocator: Allocator, path: []const u8, rev: []const u8) GitError!?[]const u8 {
     const escaped_path = try escapeForShell(allocator, path);
     defer allocator.free(escaped_path);
-    
+
     const cmd = try std.fmt.allocPrint(allocator, "git show \"{s}:{s}\" 2>/dev/null", .{ rev, escaped_path });
     defer allocator.free(cmd);
 
@@ -321,28 +321,28 @@ test "isBinaryFile" {
 
 test "escapeForShell" {
     const allocator = std.testing.allocator;
-    
+
     // No special characters
     {
         const result = try escapeForShell(allocator, "simple.txt");
         defer allocator.free(result);
         try std.testing.expectEqualStrings("simple.txt", result);
     }
-    
+
     // Double quotes
     {
         const result = try escapeForShell(allocator, "file\"name.txt");
         defer allocator.free(result);
         try std.testing.expectEqualStrings("file\\\"name.txt", result);
     }
-    
+
     // Dollar sign
     {
         const result = try escapeForShell(allocator, "file$name.txt");
         defer allocator.free(result);
         try std.testing.expectEqualStrings("file\\$name.txt", result);
     }
-    
+
     // Multiple special chars
     {
         const result = try escapeForShell(allocator, "a\"b$c`d\\e!f");

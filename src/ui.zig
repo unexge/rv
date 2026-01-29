@@ -3,17 +3,10 @@ const Allocator = std.mem.Allocator;
 const review = @import("review.zig");
 const difft = @import("difft.zig");
 const highlight = @import("highlight.zig");
+const pi = @import("pi.zig");
 
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
-
-// C library functions for popen (same pattern as git.zig)
-// Using popen for shell command execution as it handles pipes and shell features
-const FILE = opaque {};
-extern fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
-extern fn pclose(stream: *FILE) c_int;
-extern fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *FILE) usize;
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 pub const UIError = error{
     InitFailed,
@@ -1036,7 +1029,7 @@ pub const UI = struct {
             return;
         };
 
-        const response = self.callPiRpc(prompt) catch |err| {
+        const response = pi.askPi(self.allocator, prompt) catch |err| {
             self.ask_thread_error = std.fmt.allocPrint(self.allocator, "RPC error: {}", .{err}) catch null;
             self.ask_thread_done.store(true, .release);
             return;
@@ -1044,210 +1037,6 @@ pub const UI = struct {
 
         self.ask_thread_result = response;
         self.ask_thread_done.store(true, .release);
-    }
-
-    fn callPiRpc(self: *UI, prompt: []const u8) ![]const u8 {
-        // Build the JSON command with proper escaping
-        const json_prompt = try self.jsonEscapeString(prompt);
-        defer self.allocator.free(json_prompt);
-
-        // Get pi binary path from environment or use default
-        const pi_bin: []const u8 = if (getenv("RV_PI_BIN")) |env_ptr|
-            std.mem.sliceTo(env_ptr, 0)
-        else
-            "pi";
-
-        // Build the JSON payload
-        var json_buf: std.ArrayList(u8) = .empty;
-        defer json_buf.deinit(self.allocator);
-
-        try json_buf.appendSlice(self.allocator, "{\"type\":\"prompt\",\"message\":");
-        try json_buf.appendSlice(self.allocator, json_prompt);
-        try json_buf.appendSlice(self.allocator, "}\n");
-
-        // Base64 encode JSON to avoid shell escaping issues
-        const base64 = std.base64.standard;
-        const encoded_len = base64.Encoder.calcSize(json_buf.items.len);
-        const encoded = try self.allocator.alloc(u8, encoded_len);
-        defer self.allocator.free(encoded);
-        _ = base64.Encoder.encode(encoded, json_buf.items);
-
-        // Use base64 decode piped to pi - no temp file needed
-        const cmd = try std.fmt.allocPrint(self.allocator, "echo '{s}' | base64 -d | {s} --mode rpc --no-session 2>&1", .{ encoded, pi_bin });
-        defer self.allocator.free(cmd);
-
-        const cmd_z = try self.allocator.dupeZ(u8, cmd);
-        defer self.allocator.free(cmd_z);
-
-        // Use popen to run the command (consistent with git.zig pattern)
-        const fp = popen(cmd_z.ptr, "r") orelse {
-            return try std.fmt.allocPrint(self.allocator, "Failed to start Pi (popen failed)\nCommand: {s}", .{pi_bin});
-        };
-        defer _ = pclose(fp);
-
-        // Read all output
-        var response_text: std.ArrayList(u8) = .empty;
-        defer response_text.deinit(self.allocator);
-
-        var buf: [4096]u8 = undefined;
-        while (true) {
-            const n = fread(&buf, 1, buf.len, fp);
-            if (n == 0) break;
-            try response_text.appendSlice(self.allocator, buf[0..n]);
-        }
-
-        // Check if we got any output at all
-        if (response_text.items.len == 0) {
-            return try std.fmt.allocPrint(self.allocator, "No output from Pi.\nBinary: {s}\nMake sure 'pi' is installed and accessible.", .{pi_bin});
-        }
-
-        // Check for error responses from Pi
-        var has_error: bool = false;
-        var error_message: ?[]const u8 = null;
-
-        // Parse the response - look for text_delta events and concatenate
-        var final_response: std.ArrayList(u8) = .empty;
-        errdefer final_response.deinit(self.allocator);
-
-        var lines = std.mem.splitScalar(u8, response_text.items, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-
-            // Check for error response
-            if (std.mem.indexOf(u8, line, "\"success\":false")) |_| {
-                has_error = true;
-                // Try to extract error message
-                if (std.mem.indexOf(u8, line, "\"error\":\"")) |err_start| {
-                    const content_start = err_start + 9;
-                    var end = content_start;
-                    while (end < line.len and line[end] != '"') : (end += 1) {}
-                    error_message = line[content_start..end];
-                }
-            }
-
-            // Look for text_delta in message_update events
-            if (std.mem.indexOf(u8, line, "\"text_delta\"")) |_| {
-                // Extract the delta value
-                if (std.mem.indexOf(u8, line, "\"delta\":\"")) |delta_start| {
-                    const content_start = delta_start + 9;
-                    var end = content_start;
-                    var escape_next = false;
-                    while (end < line.len) : (end += 1) {
-                        if (escape_next) {
-                            escape_next = false;
-                            continue;
-                        }
-                        if (line[end] == '\\') {
-                            escape_next = true;
-                            continue;
-                        }
-                        if (line[end] == '"') break;
-                    }
-                    const delta = line[content_start..end];
-                    // Unescape the JSON string
-                    const unescaped = try self.jsonUnescapeString(delta);
-                    defer self.allocator.free(unescaped);
-                    try final_response.appendSlice(self.allocator, unescaped);
-                }
-            }
-        }
-
-        // If we got an error, report it
-        if (has_error) {
-            if (error_message) |msg| {
-                return try std.fmt.allocPrint(self.allocator, "Pi returned an error:\n{s}", .{msg});
-            }
-            return try self.allocator.dupe(u8, "Pi returned an error (unknown)");
-        }
-
-        if (final_response.items.len == 0) {
-            // Show first part of raw output for debugging
-            const preview_len = @min(response_text.items.len, 500);
-            return try std.fmt.allocPrint(self.allocator, "No text response found in Pi output.\n\nRaw output preview ({d} bytes total):\n{s}{s}", .{ response_text.items.len, response_text.items[0..preview_len], if (response_text.items.len > 500) "\n..." else "" });
-        }
-
-        return try final_response.toOwnedSlice(self.allocator);
-    }
-
-    fn jsonEscapeString(self: *UI, s: []const u8) ![]const u8 {
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(self.allocator);
-
-        try result.append(self.allocator, '"');
-        for (s) |c| {
-            switch (c) {
-                '"' => try result.appendSlice(self.allocator, "\\\""),
-                '\\' => try result.appendSlice(self.allocator, "\\\\"),
-                '\n' => try result.appendSlice(self.allocator, "\\n"),
-                '\r' => try result.appendSlice(self.allocator, "\\r"),
-                '\t' => try result.appendSlice(self.allocator, "\\t"),
-                else => {
-                    if (c < 0x20) {
-                        try result.appendSlice(self.allocator, "\\u00");
-                        const hex = "0123456789abcdef";
-                        try result.append(self.allocator, hex[c >> 4]);
-                        try result.append(self.allocator, hex[c & 0xf]);
-                    } else {
-                        try result.append(self.allocator, c);
-                    }
-                },
-            }
-        }
-        try result.append(self.allocator, '"');
-
-        return try result.toOwnedSlice(self.allocator);
-    }
-
-    fn jsonUnescapeString(self: *UI, s: []const u8) ![]const u8 {
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(self.allocator);
-
-        var i: usize = 0;
-        while (i < s.len) {
-            if (s[i] == '\\' and i + 1 < s.len) {
-                switch (s[i + 1]) {
-                    'n' => {
-                        try result.append(self.allocator, '\n');
-                        i += 2;
-                    },
-                    'r' => {
-                        try result.append(self.allocator, '\r');
-                        i += 2;
-                    },
-                    't' => {
-                        try result.append(self.allocator, '\t');
-                        i += 2;
-                    },
-                    '"' => {
-                        try result.append(self.allocator, '"');
-                        i += 2;
-                    },
-                    '\\' => {
-                        try result.append(self.allocator, '\\');
-                        i += 2;
-                    },
-                    'u' => {
-                        // Handle \uXXXX
-                        if (i + 5 < s.len) {
-                            // Simple handling - just skip for now
-                            i += 6;
-                        } else {
-                            try result.append(self.allocator, s[i]);
-                            i += 1;
-                        }
-                    },
-                    else => {
-                        try result.append(self.allocator, s[i]);
-                        i += 1;
-                    },
-                }
-            } else {
-                try result.append(self.allocator, s[i]);
-                i += 1;
-            }
-        }
-
-        return try result.toOwnedSlice(self.allocator);
     }
 
     fn getLineNumber(self: *UI) ?usize {

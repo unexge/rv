@@ -318,4 +318,5 @@ comptime {
     _ = review;
     _ = ui;
     _ = highlight;
+    _ = @import("pi.zig");
 }

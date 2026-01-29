@@ -319,4 +319,5 @@ comptime {
     _ = ui;
     _ = highlight;
     _ = @import("pi.zig");
+    _ = @import("shell.zig");
 }

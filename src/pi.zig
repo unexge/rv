@@ -1,12 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-
-// C library functions for popen
-const FILE = opaque {};
-extern fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
-extern fn pclose(stream: *FILE) c_int;
-extern fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *FILE) usize;
-extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+const shell = @import("shell.zig");
 
 pub const PiError = error{
     CommandFailed,
@@ -22,7 +16,7 @@ pub fn askPi(allocator: Allocator, prompt: []const u8) PiError![]const u8 {
     defer allocator.free(json_prompt);
 
     // Get pi binary path from environment or use default
-    const pi_bin: []const u8 = if (getenv("RV_PI_BIN")) |env_ptr|
+    const pi_bin: []const u8 = if (shell.getenv("RV_PI_BIN")) |env_ptr|
         std.mem.sliceTo(env_ptr, 0)
     else
         "pi";
@@ -46,33 +40,19 @@ pub fn askPi(allocator: Allocator, prompt: []const u8) PiError![]const u8 {
     const cmd = try std.fmt.allocPrint(allocator, "echo '{s}' | base64 -d | {s} --mode rpc --no-session 2>&1", .{ encoded, pi_bin });
     defer allocator.free(cmd);
 
-    const cmd_z = try allocator.dupeZ(u8, cmd);
-    defer allocator.free(cmd_z);
-
-    // Use popen to run the command
-    const fp = popen(cmd_z.ptr, "r") orelse {
-        return PiError.PipeFailed;
+    const result = shell.run(allocator, cmd) catch |err| switch (err) {
+        error.PipeFailed => return PiError.PipeFailed,
+        else => return PiError.CommandFailed,
     };
-    defer _ = pclose(fp);
-
-    // Read all output
-    var response_text: std.ArrayList(u8) = .empty;
-    defer response_text.deinit(allocator);
-
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = fread(&buf, 1, buf.len, fp);
-        if (n == 0) break;
-        try response_text.appendSlice(allocator, buf[0..n]);
-    }
+    defer allocator.free(result.stdout);
 
     // Check if we got any output at all
-    if (response_text.items.len == 0) {
+    if (result.stdout.len == 0) {
         return PiError.NoResponse;
     }
 
     // Parse the response - look for text_delta events and concatenate
-    return try parseRpcResponse(allocator, response_text.items);
+    return try parseRpcResponse(allocator, result.stdout);
 }
 
 /// Parse RPC response from Pi, extracting text_delta content

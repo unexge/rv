@@ -1,35 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-
-const FILE = opaque {};
-extern fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
-extern fn pclose(stream: *FILE) c_int;
-extern fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *FILE) usize;
-
-/// Escape a string for use in shell double quotes
-fn escapeForShell(allocator: Allocator, input: []const u8) Allocator.Error![]const u8 {
-    // Count special characters that need escaping in double quotes: $ ` \ " !
-    var special_count: usize = 0;
-    for (input) |c| {
-        if (c == '$' or c == '`' or c == '\\' or c == '"' or c == '!') {
-            special_count += 1;
-        }
-    }
-
-    if (special_count == 0) return try allocator.dupe(u8, input);
-
-    var result = try allocator.alloc(u8, input.len + special_count);
-    var i: usize = 0;
-    for (input) |c| {
-        if (c == '$' or c == '`' or c == '\\' or c == '"' or c == '!') {
-            result[i] = '\\';
-            i += 1;
-        }
-        result[i] = c;
-        i += 1;
-    }
-    return result;
-}
+const shell = @import("shell.zig");
 
 pub const FileStatus = enum {
     modified,
@@ -57,38 +28,22 @@ pub const GitError = error{
     NotARepository,
     CommandFailed,
     ParseError,
-    ForkFailed,
     PipeFailed,
-    ExecFailed,
 } || Allocator.Error;
 
-/// Run a command and capture its output using popen
+/// Run a command and capture its output
 pub fn runCommand(allocator: Allocator, cmd: []const u8) GitError!struct { stdout: []u8, exit_code: u8 } {
-    const cmd_z = allocator.dupeZ(u8, cmd) catch return GitError.CommandFailed;
-    defer allocator.free(cmd_z);
-
-    const fp = popen(cmd_z.ptr, "r") orelse return GitError.PipeFailed;
-    defer _ = pclose(fp);
-
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(allocator);
-
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = fread(&buf, 1, buf.len, fp);
-        if (n == 0) break;
-        try output.appendSlice(allocator, buf[0..n]);
-    }
-
-    return .{
-        .stdout = try output.toOwnedSlice(allocator),
-        .exit_code = 0, // popen doesn't give us exit code easily
+    const result = shell.run(allocator, cmd) catch |err| switch (err) {
+        error.PipeFailed => return GitError.PipeFailed,
+        error.CommandFailed => return GitError.CommandFailed,
+        else => return GitError.CommandFailed,
     };
+    return .{ .stdout = result.stdout, .exit_code = result.exit_code };
 }
 
 /// Read file content from the filesystem
 pub fn readFileContent(allocator: Allocator, path: []const u8) GitError![]const u8 {
-    const escaped_path = try escapeForShell(allocator, path);
+    const escaped_path = try shell.escapeForDoubleQuotes(allocator, path);
     defer allocator.free(escaped_path);
 
     const cmd = std.fmt.allocPrint(allocator, "cat \"{s}\" 2>/dev/null", .{escaped_path}) catch return GitError.CommandFailed;
@@ -188,7 +143,7 @@ pub fn runGitDiffWithDifft(
     }
 
     for (changed_files.items) |file| {
-        const escaped_file = try escapeForShell(allocator, file);
+        const escaped_file = try shell.escapeForDoubleQuotes(allocator, file);
         defer allocator.free(escaped_file);
 
         var difft_cmd: std.ArrayList(u8) = .empty;
@@ -276,7 +231,7 @@ fn parseNameStatus(allocator: Allocator, output: []const u8) GitError![]ChangedF
 
 /// Get the contents of a file at a specific revision
 pub fn getFileAtRevision(allocator: Allocator, path: []const u8, rev: []const u8) GitError!?[]const u8 {
-    const escaped_path = try escapeForShell(allocator, path);
+    const escaped_path = try shell.escapeForDoubleQuotes(allocator, path);
     defer allocator.free(escaped_path);
 
     const cmd = try std.fmt.allocPrint(allocator, "git show \"{s}:{s}\" 2>/dev/null", .{ rev, escaped_path });
@@ -317,36 +272,4 @@ test "isBinaryFile" {
     try std.testing.expect(!isBinaryFile("hello world"));
     try std.testing.expect(isBinaryFile("hello\x00world"));
     try std.testing.expect(!isBinaryFile(""));
-}
-
-test "escapeForShell" {
-    const allocator = std.testing.allocator;
-
-    // No special characters
-    {
-        const result = try escapeForShell(allocator, "simple.txt");
-        defer allocator.free(result);
-        try std.testing.expectEqualStrings("simple.txt", result);
-    }
-
-    // Double quotes
-    {
-        const result = try escapeForShell(allocator, "file\"name.txt");
-        defer allocator.free(result);
-        try std.testing.expectEqualStrings("file\\\"name.txt", result);
-    }
-
-    // Dollar sign
-    {
-        const result = try escapeForShell(allocator, "file$name.txt");
-        defer allocator.free(result);
-        try std.testing.expectEqualStrings("file\\$name.txt", result);
-    }
-
-    // Multiple special chars
-    {
-        const result = try escapeForShell(allocator, "a\"b$c`d\\e!f");
-        defer allocator.free(result);
-        try std.testing.expectEqualStrings("a\\\"b\\$c\\`d\\\\e\\!f", result);
-    }
 }

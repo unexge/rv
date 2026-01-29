@@ -1540,6 +1540,11 @@ pub const UI = struct {
         // Track visual column for tab alignment (relative to content start)
         var visual_col: u16 = 0;
 
+        // Only apply syntax highlighting for lines from the new file
+        // (context, addition, modification). Deletions come from the old file
+        // which we don't parse, so syntax highlighting would be incorrect.
+        const use_syntax_highlighting = line_type != .deletion;
+
         for (content) |c| {
             if (col >= start_col + max_width) break;
 
@@ -1556,10 +1561,13 @@ pub const UI = struct {
             }
 
             // Compute the style:
-            // 1. Start with syntax highlighting if available
+            // 1. Start with syntax highlighting if available (only for new file content)
             // 2. Apply background color for additions/deletions
             // 3. Override foreground for changed regions in modifications
-            var style = if (!is_selected) self.getSyntaxStyle(global_byte_pos, base_style) else base_style;
+            var style = if (!is_selected and use_syntax_highlighting)
+                self.getSyntaxStyle(global_byte_pos, base_style)
+            else
+                base_style;
 
             // Apply background for additions/deletions
             if (!is_selected) {

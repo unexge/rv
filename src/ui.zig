@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const review = @import("review.zig");
 const difft = @import("difft.zig");
 const highlight = @import("highlight.zig");
@@ -70,6 +71,7 @@ const SplitRow = struct {
 /// Main application model for the code review TUI
 pub const UI = struct {
     allocator: Allocator,
+    io: Io,
     session: *review.ReviewSession,
     mode: Mode = .normal,
     view_mode: ViewMode = .split, // Default to split view
@@ -95,6 +97,7 @@ pub const UI = struct {
     ask_context_file: ?[]const u8 = null,
     ask_context_lines: ?struct { start: u32, end: u32 } = null,
     project_path: ?[]const u8 = null,
+    pi_bin: ?[]const u8 = null, // Path to pi binary (from RV_PI_BIN env)
     // Async ask state
     ask_thread: ?std.Thread = null,
     ask_thread_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -135,9 +138,21 @@ pub const UI = struct {
         }
     };
 
-    pub fn init(allocator: Allocator, session: *review.ReviewSession) UI {
+    pub fn init(allocator: Allocator, io: Io, session: *review.ReviewSession) UI {
         return UI{
             .allocator = allocator,
+            .io = io,
+            .session = session,
+            .diff_lines = .empty,
+            .split_rows = .empty,
+        };
+    }
+
+    /// Initialize UI for testing (without Io - askPi won't work)
+    pub fn initForTest(allocator: Allocator, session: *review.ReviewSession) UI {
+        return UI{
+            .allocator = allocator,
+            .io = undefined, // Not used in tests
             .session = session,
             .diff_lines = .empty,
             .split_rows = .empty,
@@ -146,6 +161,10 @@ pub const UI = struct {
 
     pub fn setProjectPath(self: *UI, path: []const u8) void {
         self.project_path = path;
+    }
+
+    pub fn setPiBin(self: *UI, path: ?[]const u8) void {
+        self.pi_bin = path;
     }
 
     pub fn deinit(self: *UI) void {
@@ -1564,7 +1583,7 @@ pub const UI = struct {
             return;
         };
 
-        const response = pi.askPi(self.allocator, prompt) catch |err| {
+        const response = pi.askPi(self.allocator, self.io, prompt, self.pi_bin) catch |err| {
             self.ask_thread_error = std.fmt.allocPrint(self.allocator, "RPC error: {}", .{err}) catch null;
             self.ask_thread_done.store(true, .release);
             return;
@@ -3700,7 +3719,7 @@ test "deleted file shows content" {
     });
 
     // Create UI and build the diff lines
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -3744,7 +3763,7 @@ test "added file shows content" {
     });
 
     // Create UI and build the diff lines
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -3804,7 +3823,7 @@ test "context lines added around changes" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -3888,7 +3907,7 @@ test "context lines handle file boundaries" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -3975,7 +3994,7 @@ test "separator shown between distant chunks" {
         .new_content = try allocator.dupe(u8, content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4042,7 +4061,7 @@ test "partial file deletion shows content" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4101,7 +4120,7 @@ test "deleted comment line shows content" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4160,7 +4179,7 @@ test "blank line deletion shows empty content" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4219,7 +4238,7 @@ test "modified line shows both deletion and addition" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4283,7 +4302,7 @@ test "context lines use correct 1-based line numbers" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4367,7 +4386,7 @@ test "separator lines are not selectable" {
         .new_content = try allocator.dupe(u8, content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4498,7 +4517,7 @@ test "modified line with partial change has correct changes arrays" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui_instance = UI.init(allocator, &session);
+    var ui_instance = UI.initForTest(allocator, &session);
     defer ui_instance.deinit();
 
     try ui_instance.buildDiffLines();
@@ -4559,7 +4578,7 @@ test "identical lines are skipped (no false positives)" {
         .new_content = try allocator.dupe(u8, content),
     });
 
-    var ui_instance = UI.init(allocator, &session);
+    var ui_instance = UI.initForTest(allocator, &session);
     defer ui_instance.deinit();
 
     try ui_instance.buildDiffLines();
@@ -4599,7 +4618,7 @@ test "binary file produces no diff lines" {
         .new_content = try allocator.dupe(u8, content),
     });
 
-    var ui_instance = UI.init(allocator, &session);
+    var ui_instance = UI.initForTest(allocator, &session);
     defer ui_instance.deinit();
 
     try ui_instance.buildDiffLines();
@@ -4670,7 +4689,7 @@ test "difftastic semantic changes: use difft's character-level changes" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4751,7 +4770,7 @@ test "difftastic: multiple semantic changes on same line" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4826,7 +4845,7 @@ test "difftastic: line moved to different position (asymmetric line numbers)" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4897,7 +4916,7 @@ test "difftastic: pure addition (rhs only)" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -4962,7 +4981,7 @@ test "difftastic: pure deletion (lhs only)" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5046,7 +5065,7 @@ test "difftastic: mixed operations in single chunk" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5170,7 +5189,7 @@ test "unicode content handling" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5217,7 +5236,7 @@ test "empty file to non-empty file" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5254,7 +5273,7 @@ test "non-empty file to empty file" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5310,7 +5329,7 @@ test "whitespace-only changes" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5379,7 +5398,7 @@ test "very long lines" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5446,7 +5465,7 @@ test "inline diff: addition at end of line" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5506,7 +5525,7 @@ test "inline diff: modification in middle of line" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5566,7 +5585,7 @@ test "inline diff: deletion at beginning of line" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5629,7 +5648,7 @@ test "line numbers: additions shift subsequent line numbers" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5700,7 +5719,7 @@ test "line numbers: deletions shift subsequent line numbers" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5763,7 +5782,7 @@ test "line numbers: multiple additions accumulate offset" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5830,7 +5849,7 @@ test "line numbers: modification preserves line mapping" {
         .new_content = try allocator.dupe(u8, new_content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5871,7 +5890,7 @@ test "split view: deleted file shows content on left side" {
         .new_content = try allocator.dupe(u8, ""),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5915,7 +5934,7 @@ test "split view: added file shows content on right side" {
         .new_content = try allocator.dupe(u8, "fn main() {}\nreturn;"),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();
@@ -5959,7 +5978,7 @@ test "split view: unchanged file shows same content on both sides" {
         .new_content = try allocator.dupe(u8, content),
     });
 
-    var ui = UI.init(allocator, &session);
+    var ui = UI.initForTest(allocator, &session);
     defer ui.deinit();
 
     try ui.buildDiffLines();

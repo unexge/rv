@@ -8,6 +8,62 @@ const review = @import("review.zig");
 const ui = @import("ui.zig");
 const highlight = @import("highlight.zig");
 
+// Timing instrumentation - enable with RV_TIMING=1 environment variable
+const Timing = struct {
+    const max_entries = 32;
+    
+    labels: [max_entries][]const u8 = undefined,
+    durations_ns: [max_entries]u64 = undefined,
+    count: usize = 0,
+    last_instant: ?std.time.Instant,
+    enabled: bool,
+    
+    pub fn init(environ_map: *std.process.Environ.Map) Timing {
+        const enabled = environ_map.get("RV_TIMING") != null;
+        const instant = if (enabled) std.time.Instant.now() catch null else null;
+        return .{
+            .last_instant = instant,
+            .enabled = enabled,
+        };
+    }
+    
+    pub fn record(self: *Timing, label: []const u8) void {
+        if (!self.enabled) return;
+        if (self.count >= max_entries) return;
+        
+        const now = std.time.Instant.now() catch return;
+        if (self.last_instant) |last| {
+            self.labels[self.count] = label;
+            self.durations_ns[self.count] = now.since(last);
+            self.count += 1;
+        }
+        self.last_instant = now;
+    }
+    
+    pub fn print(self: *const Timing, writer: anytype) !void {
+        if (!self.enabled or self.count == 0) return;
+        
+        try writer.writeAll("\n--- rv Startup Timings ---\n");
+        var total_ns: u64 = 0;
+        var absolute_ns: u64 = 0;
+        for (0..self.count) |i| {
+            absolute_ns += self.durations_ns[i];
+            const ms = self.durations_ns[i] / std.time.ns_per_ms;
+            const abs_ms = absolute_ns / std.time.ns_per_ms;
+            try writer.print("  {s}: {d}ms (@ {d}ms)\n", .{ 
+                self.labels[i], 
+                ms,
+                abs_ms,
+            });
+            total_ns += self.durations_ns[i];
+        }
+        try writer.print("  TOTAL: {d}ms\n", .{total_ns / std.time.ns_per_ms});
+        try writer.writeAll("---------------------------\n\n");
+    }
+};
+
+var timing: Timing = undefined;
+
 const Args = struct {
     staged: bool = false,
     commit: ?[]const u8 = null,
@@ -84,6 +140,9 @@ fn printUsage(writer: anytype) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    timing = Timing.init(init.environ_map);
+    timing.record("init");
+    
     const allocator: Allocator = init.arena.allocator();
     const io = init.io;
 
@@ -96,8 +155,10 @@ pub fn main(init: std.process.Init) !void {
     const stderr = &stderr_file.interface;
 
     const argv = try init.minimal.args.toSlice(allocator);
+    timing.record("args setup");
 
     const args = try parseArgs(allocator, argv);
+    timing.record("parseArgs");
 
     if (args.err) |err_msg| {
         try stderr.print("Error: {s}\n", .{err_msg});
@@ -112,7 +173,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const difft_installed = try difft.checkInstalled(allocator);
+    const difft_installed = try difft.checkInstalled(allocator, io);
+    timing.record("difft.checkInstalled");
     if (!difft_installed) {
         try stderr.writeAll(
             \\Error: difft (difftastic) is not installed.
@@ -129,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    _ = git.getRepoRoot(allocator) catch |err| {
+    _ = git.getRepoRoot(allocator, io) catch |err| {
         if (err == git.GitError.NotARepository) {
             try stderr.writeAll("Error: Not inside a git repository.\n");
         } else {
@@ -138,12 +200,14 @@ pub fn main(init: std.process.Init) !void {
         try stderr.flush();
         std.process.exit(1);
     };
+    timing.record("git.getRepoRoot");
 
     // Get changed files for filtering
     const changed_files = if (args.commit) |commit|
-        try git.getChangedFilesForCommit(allocator, commit)
+        try git.getChangedFilesForCommit(allocator, io, commit)
     else
-        try git.getChangedFiles(allocator, args.staged);
+        try git.getChangedFiles(allocator, io, args.staged);
+    timing.record("git.getChangedFiles");
 
     // Filter paths if specified
     var filtered_paths: std.ArrayList([]const u8) = .empty;
@@ -171,12 +235,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Run git diff with external difft tool
-    const diff_json = try git.runGitDiffWithDifft(allocator, args.staged, args.commit, filtered_paths.items);
+    const diff_json = try git.runGitDiffWithDifft(allocator, io, args.staged, args.commit, filtered_paths.items);
     defer allocator.free(diff_json);
+    timing.record("git.runGitDiffWithDifft");
 
     // Parse all file diffs from the output
     const file_diffs = try difft.parseGitDiffOutput(allocator, diff_json);
     defer allocator.free(file_diffs);
+    timing.record("difft.parseGitDiffOutput");
 
     if (file_diffs.len == 0) {
         try stderr.writeAll("No changes to review.\n");
@@ -185,7 +251,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Get repo root once for all files
-    const repo_root = try git.getRepoRoot(allocator);
+    const repo_root = try git.getRepoRoot(allocator, io);
 
     // Initialize review session
     var session = review.ReviewSession.init(allocator);
@@ -202,13 +268,13 @@ pub fn main(init: std.process.Init) !void {
             const parent_rev = try std.fmt.allocPrint(allocator, "{s}^", .{commit});
             defer allocator.free(parent_rev);
 
-            old_content = (try git.getFileAtRevision(allocator, file_diff.path, parent_rev)) orelse "";
+            old_content = (try git.getFileAtRevision(allocator, io, file_diff.path, parent_rev)) orelse "";
 
             // For deleted files, there is no new content
             if (file_diff.status == .removed) {
                 new_content = "";
             } else {
-                new_content = (try git.getFileAtRevision(allocator, file_diff.path, commit)) orelse "";
+                new_content = (try git.getFileAtRevision(allocator, io, file_diff.path, commit)) orelse "";
             }
         } else {
             // For working directory/staged changes
@@ -216,18 +282,18 @@ pub fn main(init: std.process.Init) !void {
                 // For added files, there is no old content
                 old_content = "";
                 const full_path = try std.fs.path.join(allocator, &.{ repo_root, file_diff.path });
-                new_content = git.readFileContent(allocator, full_path) catch "";
+                new_content = git.readFileContent(allocator, io, full_path) catch "";
             } else if (file_diff.status == .removed) {
                 // For deleted files, old comes from HEAD/index, new is empty
                 const rev = if (args.staged) ":" else "HEAD";
-                old_content = (try git.getFileAtRevision(allocator, file_diff.path, rev)) orelse "";
+                old_content = (try git.getFileAtRevision(allocator, io, file_diff.path, rev)) orelse "";
                 new_content = "";
             } else {
                 // For modified files, get both from git and filesystem
                 const rev = if (args.staged) ":" else "HEAD";
-                old_content = (try git.getFileAtRevision(allocator, file_diff.path, rev)) orelse "";
+                old_content = (try git.getFileAtRevision(allocator, io, file_diff.path, rev)) orelse "";
                 const full_path = try std.fs.path.join(allocator, &.{ repo_root, file_diff.path });
-                new_content = git.readFileContent(allocator, full_path) catch "";
+                new_content = git.readFileContent(allocator, io, full_path) catch "";
             }
         }
 
@@ -242,6 +308,7 @@ pub fn main(init: std.process.Init) !void {
             .new_content = new_content,
         });
     }
+    timing.record("load file contents");
 
     if (session.files.len == 0) {
         try stderr.writeAll("No files could be processed.\n");
@@ -252,12 +319,19 @@ pub fn main(init: std.process.Init) !void {
     // Flush stderr before TUI
     try stderr.flush();
 
+    // Print timings before TUI takes over
+    try timing.print(stderr);
+    try stderr.flush();
+
     // Run TUI using vaxis/vxfw
-    var tui = ui.UI.init(allocator, &session);
+    var tui = ui.UI.init(allocator, io, &session);
     defer tui.deinit();
 
     // Set the project path for ask context
     tui.setProjectPath(repo_root);
+    
+    // Set pi binary path from environment (cached at startup)
+    tui.setPiBin(init.environ_map.get("RV_PI_BIN"));
 
     var run_error: ?anyerror = null;
     tui.run(init) catch |err| {

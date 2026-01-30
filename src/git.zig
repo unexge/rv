@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const shell = @import("shell.zig");
 
 pub const FileStatus = enum {
@@ -31,9 +32,9 @@ pub const GitError = error{
     PipeFailed,
 } || Allocator.Error;
 
-/// Run a command and capture its output
-pub fn runCommand(allocator: Allocator, cmd: []const u8) GitError!struct { stdout: []u8, exit_code: u8 } {
-    const result = shell.run(allocator, cmd) catch |err| switch (err) {
+/// Run a command and capture its output (via shell)
+pub fn runCommand(allocator: Allocator, io: Io, cmd: []const u8) GitError!struct { stdout: []u8, exit_code: u8 } {
+    const result = shell.run(allocator, io, cmd) catch |err| switch (err) {
         error.PipeFailed => return GitError.PipeFailed,
         error.CommandFailed => return GitError.CommandFailed,
         else => return GitError.CommandFailed,
@@ -41,21 +42,26 @@ pub fn runCommand(allocator: Allocator, cmd: []const u8) GitError!struct { stdou
     return .{ .stdout = result.stdout, .exit_code = result.exit_code };
 }
 
-/// Read file content from the filesystem
-pub fn readFileContent(allocator: Allocator, path: []const u8) GitError![]const u8 {
-    const escaped_path = try shell.escapeForDoubleQuotes(allocator, path);
-    defer allocator.free(escaped_path);
+/// Run a command directly without shell (faster)
+pub fn runCommandDirect(allocator: Allocator, io: Io, argv: []const []const u8) GitError!struct { stdout: []u8, exit_code: u8 } {
+    const result = shell.runDirect(allocator, io, argv) catch |err| switch (err) {
+        error.PipeFailed => return GitError.PipeFailed,
+        error.CommandFailed => return GitError.CommandFailed,
+        else => return GitError.CommandFailed,
+    };
+    return .{ .stdout = result.stdout, .exit_code = result.exit_code };
+}
 
-    const cmd = std.fmt.allocPrint(allocator, "cat \"{s}\" 2>/dev/null", .{escaped_path}) catch return GitError.CommandFailed;
-    defer allocator.free(cmd);
-
-    const result = try runCommand(allocator, cmd);
+/// Read file content from the filesystem (native, no shell)
+pub fn readFileContent(allocator: Allocator, io: Io, path: []const u8) GitError![]const u8 {
+    // Use cat command via direct execution (still faster than shell.run)
+    const result = runCommandDirect(allocator, io, &.{ "cat", path }) catch return GitError.CommandFailed;
     return result.stdout;
 }
 
-/// Get the root directory of the git repository
-pub fn getRepoRoot(allocator: Allocator) GitError![]const u8 {
-    const result = try runCommand(allocator, "git rev-parse --show-toplevel 2>/dev/null");
+/// Get the root directory of the git repository (direct execution)
+pub fn getRepoRoot(allocator: Allocator, io: Io) GitError![]const u8 {
+    const result = try runCommandDirect(allocator, io, &.{ "git", "rev-parse", "--show-toplevel" });
 
     if (result.stdout.len == 0) {
         allocator.free(result.stdout);
@@ -71,14 +77,12 @@ pub fn getRepoRoot(allocator: Allocator) GitError![]const u8 {
     return result.stdout;
 }
 
-/// Get list of changed files
-pub fn getChangedFiles(allocator: Allocator, staged: bool) GitError![]ChangedFile {
-    const cmd = if (staged)
-        "git diff --cached --name-status 2>/dev/null"
+/// Get list of changed files (direct execution)
+pub fn getChangedFiles(allocator: Allocator, io: Io, staged: bool) GitError![]ChangedFile {
+    const result = if (staged)
+        try runCommandDirect(allocator, io, &.{ "git", "diff", "--cached", "--name-status" })
     else
-        "git diff --name-status 2>/dev/null";
-
-    const result = try runCommand(allocator, cmd);
+        try runCommandDirect(allocator, io, &.{ "git", "diff", "--name-status" });
     defer allocator.free(result.stdout);
 
     return parseNameStatus(allocator, result.stdout);
@@ -88,6 +92,7 @@ pub fn getChangedFiles(allocator: Allocator, staged: bool) GitError![]ChangedFil
 /// Returns raw JSON output from difft for all changed files
 pub fn runGitDiffWithDifft(
     allocator: Allocator,
+    io: Io,
     staged: bool,
     commit: ?[]const u8,
     paths: []const []const u8,
@@ -113,7 +118,7 @@ pub fn runGitDiffWithDifft(
     const cmd_str = try cmd.toOwnedSlice(allocator);
     defer allocator.free(cmd_str);
 
-    const result = try runCommand(allocator, cmd_str);
+    const result = try runCommand(allocator, io, cmd_str);
     defer allocator.free(result.stdout);
 
     var changed_files: std.ArrayList([]const u8) = .empty;
@@ -160,7 +165,7 @@ pub fn runGitDiffWithDifft(
         const difft_cmd_str = try difft_cmd.toOwnedSlice(allocator);
         defer allocator.free(difft_cmd_str);
 
-        const difft_result = try runCommand(allocator, difft_cmd_str);
+        const difft_result = try runCommand(allocator, io, difft_cmd_str);
         defer allocator.free(difft_result.stdout);
 
         if (difft_result.stdout.len > 0) {
@@ -171,12 +176,9 @@ pub fn runGitDiffWithDifft(
     return output.toOwnedSlice(allocator);
 }
 
-/// Get list of changed files introduced by a commit
-pub fn getChangedFilesForCommit(allocator: Allocator, commit: []const u8) GitError![]ChangedFile {
-    const cmd = try std.fmt.allocPrint(allocator, "git diff-tree --no-commit-id --name-status -r --root {s} 2>/dev/null", .{commit});
-    defer allocator.free(cmd);
-
-    const result = try runCommand(allocator, cmd);
+/// Get list of changed files introduced by a commit (direct execution)
+pub fn getChangedFilesForCommit(allocator: Allocator, io: Io, commit: []const u8) GitError![]ChangedFile {
+    const result = try runCommandDirect(allocator, io, &.{ "git", "diff-tree", "--no-commit-id", "--name-status", "-r", "--root", commit });
     defer allocator.free(result.stdout);
 
     return parseNameStatus(allocator, result.stdout);
@@ -229,15 +231,12 @@ fn parseNameStatus(allocator: Allocator, output: []const u8) GitError![]ChangedF
     return files.toOwnedSlice(allocator);
 }
 
-/// Get the contents of a file at a specific revision
-pub fn getFileAtRevision(allocator: Allocator, path: []const u8, rev: []const u8) GitError!?[]const u8 {
-    const escaped_path = try shell.escapeForDoubleQuotes(allocator, path);
-    defer allocator.free(escaped_path);
-
-    const cmd = try std.fmt.allocPrint(allocator, "git show \"{s}:{s}\" 2>/dev/null", .{ rev, escaped_path });
-    defer allocator.free(cmd);
-
-    const result = runCommand(allocator, cmd) catch return null;
+/// Get the contents of a file at a specific revision (direct execution)
+pub fn getFileAtRevision(allocator: Allocator, io: Io, path: []const u8, rev: []const u8) GitError!?[]const u8 {
+    const ref = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ rev, path });
+    defer allocator.free(ref);
+    
+    const result = runCommandDirect(allocator, io, &.{ "git", "show", ref }) catch return null;
     return result.stdout;
 }
 

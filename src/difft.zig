@@ -1,8 +1,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const json = std.json;
+const Io = std.Io;
 
 const git = @import("git.zig");
+const shell = @import("shell.zig");
 
 /// Highlight type from difftastic's semantic analysis
 /// Maps to difftastic's JSON "highlight" field values
@@ -106,13 +108,14 @@ fn runCommand(allocator: Allocator, cmd: []const u8) DifftError![]u8 {
     return result.stdout;
 }
 
-/// Check if difft is installed
-pub fn checkInstalled(allocator: Allocator) !bool {
-    const result = runCommand(allocator, "difft --version 2>/dev/null") catch {
+/// Check if difft is installed (uses direct execution, no shell)
+pub fn checkInstalled(allocator: Allocator, io: Io) !bool {
+    // Use direct execution (no shell overhead)
+    const result = shell.runDirect(allocator, io, &.{ "difft", "--version" }) catch {
         return false;
     };
-    defer allocator.free(result);
-    return result.len > 0;
+    defer allocator.free(result.stdout);
+    return result.stdout.len > 0;
 }
 
 /// Parse multiple file diffs from git's external diff output (one or more JSON objects)

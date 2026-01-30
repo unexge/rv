@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const shell = @import("shell.zig");
 
 pub const PiError = error{
@@ -10,16 +11,14 @@ pub const PiError = error{
 } || Allocator.Error;
 
 /// Call Pi via RPC with a prompt and return the response
-pub fn askPi(allocator: Allocator, prompt: []const u8) PiError![]const u8 {
+/// pi_bin can be overridden via the pi_bin parameter (pass null to use default "pi")
+pub fn askPi(allocator: Allocator, io: Io, prompt: []const u8, pi_bin: ?[]const u8) PiError![]const u8 {
     // Build the JSON command with proper escaping
     const json_prompt = try jsonEscapeString(allocator, prompt);
     defer allocator.free(json_prompt);
 
-    // Get pi binary path from environment or use default
-    const pi_bin: []const u8 = if (shell.getenv("RV_PI_BIN")) |env_ptr|
-        std.mem.sliceTo(env_ptr, 0)
-    else
-        "pi";
+    // Get pi binary path from parameter or use default
+    const bin = pi_bin orelse "pi";
 
     // Build the JSON payload
     var json_buf: std.ArrayList(u8) = .empty;
@@ -37,10 +36,10 @@ pub fn askPi(allocator: Allocator, prompt: []const u8) PiError![]const u8 {
     _ = base64.Encoder.encode(encoded, json_buf.items);
 
     // Use base64 decode piped to pi - no temp file needed
-    const cmd = try std.fmt.allocPrint(allocator, "echo '{s}' | base64 -d | {s} --mode rpc --no-session 2>&1", .{ encoded, pi_bin });
+    const cmd = try std.fmt.allocPrint(allocator, "echo '{s}' | base64 -d | {s} --mode rpc --no-session 2>&1", .{ encoded, bin });
     defer allocator.free(cmd);
 
-    const result = shell.run(allocator, cmd) catch |err| switch (err) {
+    const result = shell.run(allocator, io, cmd) catch |err| switch (err) {
         error.PipeFailed => return PiError.PipeFailed,
         else => return PiError.CommandFailed,
     };

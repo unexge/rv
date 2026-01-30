@@ -4,6 +4,7 @@ const Io = std.Io;
 const review = @import("review.zig");
 const difft = @import("difft.zig");
 const highlight = @import("highlight.zig");
+const collapse = @import("collapse.zig");
 const pi = @import("pi.zig");
 
 const vaxis = @import("vaxis");
@@ -111,6 +112,10 @@ pub const UI = struct {
     ask_original_split_rows: std.ArrayList(SplitRow) = .empty, // Store selected split rows
     ask_original_file: ?[]const u8 = null, // Store file path at time of ask
     spinner_frame: usize = 0,
+    // Collapse/summary mode state
+    summary_mode: bool = true, // Start in summary mode (collapsed)
+    collapse_regions: []collapse.CollapsibleRegion = &.{}, // Collapsible regions for current file
+    old_collapse_regions: []collapse.CollapsibleRegion = &.{}, // Regions for old file content
 
     const InputBuffer = struct {
         buffer: [4096]u8 = undefined,
@@ -228,6 +233,19 @@ pub const UI = struct {
         }
         if (self.old_highlighter) |*hl| {
             hl.deinit();
+        }
+        // Clean up collapse regions
+        self.freeCollapseRegions();
+    }
+
+    fn freeCollapseRegions(self: *UI) void {
+        if (self.collapse_regions.len > 0) {
+            collapse.freeRegions(self.allocator, @constCast(self.collapse_regions));
+            self.collapse_regions = &.{};
+        }
+        if (self.old_collapse_regions.len > 0) {
+            collapse.freeRegions(self.allocator, @constCast(self.old_collapse_regions));
+            self.old_collapse_regions = &.{};
         }
     }
 
@@ -386,6 +404,28 @@ pub const UI = struct {
                 }
             } else |_| {
                 // Language not supported or init failed
+            }
+
+            // Detect collapsible regions for summary mode
+            self.freeCollapseRegions();
+            if (collapse.CollapseDetector.init(self.allocator, lang)) |detector_val| {
+                var detector = detector_val;
+                defer detector.deinit();
+                if (detector.findRegions(file.new_content)) |regions| {
+                    self.collapse_regions = regions;
+                } else |_| {
+                    // Detection failed, continue without collapse
+                }
+                // Also detect for old content
+                if (collapse.CollapseDetector.init(self.allocator, lang)) |old_detector_val| {
+                    var old_detector = old_detector_val;
+                    defer old_detector.deinit();
+                    if (old_detector.findRegions(file.old_content)) |old_regions| {
+                        self.old_collapse_regions = old_regions;
+                    } else |_| {}
+                } else |_| {}
+            } else |_| {
+                // Language not supported
             }
         }
 
@@ -1179,6 +1219,29 @@ pub const UI = struct {
                 self.goToBottom();
                 return ctx.consumeAndRedraw();
             },
+            's' => {
+                // Toggle summary mode (collapse/expand all)
+                self.summary_mode = !self.summary_mode;
+                // Update all regions' collapsed state
+                for (self.collapse_regions) |*region| {
+                    region.collapsed = self.summary_mode;
+                }
+                for (self.old_collapse_regions) |*region| {
+                    region.collapsed = self.summary_mode;
+                }
+                // Adjust cursor if it's now on a hidden line
+                self.adjustCursorAfterCollapse();
+                self.setMessage(if (self.summary_mode) "Summary mode (collapsed)" else "Expanded view", false);
+                return ctx.consumeAndRedraw();
+            },
+            vaxis.Key.enter => {
+                // Toggle expand/collapse for region at cursor
+                if (self.toggleRegionAtCursor()) {
+                    // Adjust cursor if it's now on a hidden line
+                    self.adjustCursorAfterCollapse();
+                    return ctx.consumeAndRedraw();
+                }
+            },
             else => {},
         }
     }
@@ -1664,16 +1727,54 @@ pub const UI = struct {
         }
     }
 
+    /// Check if a row is visible (not hidden by collapse)
+    fn isRowVisible(self: *UI, idx: usize) bool {
+        if (!self.summary_mode) return true; // All rows visible when not in summary mode
+
+        if (self.view_mode == .split) {
+            if (idx >= self.split_rows.items.len) return false;
+            const row = self.split_rows.items[idx];
+            // Check if either side's line is hidden
+            if (row.left) |l| {
+                if (collapse.isLineHidden(self.old_collapse_regions, l.line_num)) return false;
+            }
+            if (row.right) |r| {
+                if (collapse.isLineHidden(self.collapse_regions, r.line_num)) return false;
+            }
+            return true;
+        } else {
+            if (idx >= self.diff_lines.items.len) return false;
+            const line = self.diff_lines.items[idx];
+            // Check new file regions for additions/modifications/context
+            if (line.new_line_num) |ln| {
+                if (collapse.isLineHidden(self.collapse_regions, ln)) return false;
+            }
+            // Check old file regions for deletions
+            if (line.line_type == .deletion) {
+                if (line.old_line_num) |ln| {
+                    if (collapse.isLineHidden(self.old_collapse_regions, ln)) return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    /// Check if a row can be navigated to (selectable AND visible)
+    fn isRowNavigable(self: *UI, idx: usize) bool {
+        return self.isRowSelectable(idx) and self.isRowVisible(idx);
+    }
+
     fn moveCursorDown(self: *UI) void {
         const row_count = self.getRowCount();
         if (self.cursor_line + 1 < row_count) {
             self.cursor_line += 1;
-            while (self.cursor_line < row_count and !self.isRowSelectable(self.cursor_line)) {
+            // Skip non-navigable rows (non-selectable or collapsed)
+            while (self.cursor_line < row_count and !self.isRowNavigable(self.cursor_line)) {
                 self.cursor_line += 1;
             }
             if (self.cursor_line >= row_count) {
                 self.cursor_line -= 1;
-                while (self.cursor_line > 0 and !self.isRowSelectable(self.cursor_line)) {
+                while (self.cursor_line > 0 and !self.isRowNavigable(self.cursor_line)) {
                     self.cursor_line -= 1;
                 }
             }
@@ -1683,12 +1784,13 @@ pub const UI = struct {
     fn moveCursorUp(self: *UI) void {
         if (self.cursor_line > 0) {
             self.cursor_line -= 1;
-            while (self.cursor_line > 0 and !self.isRowSelectable(self.cursor_line)) {
+            // Skip non-navigable rows (non-selectable or collapsed)
+            while (self.cursor_line > 0 and !self.isRowNavigable(self.cursor_line)) {
                 self.cursor_line -= 1;
             }
-            if (!self.isRowSelectable(self.cursor_line)) {
+            if (!self.isRowNavigable(self.cursor_line)) {
                 const row_count = self.getRowCount();
-                while (self.cursor_line < row_count and !self.isRowSelectable(self.cursor_line)) {
+                while (self.cursor_line < row_count and !self.isRowNavigable(self.cursor_line)) {
                     self.cursor_line += 1;
                 }
             }
@@ -1699,8 +1801,15 @@ pub const UI = struct {
         const page_size: usize = 20;
         const row_count = self.getRowCount();
         self.cursor_line = @min(self.cursor_line + page_size, if (row_count > 0) row_count - 1 else 0);
-        while (self.cursor_line < row_count and !self.isRowSelectable(self.cursor_line)) {
+        while (self.cursor_line < row_count and !self.isRowNavigable(self.cursor_line)) {
             self.cursor_line += 1;
+        }
+        // If we went past the end, go back to find a navigable row
+        if (self.cursor_line >= row_count and row_count > 0) {
+            self.cursor_line = row_count - 1;
+            while (self.cursor_line > 0 and !self.isRowNavigable(self.cursor_line)) {
+                self.cursor_line -= 1;
+            }
         }
     }
 
@@ -1711,8 +1820,15 @@ pub const UI = struct {
         } else {
             self.cursor_line = 0;
         }
-        while (self.cursor_line > 0 and !self.isRowSelectable(self.cursor_line)) {
+        while (self.cursor_line > 0 and !self.isRowNavigable(self.cursor_line)) {
             self.cursor_line -= 1;
+        }
+        // If first row isn't navigable, find next navigable row
+        if (!self.isRowNavigable(self.cursor_line)) {
+            const row_count = self.getRowCount();
+            while (self.cursor_line < row_count and !self.isRowNavigable(self.cursor_line)) {
+                self.cursor_line += 1;
+            }
         }
     }
 
@@ -1720,7 +1836,7 @@ pub const UI = struct {
         self.cursor_line = 0;
         self.scroll_offset = 0;
         const row_count = self.getRowCount();
-        while (self.cursor_line < row_count and !self.isRowSelectable(self.cursor_line)) {
+        while (self.cursor_line < row_count and !self.isRowNavigable(self.cursor_line)) {
             self.cursor_line += 1;
         }
     }
@@ -1729,7 +1845,7 @@ pub const UI = struct {
         const row_count = self.getRowCount();
         if (row_count > 0) {
             self.cursor_line = row_count - 1;
-            while (self.cursor_line > 0 and !self.isRowSelectable(self.cursor_line)) {
+            while (self.cursor_line > 0 and !self.isRowNavigable(self.cursor_line)) {
                 self.cursor_line -= 1;
             }
         }
@@ -1747,6 +1863,184 @@ pub const UI = struct {
         self.cursor_line = 0;
         self.scroll_offset = 0;
         self.selection_start = null;
+    }
+
+    /// Adjust cursor position after collapse state changes
+    /// If cursor is on a hidden line, move it to the nearest visible line
+    fn adjustCursorAfterCollapse(self: *UI) void {
+        if (!self.isRowVisible(self.cursor_line)) {
+            // Find the nearest visible line (prefer going up to the header)
+            var found = false;
+            
+            // First try going up (to find the header of the collapsed region)
+            var up_idx = self.cursor_line;
+            while (up_idx > 0) {
+                up_idx -= 1;
+                if (self.isRowNavigable(up_idx)) {
+                    self.cursor_line = up_idx;
+                    found = true;
+                    break;
+                }
+            }
+            
+            // If not found going up, try going down
+            if (!found) {
+                const row_count = self.getRowCount();
+                var down_idx = self.cursor_line;
+                while (down_idx + 1 < row_count) {
+                    down_idx += 1;
+                    if (self.isRowNavigable(down_idx)) {
+                        self.cursor_line = down_idx;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            
+            // If still not found, go to top
+            if (!found) {
+                self.cursor_line = 0;
+            }
+        }
+        
+        // Also clear selection if it includes hidden lines
+        if (self.selection_start) |sel| {
+            if (!self.isRowVisible(sel)) {
+                self.selection_start = null;
+            }
+        }
+    }
+
+    /// Toggle collapse state for the region at the current cursor position
+    fn toggleRegionAtCursor(self: *UI) bool {
+        const line_num = self.getLineNumber() orelse return false;
+        const line_u32: u32 = @intCast(line_num);
+
+        // Check new file regions first (for right side / additions)
+        if (collapse.findRegionWithHeaderAt(@constCast(self.collapse_regions), line_u32)) |region| {
+            region.collapsed = !region.collapsed;
+            return true;
+        }
+
+        // Check old file regions (for left side / deletions)
+        if (collapse.findRegionWithHeaderAt(@constCast(self.old_collapse_regions), line_u32)) |region| {
+            region.collapsed = !region.collapsed;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// Check if a line should be shown based on collapse state
+    fn isLineVisible(self: *UI, line_num: u32, is_old_file: bool) bool {
+        if (!self.summary_mode) return true; // All lines visible when not in summary mode
+
+        const regions = if (is_old_file) self.old_collapse_regions else self.collapse_regions;
+        return !collapse.isLineHidden(regions, line_num);
+    }
+
+    /// Get the collapse indicator for a line (if it's a header line)
+    fn getCollapseIndicator(self: *UI, line_num: u32, is_old_file: bool) ?[]const u8 {
+        const regions = if (is_old_file) self.old_collapse_regions else self.collapse_regions;
+
+        // Find the innermost (highest level) region with header at this line
+        var best_region: ?*const collapse.CollapsibleRegion = null;
+        for (regions) |*region| {
+            if (region.isHeaderLine(line_num) and region.isCollapsible()) {
+                if (best_region == null or region.level > best_region.?.level) {
+                    best_region = region;
+                }
+            }
+        }
+
+        if (best_region) |region| {
+            // Use different indicators for different levels
+            return switch (region.level) {
+                1 => if (region.collapsed) "▶" else "▼",
+                2 => if (region.collapsed) "›" else "⌄",
+                else => if (region.collapsed) "·" else "˅", // Level 3+
+            };
+        }
+        return null;
+    }
+
+    /// Get the collapsed region info for display (e.g., "... 15 lines ...")
+    fn getCollapsedInfo(self: *UI, line_num: u32, is_old_file: bool) ?struct { lines: u32, name: []const u8, node_type: collapse.NodeType } {
+        const regions = if (is_old_file) self.old_collapse_regions else self.collapse_regions;
+
+        for (regions) |region| {
+            // Return info when we're at the header end line of a collapsed region
+            if (region.collapsed and region.header_end_line == line_num and region.isCollapsible()) {
+                return .{
+                    .lines = region.bodyLineCount(),
+                    .name = region.name,
+                    .node_type = region.node_type,
+                };
+            }
+        }
+        return null;
+    }
+
+    /// Build a list of visible diff line indices, respecting collapse state
+    fn buildVisibleIndices(self: *UI, indices: *std.ArrayList(usize)) !void {
+        for (self.diff_lines.items, 0..) |diff_line, idx| {
+            // Get the line number to check visibility
+            const new_line = diff_line.new_line_num;
+            const old_line = diff_line.old_line_num;
+
+            // Check if this line should be hidden due to collapse
+            var hidden = false;
+            if (self.summary_mode) {
+                // For additions/modifications/context, check new file regions
+                if (new_line) |ln| {
+                    if (collapse.isLineHidden(self.collapse_regions, ln)) {
+                        hidden = true;
+                    }
+                }
+                // For deletions, check old file regions
+                if (old_line) |ln| {
+                    if (diff_line.line_type == .deletion) {
+                        if (collapse.isLineHidden(self.old_collapse_regions, ln)) {
+                            hidden = true;
+                        }
+                    }
+                }
+            }
+
+            if (!hidden) {
+                try indices.append(self.allocator, idx);
+            }
+        }
+    }
+
+    /// Build a list of visible split row indices, respecting collapse state
+    fn buildVisibleSplitIndices(self: *UI, indices: *std.ArrayList(usize)) !void {
+        for (self.split_rows.items, 0..) |split_row, idx| {
+            // Get line numbers from both sides
+            const left_line = if (split_row.left) |l| l.line_num else null;
+            const right_line = if (split_row.right) |r| r.line_num else null;
+
+            // Check if this row should be hidden due to collapse
+            var hidden = false;
+            if (self.summary_mode) {
+                // Check left side (old file) regions
+                if (left_line) |ln| {
+                    if (collapse.isLineHidden(self.old_collapse_regions, ln)) {
+                        hidden = true;
+                    }
+                }
+                // Check right side (new file) regions
+                if (right_line) |ln| {
+                    if (collapse.isLineHidden(self.collapse_regions, ln)) {
+                        hidden = true;
+                    }
+                }
+            }
+
+            if (!hidden) {
+                try indices.append(self.allocator, idx);
+            }
+        }
     }
 
     fn setMessage(self: *UI, msg: []const u8, is_error: bool) void {
@@ -1853,14 +2147,16 @@ pub const UI = struct {
         // Fill entire header row with background
         fillRow(surface, 0, ' ', header_style);
 
-        // Build header text with view mode indicator
+        // Build header text with view mode and summary mode indicators
         var buf: [256]u8 = undefined;
         const view_indicator = if (self.view_mode == .split) "[⫿]" else "[≡]";
-        const header_text = std.fmt.bufPrint(&buf, " rv: {s} ({d}/{d}) {s}", .{
+        const summary_indicator = if (self.summary_mode) "[▶]" else "[▼]";
+        const header_text = std.fmt.bufPrint(&buf, " rv: {s} ({d}/{d}) {s} {s}", .{
             path,
             self.session.current_file_idx + 1,
             self.session.files.len,
             view_indicator,
+            summary_indicator,
         }) catch " rv";
 
         // Write header text
@@ -1885,20 +2181,44 @@ pub const UI = struct {
 
         const width = surface.size.width;
 
+        // Build list of visible line indices (respecting collapse state)
+        var visible_indices: std.ArrayList(usize) = .empty;
+        defer visible_indices.deinit(self.allocator);
+        self.buildVisibleIndices(&visible_indices) catch return;
+
+        if (visible_indices.items.len == 0) {
+            writeString(surface, 2, 2, "No visible lines", .{});
+            return;
+        }
+
+        // Find the visible index for cursor_line
+        var cursor_visible_idx: usize = 0;
+        for (visible_indices.items, 0..) |idx, vi| {
+            if (idx == self.cursor_line) {
+                cursor_visible_idx = vi;
+                break;
+            }
+            if (idx > self.cursor_line) {
+                cursor_visible_idx = if (vi > 0) vi - 1 else 0;
+                break;
+            }
+        }
+
         // Adjust scroll to keep cursor visible
-        if (self.cursor_line < self.scroll_offset) {
-            self.scroll_offset = self.cursor_line;
-        } else if (self.cursor_line >= self.scroll_offset + height) {
-            self.scroll_offset = self.cursor_line - height + 1;
+        if (cursor_visible_idx < self.scroll_offset) {
+            self.scroll_offset = cursor_visible_idx;
+        } else if (cursor_visible_idx >= self.scroll_offset + height) {
+            self.scroll_offset = cursor_visible_idx - height + 1;
         }
 
         // Render visible lines in unified diff format
         var row: u16 = 0;
-        var line_idx = self.scroll_offset;
-        while (row < height and line_idx < self.diff_lines.items.len) : ({
+        var visible_idx = self.scroll_offset;
+        while (row < height and visible_idx < visible_indices.items.len) : ({
             row += 1;
-            line_idx += 1;
+            visible_idx += 1;
         }) {
+            const line_idx = visible_indices.items[visible_idx];
             const diff_line = self.diff_lines.items[line_idx];
             const is_selected = line_idx == self.cursor_line;
             const in_selection = if (self.selection_start) |sel|
@@ -2088,12 +2408,31 @@ pub const UI = struct {
                 }
             }
 
-            // Space after line numbers
+            // Space after line numbers - or collapse indicator
             if (col < width) {
-                surface.writeCell(col, display_row, .{
-                    .char = .{ .grapheme = grapheme(' ') },
-                    .style = style,
-                });
+                // Check for collapse indicator on new file lines (most common)
+                const collapse_ind = if (diff_line.new_line_num) |ln|
+                    self.getCollapseIndicator(ln, false)
+                else if (diff_line.old_line_num) |ln|
+                    self.getCollapseIndicator(ln, true)
+                else
+                    null;
+
+                if (collapse_ind) |indicator| {
+                    const ind_style: vaxis.Style = .{
+                        .fg = .{ .rgb = .{ 0xff, 0xd7, 0x00 } }, // Yellow/gold for collapse indicator
+                        .bold = true,
+                    };
+                    surface.writeCell(col, display_row, .{
+                        .char = .{ .grapheme = indicator },
+                        .style = if (is_selected) vaxis.Style{ .reverse = true } else ind_style,
+                    });
+                } else {
+                    surface.writeCell(col, display_row, .{
+                        .char = .{ .grapheme = grapheme(' ') },
+                        .style = style,
+                    });
+                }
                 col += 1;
             }
 
@@ -2165,6 +2504,7 @@ pub const UI = struct {
     }
 
     /// Draw the diff in split (side-by-side) view
+    /// Draw the diff in split (side-by-side) view
     fn drawSplitDiff(self: *UI, surface: *vxfw.Surface, height: u16) void {
         const file = self.session.currentFile() orelse {
             writeString(surface, 2, 2, "No files to review", .{});
@@ -2183,6 +2523,16 @@ pub const UI = struct {
 
         const width = surface.size.width;
 
+        // Build list of visible row indices (respecting collapse state)
+        var visible_indices: std.ArrayList(usize) = .empty;
+        defer visible_indices.deinit(self.allocator);
+        self.buildVisibleSplitIndices(&visible_indices) catch return;
+
+        if (visible_indices.items.len == 0) {
+            writeString(surface, 2, 2, "No visible lines", .{});
+            return;
+        }
+
         // Calculate panel widths
         // Layout: [line_num(5)][content...] | [line_num(5)][content...]
         const separator_col: u16 = width / 2;
@@ -2191,20 +2541,34 @@ pub const UI = struct {
         const left_content_width: u16 = separator_col -| left_content_start -| 1;
         const right_content_width: u16 = width -| right_content_start;
 
+        // Find the visible index for cursor_line
+        var cursor_visible_idx: usize = 0;
+        for (visible_indices.items, 0..) |idx, vi| {
+            if (idx == self.cursor_line) {
+                cursor_visible_idx = vi;
+                break;
+            }
+            if (idx > self.cursor_line) {
+                cursor_visible_idx = if (vi > 0) vi - 1 else 0;
+                break;
+            }
+        }
+
         // Adjust scroll to keep cursor visible
-        if (self.cursor_line < self.scroll_offset) {
-            self.scroll_offset = self.cursor_line;
-        } else if (self.cursor_line >= self.scroll_offset + height) {
-            self.scroll_offset = self.cursor_line - height + 1;
+        if (cursor_visible_idx < self.scroll_offset) {
+            self.scroll_offset = cursor_visible_idx;
+        } else if (cursor_visible_idx >= self.scroll_offset + height) {
+            self.scroll_offset = cursor_visible_idx - height + 1;
         }
 
         // Render visible rows
         var row: u16 = 0;
-        var line_idx = self.scroll_offset;
-        while (row < height and line_idx < self.split_rows.items.len) : ({
+        var visible_idx = self.scroll_offset;
+        while (row < height and visible_idx < visible_indices.items.len) : ({
             row += 1;
-            line_idx += 1;
+            visible_idx += 1;
         }) {
+            const line_idx = visible_indices.items[visible_idx];
             const split_row = self.split_rows.items[line_idx];
             const is_selected = line_idx == self.cursor_line;
             const in_selection = if (self.selection_start) |sel|
@@ -2338,18 +2702,39 @@ pub const UI = struct {
                 content_style.bg = bg;
             }
 
-            // Draw line number
+            // Draw line number with collapse indicator
             var num_buf: [8]u8 = undefined;
-            const num_str = std.fmt.bufPrint(&num_buf, "{d:>4} ", .{c.line_num}) catch "     ";
+            const num_str = std.fmt.bufPrint(&num_buf, "{d:>4}", .{c.line_num}) catch "    ";
             var col = panel_start + 1; // +1 for focus indicator space
             for (num_str) |ch| {
-                if (col < content_start) {
+                if (col < content_start - 1) { // -1 to leave room for collapse indicator
                     surface.writeCell(col, row, .{
                         .char = .{ .grapheme = grapheme(ch) },
                         .style = line_num_style,
                     });
                     col += 1;
                 }
+            }
+
+            // Draw collapse indicator or space
+            if (col < content_start) {
+                const collapse_ind = self.getCollapseIndicator(c.line_num, is_left);
+                if (collapse_ind) |indicator| {
+                    const ind_style: vaxis.Style = .{
+                        .fg = .{ .rgb = .{ 0xff, 0xd7, 0x00 } }, // Yellow/gold
+                        .bold = true,
+                    };
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = indicator },
+                        .style = if (is_selected) vaxis.Style{ .reverse = true } else ind_style,
+                    });
+                } else {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = " " },
+                        .style = line_num_style,
+                    });
+                }
+                col += 1;
             }
 
             // Draw content with syntax highlighting
@@ -3002,6 +3387,8 @@ pub const UI = struct {
             "  View:",
             "    v                   Toggle split/unified view",
             "    Tab                 Toggle focus (old/new side)",
+            "    s                   Toggle summary/expanded mode",
+            "    Enter               Expand/collapse region at cursor",
             "",
             "  Actions:",
             "    c                   Add comment at cursor/selection",

@@ -24,6 +24,7 @@ zig build test         # Run tests
 - Keep modules focused and testable
 - Use descriptive names
 - Don't create temporary files to pass information to a different process - handle without temporary files
+- Use native Zig functions from the standard library to interact with the OS instead of using raw C functions
 
 ## Error Handling
 

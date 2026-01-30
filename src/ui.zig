@@ -18,10 +18,15 @@ const Mode = enum {
     normal,
     comment_input,
     ask_input,
-    ask_pending,
     ask_response,
+    ask_response_comment, // Comment input from response view
     help,
     file_list,
+};
+
+const ViewMode = enum {
+    unified,
+    split,
 };
 
 /// Represents a single line in the unified diff view
@@ -36,6 +41,7 @@ const DiffLine = struct {
     selectable: bool = true,
     is_partial_change: bool = false, // True if only part of line changed (unchanged parts shown in white)
     content_byte_offset: u32 = 0, // Byte offset of this line in the new file content (for syntax highlighting)
+    old_content_byte_offset: u32 = 0, // Byte offset of this line in the old file content (for syntax highlighting)
 
     const LineType = enum {
         context, // Unchanged line (shown with space prefix)
@@ -45,11 +51,28 @@ const DiffLine = struct {
     };
 };
 
+/// Represents a row in split view (left and right panels)
+const SplitRow = struct {
+    left: ?SplitCell = null, // Old file side (null for additions)
+    right: ?SplitCell = null, // New file side (null for deletions)
+    selectable: bool = true,
+    is_separator: bool = false, // True for "..." separator rows
+
+    const SplitCell = struct {
+        line_num: u32,
+        content: []const u8,
+        changes: []const difft.Change = &.{},
+        line_type: DiffLine.LineType,
+        content_byte_offset: u32 = 0,
+    };
+};
+
 /// Main application model for the code review TUI
 pub const UI = struct {
     allocator: Allocator,
     session: *review.ReviewSession,
     mode: Mode = .normal,
+    view_mode: ViewMode = .split, // Default to split view
     scroll_offset: usize = 0,
     cursor_line: usize = 0,
     selection_start: ?usize = null,
@@ -57,12 +80,15 @@ pub const UI = struct {
     message: ?[]const u8 = null,
     message_is_error: bool = false,
     diff_lines: std.ArrayList(DiffLine),
+    split_rows: std.ArrayList(SplitRow),
     should_quit: bool = false,
     focus_side: review.CommentSide = .new,
     file_list_cursor: usize = 0,
     // Syntax highlighting
     highlighter: ?highlight.Highlighter = null,
+    old_highlighter: ?highlight.Highlighter = null, // For old file in split view
     syntax_spans: []const highlight.HighlightSpan = &.{},
+    old_syntax_spans: []const highlight.HighlightSpan = &.{}, // For old file in split view
     // Ask mode state
     ask_response: ?[]const u8 = null,
     ask_scroll_offset: usize = 0,
@@ -75,6 +101,12 @@ pub const UI = struct {
     ask_thread_result: ?[]const u8 = null,
     ask_thread_error: ?[]const u8 = null,
     ask_pending_prompt: ?[]const u8 = null,
+    ask_in_progress: bool = false, // True while waiting for Pi response (non-blocking)
+    ask_original_question: ?[]const u8 = null, // Store original question for response view
+    ask_original_code: ?[]const u8 = null, // Store selected code for response view
+    ask_original_diff_lines: std.ArrayList(DiffLine) = .empty, // Store selected diff lines
+    ask_original_split_rows: std.ArrayList(SplitRow) = .empty, // Store selected split rows
+    ask_original_file: ?[]const u8 = null, // Store file path at time of ask
     spinner_frame: usize = 0,
 
     const InputBuffer = struct {
@@ -108,6 +140,7 @@ pub const UI = struct {
             .allocator = allocator,
             .session = session,
             .diff_lines = .empty,
+            .split_rows = .empty,
         };
     }
 
@@ -139,6 +172,9 @@ pub const UI = struct {
             }
         }
         self.diff_lines.deinit(self.allocator);
+        // Clean up split rows
+        self.freeSplitRows();
+        self.split_rows.deinit(self.allocator);
         if (self.ask_response) |resp| {
             self.allocator.free(resp);
         }
@@ -151,6 +187,16 @@ pub const UI = struct {
         if (self.ask_pending_prompt) |prompt| {
             self.allocator.free(prompt);
         }
+        if (self.ask_original_question) |q| {
+            self.allocator.free(q);
+        }
+        if (self.ask_original_code) |c| {
+            self.allocator.free(c);
+        }
+        if (self.ask_original_file) |f| {
+            self.allocator.free(f);
+        }
+        self.freeAskOriginalLines();
         // Clean up syntax highlighting
         if (self.syntax_spans.len > 0) {
             self.allocator.free(self.syntax_spans);
@@ -158,6 +204,81 @@ pub const UI = struct {
         if (self.highlighter) |*hl| {
             hl.deinit();
         }
+        if (self.old_syntax_spans.len > 0) {
+            self.allocator.free(self.old_syntax_spans);
+        }
+        if (self.old_highlighter) |*hl| {
+            hl.deinit();
+        }
+    }
+
+    fn freeSplitRows(self: *UI) void {
+        for (self.split_rows.items) |row| {
+            if (row.left) |left| {
+                if (left.content.len > 0) self.allocator.free(left.content);
+                if (left.changes.len > 0) {
+                    for (left.changes) |change| {
+                        if (change.content.len > 0) self.allocator.free(change.content);
+                    }
+                    self.allocator.free(left.changes);
+                }
+            }
+            if (row.right) |right| {
+                if (right.content.len > 0) self.allocator.free(right.content);
+                if (right.changes.len > 0) {
+                    for (right.changes) |change| {
+                        if (change.content.len > 0) self.allocator.free(change.content);
+                    }
+                    self.allocator.free(right.changes);
+                }
+            }
+        }
+    }
+
+    fn freeAskOriginalLines(self: *UI) void {
+        // Free diff lines
+        for (self.ask_original_diff_lines.items) |line| {
+            if (line.content.len > 0) self.allocator.free(line.content);
+            if (line.old_content) |oc| {
+                if (oc.len > 0) self.allocator.free(oc);
+            }
+            if (line.changes.len > 0) {
+                for (line.changes) |change| {
+                    if (change.content.len > 0) self.allocator.free(change.content);
+                }
+                self.allocator.free(line.changes);
+            }
+            if (line.old_changes.len > 0) {
+                for (line.old_changes) |change| {
+                    if (change.content.len > 0) self.allocator.free(change.content);
+                }
+                self.allocator.free(line.old_changes);
+            }
+        }
+        self.ask_original_diff_lines.clearRetainingCapacity();
+
+        // Free split rows
+        for (self.ask_original_split_rows.items) |row| {
+            if (row.left) |left| {
+                if (left.content.len > 0) self.allocator.free(left.content);
+                if (left.changes.len > 0) {
+                    for (left.changes) |change| {
+                        if (change.content.len > 0) self.allocator.free(change.content);
+                    }
+                    self.allocator.free(left.changes);
+                }
+            }
+            if (row.right) |right| {
+                if (right.content.len > 0) self.allocator.free(right.content);
+                if (right.changes.len > 0) {
+                    for (right.changes) |change| {
+                        if (change.content.len > 0) self.allocator.free(change.content);
+                    }
+                    self.allocator.free(right.changes);
+                }
+            }
+        }
+        self.ask_original_split_rows.clearRetainingCapacity();
     }
 
     /// Duplicate a changes array, allocating new memory for the array and content strings
@@ -197,6 +318,10 @@ pub const UI = struct {
         }
         self.diff_lines.clearRetainingCapacity();
 
+        // Clean up split rows
+        self.freeSplitRows();
+        self.split_rows.clearRetainingCapacity();
+
         // Clean up old syntax highlighting
         if (self.syntax_spans.len > 0) {
             self.allocator.free(self.syntax_spans);
@@ -206,17 +331,37 @@ pub const UI = struct {
             hl.deinit();
             self.highlighter = null;
         }
+        if (self.old_syntax_spans.len > 0) {
+            self.allocator.free(self.old_syntax_spans);
+            self.old_syntax_spans = &.{};
+        }
+        if (self.old_highlighter) |*hl| {
+            hl.deinit();
+            self.old_highlighter = null;
+        }
 
         const file = self.session.currentFile() orelse return;
         if (file.is_binary) return;
 
-        // Initialize syntax highlighter for this file
+        // Initialize syntax highlighter for this file (new content)
         if (highlight.Language.fromPath(file.path)) |lang| {
             if (highlight.Highlighter.init(self.allocator, lang)) |hl| {
                 self.highlighter = hl;
                 // Highlight the new content (what we display for context lines)
                 if (self.highlighter.?.highlight(file.new_content)) |spans| {
                     self.syntax_spans = spans;
+                } else |_| {
+                    // Highlighting failed, continue without it
+                }
+            } else |_| {
+                // Language not supported or init failed
+            }
+
+            // Also highlight old content for split view
+            if (highlight.Highlighter.init(self.allocator, lang)) |hl| {
+                self.old_highlighter = hl;
+                if (self.old_highlighter.?.highlight(file.old_content)) |spans| {
+                    self.old_syntax_spans = spans;
                 } else |_| {
                     // Highlighting failed, continue without it
                 }
@@ -231,10 +376,16 @@ pub const UI = struct {
         defer new_lines.deinit(self.allocator);
         var new_line_offsets: std.ArrayList(u32) = .empty;
         defer new_line_offsets.deinit(self.allocator);
+        var old_line_offsets: std.ArrayList(u32) = .empty;
+        defer old_line_offsets.deinit(self.allocator);
 
+        // Track byte offsets for each line in old content
+        var old_byte_offset: u32 = 0;
         var old_iter = std.mem.splitScalar(u8, file.old_content, '\n');
         while (old_iter.next()) |line| {
             try old_lines.append(self.allocator, line);
+            try old_line_offsets.append(self.allocator, old_byte_offset);
+            old_byte_offset += @intCast(line.len + 1);
         }
 
         // Track byte offsets for each line in new content
@@ -250,12 +401,24 @@ pub const UI = struct {
             if (file.diff.status == .removed) {
                 for (old_lines.items, 0..) |line, idx| {
                     const line_num: u32 = @intCast(idx + 1);
+                    const offset = if (idx < old_line_offsets.items.len) old_line_offsets.items[idx] else 0;
                     try self.diff_lines.append(self.allocator, .{
                         .old_line_num = line_num,
                         .new_line_num = null,
                         .content = try self.allocator.dupe(u8, line),
                         .changes = &.{},
                         .line_type = .deletion,
+                        .old_content_byte_offset = offset,
+                    });
+                    // Split view: deletion on left, empty on right
+                    try self.split_rows.append(self.allocator, .{
+                        .left = .{
+                            .line_num = line_num,
+                            .content = try self.allocator.dupe(u8, line),
+                            .line_type = .deletion,
+                            .content_byte_offset = offset,
+                        },
+                        .right = null,
                     });
                 }
             } else if (file.diff.status == .added) {
@@ -270,12 +433,23 @@ pub const UI = struct {
                         .line_type = .addition,
                         .content_byte_offset = offset,
                     });
+                    // Split view: empty on left, addition on right
+                    try self.split_rows.append(self.allocator, .{
+                        .left = null,
+                        .right = .{
+                            .line_num = line_num,
+                            .content = try self.allocator.dupe(u8, line),
+                            .line_type = .addition,
+                            .content_byte_offset = offset,
+                        },
+                    });
                 }
             } else if (file.diff.status == .unchanged) {
                 // For unchanged files, show all lines as context
                 for (new_lines.items, 0..) |line, idx| {
                     const line_num: u32 = @intCast(idx + 1);
                     const offset = if (idx < new_line_offsets.items.len) new_line_offsets.items[idx] else 0;
+                    const old_offset = if (idx < old_line_offsets.items.len) old_line_offsets.items[idx] else 0;
                     try self.diff_lines.append(self.allocator, .{
                         .old_line_num = line_num,
                         .new_line_num = line_num,
@@ -283,6 +457,21 @@ pub const UI = struct {
                         .changes = &.{},
                         .line_type = .context,
                         .content_byte_offset = offset,
+                    });
+                    // Split view: same content on both sides
+                    try self.split_rows.append(self.allocator, .{
+                        .left = .{
+                            .line_num = line_num,
+                            .content = try self.allocator.dupe(u8, line),
+                            .line_type = .context,
+                            .content_byte_offset = old_offset,
+                        },
+                        .right = .{
+                            .line_num = line_num,
+                            .content = try self.allocator.dupe(u8, line),
+                            .line_type = .context,
+                            .content_byte_offset = offset,
+                        },
                     });
                 }
             }
@@ -593,6 +782,163 @@ pub const UI = struct {
                 }
             }
         }
+
+        // Build split rows from diff_lines for split view
+        try self.buildSplitRowsFromDiffLines(old_line_offsets.items, new_line_offsets.items);
+    }
+
+    /// Build split rows from the diff_lines for side-by-side view
+    /// This converts the unified diff representation into paired rows
+    fn buildSplitRowsFromDiffLines(
+        self: *UI,
+        old_line_offsets: []const u32,
+        new_line_offsets: []const u32,
+    ) !void {
+        // Skip if we already built split rows in the simple cases (added/deleted/unchanged files)
+        if (self.split_rows.items.len > 0) return;
+
+        var i: usize = 0;
+        while (i < self.diff_lines.items.len) {
+            const diff_line = self.diff_lines.items[i];
+
+            switch (diff_line.line_type) {
+                .context => {
+                    // Context lines appear on both sides
+                    const old_ln = diff_line.old_line_num orelse 0;
+                    const new_ln = diff_line.new_line_num orelse 0;
+                    const old_offset = if (old_ln > 0 and old_ln - 1 < old_line_offsets.len)
+                        old_line_offsets[old_ln - 1]
+                    else
+                        0;
+                    const new_offset = if (new_ln > 0 and new_ln - 1 < new_line_offsets.len)
+                        new_line_offsets[new_ln - 1]
+                    else
+                        0;
+                    // For context lines, content is the same on both sides
+                    const content = diff_line.content;
+
+                    try self.split_rows.append(self.allocator, .{
+                        .left = if (old_ln > 0) .{
+                            .line_num = old_ln,
+                            .content = try self.allocator.dupe(u8, content),
+                            .line_type = .context,
+                            .content_byte_offset = old_offset,
+                        } else null,
+                        .right = if (new_ln > 0) .{
+                            .line_num = new_ln,
+                            .content = try self.allocator.dupe(u8, content),
+                            .line_type = .context,
+                            .content_byte_offset = new_offset,
+                        } else null,
+                        .selectable = diff_line.selectable,
+                    });
+                    i += 1;
+                },
+                .modification => {
+                    // Modification: old on left, new on right (same row)
+                    const old_ln = diff_line.old_line_num orelse 0;
+                    const new_ln = diff_line.new_line_num orelse 0;
+                    const old_offset = if (old_ln > 0 and old_ln - 1 < old_line_offsets.len)
+                        old_line_offsets[old_ln - 1]
+                    else
+                        0;
+                    const new_offset = if (new_ln > 0 and new_ln - 1 < new_line_offsets.len)
+                        new_line_offsets[new_ln - 1]
+                    else
+                        0;
+
+                    try self.split_rows.append(self.allocator, .{
+                        .left = if (diff_line.old_content) |oc| .{
+                            .line_num = old_ln,
+                            .content = try self.allocator.dupe(u8, oc),
+                            .changes = try self.dupeChanges(diff_line.old_changes),
+                            .line_type = .deletion,
+                            .content_byte_offset = old_offset,
+                        } else null,
+                        .right = .{
+                            .line_num = new_ln,
+                            .content = try self.allocator.dupe(u8, diff_line.content),
+                            .changes = try self.dupeChanges(diff_line.changes),
+                            .line_type = .addition,
+                            .content_byte_offset = new_offset,
+                        },
+                    });
+                    i += 1;
+                },
+                .deletion => {
+                    // Pure deletion: only on left side
+                    // Look ahead to see if next line is an addition (can pair them)
+                    const old_ln = diff_line.old_line_num orelse 0;
+                    const old_offset = if (old_ln > 0 and old_ln - 1 < old_line_offsets.len)
+                        old_line_offsets[old_ln - 1]
+                    else
+                        0;
+
+                    // Check if we should pair with following addition
+                    if (i + 1 < self.diff_lines.items.len and
+                        self.diff_lines.items[i + 1].line_type == .addition)
+                    {
+                        const next = self.diff_lines.items[i + 1];
+                        const new_ln = next.new_line_num orelse 0;
+                        const new_offset = if (new_ln > 0 and new_ln - 1 < new_line_offsets.len)
+                            new_line_offsets[new_ln - 1]
+                        else
+                            0;
+
+                        try self.split_rows.append(self.allocator, .{
+                            .left = .{
+                                .line_num = old_ln,
+                                .content = try self.allocator.dupe(u8, diff_line.content),
+                                .changes = try self.dupeChanges(diff_line.changes),
+                                .line_type = .deletion,
+                                .content_byte_offset = old_offset,
+                            },
+                            .right = .{
+                                .line_num = new_ln,
+                                .content = try self.allocator.dupe(u8, next.content),
+                                .changes = try self.dupeChanges(next.changes),
+                                .line_type = .addition,
+                                .content_byte_offset = new_offset,
+                            },
+                        });
+                        i += 2; // Skip both
+                    } else {
+                        // Standalone deletion
+                        try self.split_rows.append(self.allocator, .{
+                            .left = .{
+                                .line_num = old_ln,
+                                .content = try self.allocator.dupe(u8, diff_line.content),
+                                .changes = try self.dupeChanges(diff_line.changes),
+                                .line_type = .deletion,
+                                .content_byte_offset = old_offset,
+                            },
+                            .right = null,
+                        });
+                        i += 1;
+                    }
+                },
+                .addition => {
+                    // Pure addition: only on right side
+                    const new_ln = diff_line.new_line_num orelse 0;
+                    const new_offset = if (new_ln > 0 and new_ln - 1 < new_line_offsets.len)
+                        new_line_offsets[new_ln - 1]
+                    else
+                        0;
+
+                    try self.split_rows.append(self.allocator, .{
+                        .left = null,
+                        .right = .{
+                            .line_num = new_ln,
+                            .content = try self.allocator.dupe(u8, diff_line.content),
+                            .changes = try self.dupeChanges(diff_line.changes),
+                            .line_type = .addition,
+                            .content_byte_offset = new_offset,
+                        },
+                    });
+                    i += 1;
+                },
+            }
+        }
     }
 
     /// Returns a vxfw.Widget struct for this model
@@ -624,12 +970,18 @@ pub const UI = struct {
                 try self.handleKeyPress(ctx, key);
             },
             .tick => {
-                // For ask_pending mode, update spinner and request redraw
-                if (self.mode == .ask_pending) {
+                // Update spinner while ask is in progress (non-blocking)
+                if (self.ask_in_progress) {
                     self.spinner_frame +%= 1;
-                    // Schedule next tick to keep animation going
-                    try ctx.tick(80, self.widget());
-                    // Request redraw to show updated spinner
+                    
+                    // Check if request completed
+                    if (self.ask_thread_done.load(.acquire)) {
+                        try self.handleAskComplete();
+                    } else {
+                        // Schedule next tick to keep animation going
+                        try ctx.tick(80, self.widget());
+                    }
+                    // Request redraw to show updated spinner/result
                     ctx.redraw = true;
                 }
             },
@@ -642,8 +994,8 @@ pub const UI = struct {
             .normal => try self.handleNormalKey(ctx, key),
             .comment_input => try self.handleCommentInputKey(ctx, key),
             .ask_input => try self.handleAskInputKey(ctx, key),
-            .ask_pending => self.handleAskPendingKey(ctx, key),
             .ask_response => self.handleAskResponseKey(ctx, key),
+            .ask_response_comment => try self.handleAskResponseCommentKey(ctx, key),
             .help => self.handleHelpKey(ctx, key),
             .file_list => try self.handleFileListKey(ctx, key),
         }
@@ -658,10 +1010,30 @@ pub const UI = struct {
         const cp = key.codepoint;
 
         if (cp == vaxis.Key.up) {
-            self.moveCursorUp();
+            if (key.mods.shift) {
+                // Shift+Up: start/extend selection upward
+                if (self.selection_start == null) {
+                    self.selection_start = self.cursor_line;
+                }
+                self.moveCursorUp();
+            } else {
+                // Plain Up: move cursor, clear selection
+                self.selection_start = null;
+                self.moveCursorUp();
+            }
             return ctx.consumeAndRedraw();
         } else if (cp == vaxis.Key.down) {
-            self.moveCursorDown();
+            if (key.mods.shift) {
+                // Shift+Down: start/extend selection downward
+                if (self.selection_start == null) {
+                    self.selection_start = self.cursor_line;
+                }
+                self.moveCursorDown();
+            } else {
+                // Plain Down: move cursor, clear selection
+                self.selection_start = null;
+                self.moveCursorDown();
+            }
             return ctx.consumeAndRedraw();
         } else if (cp == vaxis.Key.left) {
             self.session.prevFile();
@@ -674,12 +1046,27 @@ pub const UI = struct {
             try self.buildDiffLines();
             return ctx.consumeAndRedraw();
         } else if (cp == vaxis.Key.page_up) {
+            if (key.mods.shift) {
+                if (self.selection_start == null) {
+                    self.selection_start = self.cursor_line;
+                }
+            } else {
+                self.selection_start = null;
+            }
             self.pageUp();
             return ctx.consumeAndRedraw();
         } else if (cp == vaxis.Key.page_down) {
+            if (key.mods.shift) {
+                if (self.selection_start == null) {
+                    self.selection_start = self.cursor_line;
+                }
+            } else {
+                self.selection_start = null;
+            }
             self.pageDown();
             return ctx.consumeAndRedraw();
         } else if (cp == vaxis.Key.escape) {
+            self.selection_start = null;
             self.clearMessage();
             return ctx.consumeAndRedraw();
         }
@@ -690,10 +1077,24 @@ pub const UI = struct {
                 ctx.quit = true;
             },
             'f' => {
+                if (key.mods.shift) {
+                    if (self.selection_start == null) {
+                        self.selection_start = self.cursor_line;
+                    }
+                } else {
+                    self.selection_start = null;
+                }
                 self.pageDown();
                 return ctx.consumeAndRedraw();
             },
             'p' => {
+                if (key.mods.shift) {
+                    if (self.selection_start == null) {
+                        self.selection_start = self.cursor_line;
+                    }
+                } else {
+                    self.selection_start = null;
+                }
                 self.pageUp();
                 return ctx.consumeAndRedraw();
             },
@@ -727,6 +1128,18 @@ pub const UI = struct {
             },
             ' ' => {
                 self.toggleSelection();
+                return ctx.consumeAndRedraw();
+            },
+            'v' => {
+                // Toggle between unified and split view
+                self.view_mode = if (self.view_mode == .unified) .split else .unified;
+                self.setMessage(if (self.view_mode == .split) "Split view" else "Unified view", false);
+                return ctx.consumeAndRedraw();
+            },
+            '\t' => {
+                // Toggle focus side (for commenting)
+                self.focus_side = if (self.focus_side == .new) .old else .new;
+                self.setMessage(if (self.focus_side == .new) "Focus: NEW (right)" else "Focus: OLD (left)", false);
                 return ctx.consumeAndRedraw();
             },
             '/' => {
@@ -791,11 +1204,22 @@ pub const UI = struct {
 
         if (cp == vaxis.Key.enter) {
             if (self.input_buffer.len > 0) {
-                // Switch to pending mode and start the ask request
-                self.mode = .ask_pending;
+                // Store the original question
+                if (self.ask_original_question) |old| {
+                    self.allocator.free(old);
+                }
+                self.ask_original_question = self.allocator.dupe(u8, self.input_buffer.slice()) catch null;
+                
+                // Start the ask request (non-blocking)
                 self.spinner_frame = 0;
                 try self.startAskRequest();
-                // Start the spinner tick immediately
+                
+                // Return to normal mode - user can continue navigating
+                self.mode = .normal;
+                self.input_buffer.clear();
+                self.setMessage("Asking Pi...", false);
+                
+                // Start the spinner tick
                 try ctx.tick(1, self.widget());
             }
             return ctx.consumeAndRedraw();
@@ -812,22 +1236,6 @@ pub const UI = struct {
         }
     }
 
-    fn handleAskPendingKey(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) void {
-        const cp = key.codepoint;
-
-        // Allow escape to cancel - we'll let the thread finish in background
-        // but ignore its result
-        if (cp == vaxis.Key.escape) {
-            // Note: We can't easily kill the thread, so we just switch mode
-            // The thread will complete and its result will be ignored on next ask
-            self.mode = .normal;
-            self.input_buffer.clear();
-            self.clearMessage();
-            self.setMessage("Ask cancelled", false);
-            return ctx.consumeAndRedraw();
-        }
-    }
-
     fn handleAskResponseKey(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) void {
         const cp = key.codepoint;
 
@@ -835,6 +1243,18 @@ pub const UI = struct {
             self.mode = .normal;
             self.ask_scroll_offset = 0;
             return ctx.consumeAndRedraw();
+        }
+
+        if (cp == 'c') {
+            // Add comment on the original code from response view
+            if (self.ask_original_file != null and self.ask_context_lines != null) {
+                self.mode = .ask_response_comment;
+                self.input_buffer.clear();
+                return ctx.consumeAndRedraw();
+            } else {
+                self.setMessage("No code context available for comment", true);
+                return ctx.consumeAndRedraw();
+            }
         }
 
         if (cp == vaxis.Key.up) {
@@ -862,6 +1282,62 @@ pub const UI = struct {
             self.ask_scroll_offset += 20;
             return ctx.consumeAndRedraw();
         }
+    }
+
+    fn handleAskResponseCommentKey(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        const cp = key.codepoint;
+
+        if (cp == vaxis.Key.escape) {
+            // Cancel and go back to response view
+            self.mode = .ask_response;
+            self.input_buffer.clear();
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.enter) {
+            if (self.input_buffer.slice().len > 0) {
+                try self.submitResponseComment();
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.backspace) {
+            self.input_buffer.backspace();
+            return ctx.consumeAndRedraw();
+        }
+
+        // Regular character input
+        if (cp >= 32 and cp < 127) {
+            self.input_buffer.append(@intCast(cp));
+            return ctx.consumeAndRedraw();
+        }
+    }
+
+    fn submitResponseComment(self: *UI) !void {
+        const file_path = self.ask_original_file orelse {
+            self.mode = .ask_response;
+            return;
+        };
+
+        const lines = self.ask_context_lines orelse {
+            self.mode = .ask_response;
+            return;
+        };
+
+        const comment = review.Comment{
+            .file_path = try self.allocator.dupe(u8, file_path),
+            .side = self.focus_side,
+            .line_start = lines.start,
+            .line_end = lines.end,
+            .text = try self.allocator.dupe(u8, self.input_buffer.slice()),
+            .allocator = self.allocator,
+        };
+
+        try self.session.addComment(comment);
+
+        self.input_buffer.clear();
+        self.mode = .ask_response;
+        self.setMessage("Comment added", false);
     }
 
     fn handleHelpKey(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) void {
@@ -951,7 +1427,16 @@ pub const UI = struct {
         const lines_end = if (self.ask_context_lines) |l| l.end else 1;
         const question = self.input_buffer.slice();
 
-        // Get the selected code content
+        // Store the original file path
+        if (self.ask_original_file) |old| {
+            self.allocator.free(old);
+        }
+        self.ask_original_file = self.allocator.dupe(u8, file_path) catch null;
+
+        // Clear and store the original diff lines and split rows for the selected range
+        self.freeAskOriginalLines();
+
+        // Get the selected code content and store the diff lines
         var code_content: std.ArrayList(u8) = .empty;
         defer code_content.deinit(self.allocator);
 
@@ -960,6 +1445,21 @@ pub const UI = struct {
             const line_num = diff_line.new_line_num orelse diff_line.old_line_num;
             if (line_num) |num| {
                 if (num >= lines_start and num <= lines_end) {
+                    // Store a copy of this diff line
+                    try self.ask_original_diff_lines.append(self.allocator, .{
+                        .old_line_num = diff_line.old_line_num,
+                        .new_line_num = diff_line.new_line_num,
+                        .content = try self.allocator.dupe(u8, diff_line.content),
+                        .old_content = if (diff_line.old_content) |oc| try self.allocator.dupe(u8, oc) else null,
+                        .changes = try self.dupeChanges(diff_line.changes),
+                        .old_changes = try self.dupeChanges(diff_line.old_changes),
+                        .line_type = diff_line.line_type,
+                        .selectable = diff_line.selectable,
+                        .is_partial_change = diff_line.is_partial_change,
+                        .content_byte_offset = diff_line.content_byte_offset,
+                        .old_content_byte_offset = diff_line.old_content_byte_offset,
+                    });
+
                     const prefix: u8 = switch (diff_line.line_type) {
                         .addition => '+',
                         .deletion => '-',
@@ -980,6 +1480,40 @@ pub const UI = struct {
                 }
             }
         }
+
+        // Store split rows for the selected range
+        for (self.split_rows.items) |split_row| {
+            const left_num = if (split_row.left) |l| l.line_num else 0;
+            const right_num = if (split_row.right) |r| r.line_num else 0;
+            const row_num = if (right_num > 0) right_num else left_num;
+
+            if (row_num >= lines_start and row_num <= lines_end) {
+                try self.ask_original_split_rows.append(self.allocator, .{
+                    .left = if (split_row.left) |l| .{
+                        .line_num = l.line_num,
+                        .content = try self.allocator.dupe(u8, l.content),
+                        .changes = try self.dupeChanges(l.changes),
+                        .line_type = l.line_type,
+                        .content_byte_offset = l.content_byte_offset,
+                    } else null,
+                    .right = if (split_row.right) |r| .{
+                        .line_num = r.line_num,
+                        .content = try self.allocator.dupe(u8, r.content),
+                        .changes = try self.dupeChanges(r.changes),
+                        .line_type = r.line_type,
+                        .content_byte_offset = r.content_byte_offset,
+                    } else null,
+                    .selectable = split_row.selectable,
+                    .is_separator = split_row.is_separator,
+                });
+            }
+        }
+
+        // Store the original code for display in response view
+        if (self.ask_original_code) |old| {
+            self.allocator.free(old);
+        }
+        self.ask_original_code = self.allocator.dupe(u8, code_content.items) catch null;
 
         // Build the full prompt with context
         const line_range = if (lines_start == lines_end)
@@ -1008,15 +1542,16 @@ pub const UI = struct {
         }
         self.ask_pending_prompt = prompt;
 
-        // Reset thread state
+        // Reset thread state and mark as in progress
         self.ask_thread_done.store(false, .release);
         self.ask_thread_result = null;
         self.ask_thread_error = null;
         self.spinner_frame = 0;
+        self.ask_in_progress = true;
 
         // Spawn thread to do the RPC call
         self.ask_thread = std.Thread.spawn(.{}, askThreadFn, .{self}) catch {
-            self.mode = .normal;
+            self.ask_in_progress = false;
             self.setMessage("Failed to start ask thread", true);
             return;
         };
@@ -1039,26 +1574,87 @@ pub const UI = struct {
         self.ask_thread_done.store(true, .release);
     }
 
+    /// Handle completion of the async ask request
+    fn handleAskComplete(self: *UI) !void {
+        // Thread completed, get result
+        if (self.ask_thread) |thread| {
+            thread.join();
+            self.ask_thread = null;
+        }
+
+        if (self.ask_thread_error) |err| {
+            if (self.ask_response) |old| {
+                self.allocator.free(old);
+            }
+            self.ask_response = err;
+            self.ask_thread_error = null;
+        } else if (self.ask_thread_result) |result| {
+            if (self.ask_response) |old| {
+                self.allocator.free(old);
+            }
+            self.ask_response = result;
+            self.ask_thread_result = null;
+        }
+
+        if (self.ask_pending_prompt) |prompt| {
+            self.allocator.free(prompt);
+            self.ask_pending_prompt = null;
+        }
+        self.ask_thread_done.store(false, .release);
+        self.ask_in_progress = false;
+
+        // Switch to response view
+        self.ask_scroll_offset = 0;
+        self.mode = .ask_response;
+        self.clearMessage();
+    }
+
     fn getLineNumber(self: *UI) ?usize {
         return self.getLineNumberAt(self.cursor_line);
     }
 
     fn getLineNumberAt(self: *UI, idx: usize) ?usize {
-        if (idx >= self.diff_lines.items.len) return null;
-        const line = self.diff_lines.items[idx];
-        // Prefer new line number, fall back to old line number
-        return if (line.new_line_num) |n| n else if (line.old_line_num) |n| n else null;
+        if (self.view_mode == .split) {
+            if (idx >= self.split_rows.items.len) return null;
+            const row = self.split_rows.items[idx];
+            // Return line number based on focus side
+            if (self.focus_side == .new) {
+                return if (row.right) |r| r.line_num else if (row.left) |l| l.line_num else null;
+            } else {
+                return if (row.left) |l| l.line_num else if (row.right) |r| r.line_num else null;
+            }
+        } else {
+            if (idx >= self.diff_lines.items.len) return null;
+            const line = self.diff_lines.items[idx];
+            // Prefer new line number, fall back to old line number
+            return if (line.new_line_num) |n| n else if (line.old_line_num) |n| n else null;
+        }
+    }
+
+    fn getRowCount(self: *UI) usize {
+        return if (self.view_mode == .split) self.split_rows.items.len else self.diff_lines.items.len;
+    }
+
+    fn isRowSelectable(self: *UI, idx: usize) bool {
+        if (self.view_mode == .split) {
+            if (idx >= self.split_rows.items.len) return false;
+            return self.split_rows.items[idx].selectable;
+        } else {
+            if (idx >= self.diff_lines.items.len) return false;
+            return self.diff_lines.items[idx].selectable;
+        }
     }
 
     fn moveCursorDown(self: *UI) void {
-        if (self.cursor_line + 1 < self.diff_lines.items.len) {
+        const row_count = self.getRowCount();
+        if (self.cursor_line + 1 < row_count) {
             self.cursor_line += 1;
-            while (self.cursor_line < self.diff_lines.items.len and !self.diff_lines.items[self.cursor_line].selectable) {
+            while (self.cursor_line < row_count and !self.isRowSelectable(self.cursor_line)) {
                 self.cursor_line += 1;
             }
-            if (self.cursor_line >= self.diff_lines.items.len) {
+            if (self.cursor_line >= row_count) {
                 self.cursor_line -= 1;
-                while (self.cursor_line > 0 and !self.diff_lines.items[self.cursor_line].selectable) {
+                while (self.cursor_line > 0 and !self.isRowSelectable(self.cursor_line)) {
                     self.cursor_line -= 1;
                 }
             }
@@ -1068,11 +1664,12 @@ pub const UI = struct {
     fn moveCursorUp(self: *UI) void {
         if (self.cursor_line > 0) {
             self.cursor_line -= 1;
-            while (self.cursor_line > 0 and !self.diff_lines.items[self.cursor_line].selectable) {
+            while (self.cursor_line > 0 and !self.isRowSelectable(self.cursor_line)) {
                 self.cursor_line -= 1;
             }
-            if (!self.diff_lines.items[self.cursor_line].selectable) {
-                while (self.cursor_line < self.diff_lines.items.len and !self.diff_lines.items[self.cursor_line].selectable) {
+            if (!self.isRowSelectable(self.cursor_line)) {
+                const row_count = self.getRowCount();
+                while (self.cursor_line < row_count and !self.isRowSelectable(self.cursor_line)) {
                     self.cursor_line += 1;
                 }
             }
@@ -1081,8 +1678,9 @@ pub const UI = struct {
 
     fn pageDown(self: *UI) void {
         const page_size: usize = 20;
-        self.cursor_line = @min(self.cursor_line + page_size, if (self.diff_lines.items.len > 0) self.diff_lines.items.len - 1 else 0);
-        while (self.cursor_line < self.diff_lines.items.len and !self.diff_lines.items[self.cursor_line].selectable) {
+        const row_count = self.getRowCount();
+        self.cursor_line = @min(self.cursor_line + page_size, if (row_count > 0) row_count - 1 else 0);
+        while (self.cursor_line < row_count and !self.isRowSelectable(self.cursor_line)) {
             self.cursor_line += 1;
         }
     }
@@ -1094,7 +1692,7 @@ pub const UI = struct {
         } else {
             self.cursor_line = 0;
         }
-        while (self.cursor_line > 0 and !self.diff_lines.items[self.cursor_line].selectable) {
+        while (self.cursor_line > 0 and !self.isRowSelectable(self.cursor_line)) {
             self.cursor_line -= 1;
         }
     }
@@ -1102,15 +1700,17 @@ pub const UI = struct {
     fn goToTop(self: *UI) void {
         self.cursor_line = 0;
         self.scroll_offset = 0;
-        while (self.cursor_line < self.diff_lines.items.len and !self.diff_lines.items[self.cursor_line].selectable) {
+        const row_count = self.getRowCount();
+        while (self.cursor_line < row_count and !self.isRowSelectable(self.cursor_line)) {
             self.cursor_line += 1;
         }
     }
 
     fn goToBottom(self: *UI) void {
-        if (self.diff_lines.items.len > 0) {
-            self.cursor_line = self.diff_lines.items.len - 1;
-            while (self.cursor_line > 0 and !self.diff_lines.items[self.cursor_line].selectable) {
+        const row_count = self.getRowCount();
+        if (row_count > 0) {
+            self.cursor_line = row_count - 1;
+            while (self.cursor_line > 0 and !self.isRowSelectable(self.cursor_line)) {
                 self.cursor_line -= 1;
             }
         }
@@ -1183,8 +1783,8 @@ pub const UI = struct {
         return switch (self.mode) {
             .help => self.drawHelp(ctx),
             .file_list => self.drawFileList(ctx),
-            .ask_pending => self.drawAskPending(ctx),
             .ask_response => self.drawAskResponse(ctx),
+            .ask_response_comment => self.drawAskResponseComment(ctx),
             else => self.drawMainView(ctx),
         };
     }
@@ -1205,7 +1805,14 @@ pub const UI = struct {
 
         // Draw diff content (rows 1 to height-3)
         const content_height = size.height -| 3;
-        self.drawDiff(&surface, content_height);
+
+        // Choose between split and unified view based on terminal width
+        // Split view needs at least 80 columns to be usable
+        if (self.view_mode == .split and size.width >= 80) {
+            self.drawSplitDiff(&surface, content_height);
+        } else {
+            self.drawDiff(&surface, content_height);
+        }
 
         // Draw footer (last 2 rows)
         self.drawFooter(&surface);
@@ -1227,12 +1834,14 @@ pub const UI = struct {
         // Fill entire header row with background
         fillRow(surface, 0, ' ', header_style);
 
-        // Build header text
+        // Build header text with view mode indicator
         var buf: [256]u8 = undefined;
-        const header_text = std.fmt.bufPrint(&buf, " rv: {s} ({d}/{d})", .{
+        const view_indicator = if (self.view_mode == .split) "[⫿]" else "[≡]";
+        const header_text = std.fmt.bufPrint(&buf, " rv: {s} ({d}/{d}) {s}", .{
             path,
             self.session.current_file_idx + 1,
             self.session.files.len,
+            view_indicator,
         }) catch " rv";
 
         // Write header text
@@ -1347,12 +1956,26 @@ pub const UI = struct {
                 .fg = .{ .rgb = .{ 0xd7, 0xd7, 0x00 } }, // Yellow for modifications
             };
 
+            // Selection background color
+            const selection_bg: vaxis.Color = .{ .rgb = .{ 0x30, 0x30, 0x50 } };
+
             const display_row = row + 1; // +1 for header
             var col: u16 = 0;
 
+            // Fill entire row with selection background first if in selection
+            if (in_selection and !is_selected) {
+                var fill_col: u16 = 0;
+                while (fill_col < width) : (fill_col += 1) {
+                    surface.writeCell(fill_col, display_row, .{
+                        .char = .{ .grapheme = " " },
+                        .style = .{ .bg = selection_bg },
+                    });
+                }
+            }
+
             // Old line number (4 chars) - red for deletions, yellow for modifications, dim for context
             var num_buf: [8]u8 = undefined;
-            const old_num_style = if (is_selected)
+            var old_num_style: vaxis.Style = if (is_selected)
                 vaxis.Style{ .reverse = true }
             else if (diff_line.line_type == .deletion)
                 red_line_num_style
@@ -1360,6 +1983,11 @@ pub const UI = struct {
                 yellow_line_num_style
             else
                 dim_style;
+            
+            // Apply selection background to line numbers
+            if (in_selection and !is_selected) {
+                old_num_style.bg = selection_bg;
+            }
 
             if (diff_line.old_line_num) |num| {
                 const num_str = std.fmt.bufPrint(&num_buf, "{d:>4}", .{num}) catch "    ";
@@ -1374,25 +2002,35 @@ pub const UI = struct {
                 }
             } else {
                 // Blank for additions (no old line)
+                var blank_style = dim_style;
+                if (in_selection and !is_selected) {
+                    blank_style.bg = selection_bg;
+                }
                 while (col < 4 and col < width) : (col += 1) {
                     surface.writeCell(col, display_row, .{
                         .char = .{ .grapheme = grapheme(' ') },
-                        .style = dim_style,
+                        .style = blank_style,
                     });
                 }
             }
 
             // Space between line numbers
             if (col < width) {
+                var space_style = dim_style;
+                if (in_selection and !is_selected) {
+                    space_style.bg = selection_bg;
+                } else if (is_selected) {
+                    space_style.reverse = true;
+                }
                 surface.writeCell(col, display_row, .{
                     .char = .{ .grapheme = grapheme(' ') },
-                    .style = dim_style,
+                    .style = space_style,
                 });
                 col += 1;
             }
 
             // New line number (4 chars) - green for additions, yellow for modifications, dim for context
-            const new_num_style = if (is_selected)
+            var new_num_style: vaxis.Style = if (is_selected)
                 vaxis.Style{ .reverse = true }
             else if (diff_line.line_type == .addition)
                 green_line_num_style
@@ -1400,6 +2038,11 @@ pub const UI = struct {
                 yellow_line_num_style
             else
                 dim_style;
+
+            // Apply selection background to line numbers
+            if (in_selection and !is_selected) {
+                new_num_style.bg = selection_bg;
+            }
 
             if (diff_line.new_line_num) |num| {
                 const num_str = std.fmt.bufPrint(&num_buf, "{d:>4}", .{num}) catch "    ";
@@ -1414,10 +2057,14 @@ pub const UI = struct {
                 }
             } else {
                 // Blank for deletions (no new line)
+                var blank_style = dim_style;
+                if (in_selection and !is_selected) {
+                    blank_style.bg = selection_bg;
+                }
                 while (col < 9 and col < width) : (col += 1) {
                     surface.writeCell(col, display_row, .{
                         .char = .{ .grapheme = grapheme(' ') },
-                        .style = dim_style,
+                        .style = blank_style,
                     });
                 }
             }
@@ -1496,6 +2143,358 @@ pub const UI = struct {
                 self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection, byte_offset, diff_line.line_type);
             }
         }
+    }
+
+    /// Draw the diff in split (side-by-side) view
+    fn drawSplitDiff(self: *UI, surface: *vxfw.Surface, height: u16) void {
+        const file = self.session.currentFile() orelse {
+            writeString(surface, 2, 2, "No files to review", .{});
+            return;
+        };
+
+        if (file.is_binary) {
+            writeString(surface, 2, 2, "(binary file)", .{});
+            return;
+        }
+
+        if (self.split_rows.items.len == 0) {
+            writeString(surface, 2, 2, "No changes in this file", .{});
+            return;
+        }
+
+        const width = surface.size.width;
+
+        // Calculate panel widths
+        // Layout: [line_num(5)][content...] | [line_num(5)][content...]
+        const separator_col: u16 = width / 2;
+        const left_content_start: u16 = 6; // 5 for line num + 1 space
+        const right_content_start: u16 = separator_col + 7; // separator + 5 for line num + 1 space
+        const left_content_width: u16 = separator_col -| left_content_start -| 1;
+        const right_content_width: u16 = width -| right_content_start;
+
+        // Adjust scroll to keep cursor visible
+        if (self.cursor_line < self.scroll_offset) {
+            self.scroll_offset = self.cursor_line;
+        } else if (self.cursor_line >= self.scroll_offset + height) {
+            self.scroll_offset = self.cursor_line - height + 1;
+        }
+
+        // Render visible rows
+        var row: u16 = 0;
+        var line_idx = self.scroll_offset;
+        while (row < height and line_idx < self.split_rows.items.len) : ({
+            row += 1;
+            line_idx += 1;
+        }) {
+            const split_row = self.split_rows.items[line_idx];
+            const is_selected = line_idx == self.cursor_line;
+            const in_selection = if (self.selection_start) |sel|
+                (line_idx >= @min(sel, self.cursor_line) and line_idx <= @max(sel, self.cursor_line))
+            else
+                false;
+
+            const display_row = row + 1; // +1 for header
+
+            // Draw separator
+            const separator_style: vaxis.Style = .{
+                .fg = .{ .rgb = .{ 0x44, 0x44, 0x44 } },
+            };
+            surface.writeCell(separator_col, display_row, .{
+                .char = .{ .grapheme = "│" },
+                .style = separator_style,
+            });
+
+            // Draw left panel (old file)
+            self.drawSplitPanelCell(
+                surface,
+                display_row,
+                0,
+                left_content_start,
+                left_content_width,
+                split_row.left,
+                is_selected and self.focus_side == .old,
+                in_selection,
+                true, // is_left
+            );
+
+            // Draw right panel (new file)
+            self.drawSplitPanelCell(
+                surface,
+                display_row,
+                separator_col + 1,
+                right_content_start,
+                right_content_width,
+                split_row.right,
+                is_selected and self.focus_side == .new,
+                in_selection,
+                false, // is_left
+            );
+
+            // Highlight the focused side when selected
+            if (is_selected) {
+                // Draw a subtle indicator for which side is focused
+                const focus_indicator_col: u16 = if (self.focus_side == .old) 0 else separator_col + 1;
+                const focus_style: vaxis.Style = .{
+                    .bg = .{ .rgb = .{ 0x00, 0x5f, 0xaf } }, // Blue for focus
+                    .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } },
+                };
+                surface.writeCell(focus_indicator_col, display_row, .{
+                    .char = .{ .grapheme = if (self.focus_side == .old) "◀" else "▶" },
+                    .style = focus_style,
+                });
+            }
+        }
+    }
+
+    /// Draw a single cell (left or right) in split view
+    fn drawSplitPanelCell(
+        self: *UI,
+        surface: *vxfw.Surface,
+        row: u16,
+        panel_start: u16,
+        content_start: u16,
+        content_width: u16,
+        cell: ?SplitRow.SplitCell,
+        is_selected: bool,
+        in_selection: bool,
+        is_left: bool,
+    ) void {
+        const dim_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x60, 0x60, 0x60 } },
+        };
+        const selection_bg: vaxis.Color = .{ .rgb = .{ 0x30, 0x30, 0x50 } };
+        const panel_end = content_start + content_width;
+
+        // Fill entire panel with selection background first if in selection
+        if (in_selection and !is_selected) {
+            var fill_col = panel_start + 1;
+            while (fill_col < panel_end) : (fill_col += 1) {
+                surface.writeCell(fill_col, row, .{
+                    .char = .{ .grapheme = " " },
+                    .style = .{ .bg = selection_bg },
+                });
+            }
+        }
+
+        if (cell) |c| {
+            // Determine colors based on line type
+            const deletion_bg: vaxis.Color = .{ .rgb = .{ 0x3d, 0x1a, 0x1a } }; // Dark red
+            const addition_bg: vaxis.Color = .{ .rgb = .{ 0x1a, 0x3d, 0x1a } }; // Dark green
+            const deletion_fg: vaxis.Color = .{ .rgb = .{ 0xff, 0x5f, 0x5f } }; // Red
+            const addition_fg: vaxis.Color = .{ .rgb = .{ 0x5f, 0xff, 0x5f } }; // Green
+            const context_fg: vaxis.Color = .{ .rgb = .{ 0xa0, 0xa0, 0xa0 } }; // Gray
+
+            var line_num_style: vaxis.Style = dim_style;
+            var content_style: vaxis.Style = .{};
+            var bg_color: ?vaxis.Color = null;
+
+            switch (c.line_type) {
+                .deletion => {
+                    line_num_style.fg = deletion_fg;
+                    content_style.fg = deletion_fg;
+                    bg_color = deletion_bg;
+                },
+                .addition => {
+                    line_num_style.fg = addition_fg;
+                    content_style.fg = addition_fg;
+                    bg_color = addition_bg;
+                },
+                .context => {
+                    content_style.fg = context_fg;
+                },
+                .modification => {
+                    // Shouldn't happen in split view, but handle it
+                    content_style.fg = .{ .rgb = .{ 0xff, 0xd7, 0x00 } };
+                },
+            }
+
+            if (is_selected) {
+                line_num_style.reverse = true;
+                content_style.reverse = true;
+            } else if (in_selection) {
+                // Apply selection background while preserving foreground colors
+                line_num_style.bg = selection_bg;
+                content_style.bg = selection_bg;
+            } else if (bg_color) |bg| {
+                content_style.bg = bg;
+            }
+
+            // Draw line number
+            var num_buf: [8]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "{d:>4} ", .{c.line_num}) catch "     ";
+            var col = panel_start + 1; // +1 for focus indicator space
+            for (num_str) |ch| {
+                if (col < content_start) {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = grapheme(ch) },
+                        .style = line_num_style,
+                    });
+                    col += 1;
+                }
+            }
+
+            // Draw content with syntax highlighting
+            var content = c.content;
+            // Strip trailing newlines
+            while (content.len > 0 and (content[content.len - 1] == '\n' or content[content.len - 1] == '\r')) {
+                content = content[0 .. content.len - 1];
+            }
+
+            // Draw content with highlighting
+            self.writeSplitContent(
+                surface,
+                row,
+                content_start,
+                content,
+                c.changes,
+                content_width,
+                content_style,
+                is_selected,
+                c.content_byte_offset,
+                c.line_type,
+                is_left,
+                in_selection,
+            );
+        } else {
+            // Empty cell - fill with background (selection or default)
+            var empty_style = dim_style;
+            if (in_selection and !is_selected) {
+                empty_style.bg = selection_bg;
+            }
+            var col = panel_start + 1;
+            while (col < panel_end) : (col += 1) {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = " " },
+                    .style = empty_style,
+                });
+            }
+        }
+    }
+
+    /// Write content in split view with syntax highlighting
+    fn writeSplitContent(
+        self: *UI,
+        surface: *vxfw.Surface,
+        row: u16,
+        start_col: u16,
+        content: []const u8,
+        changes: []const difft.Change,
+        max_width: u16,
+        base_style: vaxis.Style,
+        is_selected: bool,
+        content_byte_offset: u32,
+        line_type: DiffLine.LineType,
+        is_left: bool,
+        in_selection: bool,
+    ) void {
+        const deletion_bg: vaxis.Color = .{ .rgb = .{ 0x3d, 0x1a, 0x1a } };
+        const addition_bg: vaxis.Color = .{ .rgb = .{ 0x1a, 0x3d, 0x1a } };
+        const selection_bg: vaxis.Color = .{ .rgb = .{ 0x30, 0x30, 0x50 } };
+
+        var col = start_col;
+        var char_idx: u32 = 0;
+        var visual_col: u16 = 0;
+
+        // Use appropriate syntax highlighting based on side
+        // Left side always uses old file highlighting, right side uses new file highlighting
+        const use_old_highlighting = is_left;
+
+        for (content) |c| {
+            if (col >= start_col + max_width) break;
+
+            const global_byte_pos = content_byte_offset + char_idx;
+
+            // Check if in a changed region
+            var in_change = false;
+            for (changes) |change| {
+                if (char_idx >= change.start and char_idx < change.end) {
+                    in_change = true;
+                    break;
+                }
+            }
+
+            // Get syntax highlighting style
+            // Left side uses old file spans, right side uses new file spans
+            var style = if (!is_selected) blk: {
+                if (use_old_highlighting) {
+                    break :blk self.getOldSyntaxStyle(global_byte_pos, base_style);
+                } else {
+                    break :blk self.getSyntaxStyle(global_byte_pos, base_style);
+                }
+            } else base_style;
+
+            // Apply background for additions/deletions or selection
+            if (!is_selected) {
+                if (in_selection) {
+                    style.bg = selection_bg;
+                } else {
+                    switch (line_type) {
+                        .addition => {
+                            style.bg = addition_bg;
+                            if (in_change) {
+                                style.bold = true;
+                            }
+                        },
+                        .deletion => {
+                            style.bg = deletion_bg;
+                            if (in_change) {
+                                style.bold = true;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+
+            if (c == '\t') {
+                const spaces_to_add = TAB_WIDTH - (visual_col % TAB_WIDTH);
+                var i: u16 = 0;
+                while (i < spaces_to_add and col < start_col + max_width) : (i += 1) {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = " " },
+                        .style = style,
+                    });
+                    col += 1;
+                    visual_col += 1;
+                }
+            } else {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = grapheme(c) },
+                    .style = style,
+                });
+                col += 1;
+                visual_col += 1;
+            }
+            char_idx += 1;
+        }
+
+        // Fill remaining space with background
+        const bg_style: vaxis.Style = if (is_selected)
+            .{ .reverse = true }
+        else if (in_selection)
+            .{ .bg = selection_bg }
+        else switch (line_type) {
+            .addition => .{ .bg = addition_bg },
+            .deletion => .{ .bg = deletion_bg },
+            else => .{},
+        };
+        while (col < start_col + max_width) {
+            surface.writeCell(col, row, .{
+                .char = .{ .grapheme = " " },
+                .style = bg_style,
+            });
+            col += 1;
+        }
+    }
+
+    /// Get syntax highlighting style for old file content
+    fn getOldSyntaxStyle(self: *UI, byte_pos: u32, base_style: vaxis.Style) vaxis.Style {
+        for (self.old_syntax_spans) |span| {
+            if (byte_pos >= span.start_byte and byte_pos < span.end_byte) {
+                return highlightToStyle(span.highlight, base_style);
+            }
+        }
+        return base_style;
     }
 
     const TAB_WIDTH: u16 = 4;
@@ -1918,9 +2917,25 @@ pub const UI = struct {
                 writeString(surface, 0, status_row, "[Enter] ask  [Esc] cancel", dim_style);
             },
             else => {
-                writeString(surface, 0, footer_row, "[↑↓] nav  [←→] files  [c] comment  [a] ask  [Space] select  [l] list  [q] quit  [?] help", dim_style);
+                writeString(surface, 0, footer_row, "[↑↓] nav  [Shift+↑↓] select  [c] comment  [a] ask  [v] view  [Tab] side  [?] help", dim_style);
 
-                if (self.message) |msg| {
+                // Show spinner if ask is in progress
+                if (self.ask_in_progress) {
+                    const spinner_frames = [_][]const u8{ "⣶", "⣧", "⣏", "⡟", "⠿", "⢻", "⣹", "⣼" };
+                    const frame_idx = self.spinner_frame % spinner_frames.len;
+                    const spinner_char = spinner_frames[frame_idx];
+                    
+                    const spinner_style: vaxis.Style = .{
+                        .fg = .{ .rgb = .{ 0xaf, 0x5f, 0xff } }, // Purple
+                        .bold = true,
+                    };
+                    
+                    surface.writeCell(0, status_row, .{
+                        .char = .{ .grapheme = spinner_char, .width = 1 },
+                        .style = spinner_style,
+                    });
+                    writeString(surface, 2, status_row, "Asking Pi...", spinner_style);
+                } else if (self.message) |msg| {
                     const msg_style: vaxis.Style = .{
                         .fg = if (self.message_is_error)
                             .{ .rgb = .{ 0xd7, 0x00, 0x00 } }
@@ -1934,10 +2949,13 @@ pub const UI = struct {
                     writeString(surface, 0, status_row, comment_text, dim_style);
                 }
 
-                // Show focus indicator
-                const focus_text = if (self.focus_side == .new) "Focus: NEW" else "Focus: OLD";
+                // Show view mode and focus indicator
+                var mode_buf: [32]u8 = undefined;
+                const view_text = if (self.view_mode == .split) "SPLIT" else "UNIFIED";
+                const focus_text = if (self.focus_side == .new) "NEW" else "OLD";
+                const mode_text = std.fmt.bufPrint(&mode_buf, "{s} | {s}", .{ view_text, focus_text }) catch "?";
                 if (width > 20) {
-                    writeString(surface, @intCast(width -| 12), status_row, focus_text, dim_style);
+                    writeString(surface, @intCast(width -| @as(u16, @intCast(mode_text.len)) -| 1), status_row, mode_text, dim_style);
                 }
             },
         }
@@ -1953,18 +2971,31 @@ pub const UI = struct {
             "",
             "  Navigation:",
             "    Up/Down             Move cursor by line",
+            "    Shift+Up/Down       Select lines",
             "    Left/Right          Previous/next file",
             "    f/p                 Page forward/backward",
+            "    Shift+f/p           Page with selection",
             "    g/G                 Go to top/bottom",
             "    PgUp/PgDn           Page up/down",
+            "    Shift+PgUp/PgDn     Page with selection",
             "    l or .              Show file list",
             "",
+            "  View:",
+            "    v                   Toggle split/unified view",
+            "    Tab                 Toggle focus (old/new side)",
+            "",
             "  Actions:",
-            "    c                   Add comment at cursor",
-            "    a                   Ask Pi about selected lines",
-            "    Space               Start/end line selection",
+            "    c                   Add comment at cursor/selection",
+            "    a                   Ask Pi about cursor/selection",
+            "    Space               Toggle line selection",
+            "    Esc                 Clear selection/message",
             "    q                   Quit and export markdown",
             "    ?                   Toggle this help",
+            "",
+            "  In Pi Response View:",
+            "    c                   Add comment on the code",
+            "    Up/Down/PgUp/PgDn   Scroll answer",
+            "    Esc/q               Close response",
             "",
             "  Press ? or Esc to close",
         };
@@ -2019,74 +3050,6 @@ pub const UI = struct {
         return surface;
     }
 
-    fn drawAskPending(self: *UI, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
-        // Check if thread completed (poll on every draw)
-        if (self.ask_thread_done.load(.acquire)) {
-            // Thread completed, get result
-            if (self.ask_thread) |thread| {
-                thread.join();
-                self.ask_thread = null;
-            }
-
-            if (self.ask_thread_error) |err| {
-                if (self.ask_response) |old| {
-                    self.allocator.free(old);
-                }
-                self.ask_response = err;
-                self.ask_thread_error = null;
-            } else if (self.ask_thread_result) |result| {
-                if (self.ask_response) |old| {
-                    self.allocator.free(old);
-                }
-                self.ask_response = result;
-                self.ask_thread_result = null;
-            }
-
-            if (self.ask_pending_prompt) |prompt| {
-                self.allocator.free(prompt);
-                self.ask_pending_prompt = null;
-            }
-            self.ask_thread_done.store(false, .release);
-
-            self.ask_scroll_offset = 0;
-            self.mode = .ask_response;
-            self.input_buffer.clear();
-            self.selection_start = null;
-
-            // Draw the response instead
-            return self.drawAskResponse(ctx);
-        }
-
-        const size = ctx.max.size();
-        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
-
-        const header_style: vaxis.Style = .{
-            .bg = .{ .rgb = .{ 0x5f, 0x00, 0xaf } }, // Purple background
-            .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } },
-            .bold = true,
-        };
-        fillRow(&surface, 0, ' ', header_style);
-        writeString(&surface, 1, 0, "Ask Pi", header_style);
-
-        const center_row = size.height / 2;
-
-        // Static loading message with dots
-        writeString(&surface, 2, center_row - 1, "⏳ Asking Pi...", .{
-            .bold = true,
-            .fg = .{ .rgb = .{ 0xaf, 0x5f, 0xff } }, // Purple text
-        });
-        writeString(&surface, 2, center_row + 1, "Please wait for response", .{
-            .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
-        });
-
-        const dim_style: vaxis.Style = .{
-            .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
-        };
-        writeString(&surface, 2, @intCast(size.height -| 1), "[Esc] cancel", dim_style);
-
-        return surface;
-    }
-
     fn drawAskResponse(self: *UI, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
         const size = ctx.max.size();
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
@@ -2098,64 +3061,532 @@ pub const UI = struct {
             .bold = true,
         };
         fillRow(&surface, 0, ' ', header_style);
+        writeString(&surface, 1, 0, " Pi Response", header_style);
 
-        var header_buf: [128]u8 = undefined;
-        const file_info = self.ask_context_file orelse "unknown";
-        const lines_info = if (self.ask_context_lines) |l|
-            if (l.start == l.end)
-                std.fmt.bufPrint(&header_buf, " Pi Response - {s}:{d}", .{ file_info, l.start }) catch " Pi Response"
+        const dim_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
+        };
+        const question_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0xaf, 0x5f, 0xff } }, // Purple for question
+            .bold = true,
+        };
+        const label_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x5f, 0x87, 0xaf } }, // Blue for labels
+            .bold = true,
+        };
+        const separator_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x44, 0x44, 0x44 } },
+        };
+
+        // Use stored original lines count
+        const code_line_count: u16 = @intCast(self.ask_original_diff_lines.items.len);
+
+        // Layout calculation
+        const footer_row: u16 = size.height -| 1;
+        var current_row: u16 = 1;
+
+        // File and line info (use stored original file)
+        if (self.ask_original_file) |file| {
+            var info_buf: [128]u8 = undefined;
+            const info = if (self.ask_context_lines) |l|
+                if (l.start == l.end)
+                    std.fmt.bufPrint(&info_buf, "File: {s}, Line {d}", .{ file, l.start }) catch "File: ?"
+                else
+                    std.fmt.bufPrint(&info_buf, "File: {s}, Lines {d}-{d}", .{ file, l.start, l.end }) catch "File: ?"
             else
-                std.fmt.bufPrint(&header_buf, " Pi Response - {s}:{d}-{d}", .{ file_info, l.start, l.end }) catch " Pi Response"
-        else
-            " Pi Response";
+                std.fmt.bufPrint(&info_buf, "File: {s}", .{file}) catch "File: ?";
+            writeString(&surface, 2, current_row, info, dim_style);
+            current_row += 1;
+        }
 
-        writeString(&surface, 0, 0, lines_info, header_style);
+        // Question section
+        writeString(&surface, 2, current_row, "Question:", label_style);
+        current_row += 1;
+        if (self.ask_original_question) |q| {
+            const max_question_width = size.width -| 4;
+            const display_q = if (q.len > max_question_width) q[0..max_question_width] else q;
+            writeString(&surface, 2, current_row, display_q, question_style);
+            current_row += 1;
+        }
 
-        // Content area
-        const content_height = size.height -| 2;
+        // Separator
+        current_row += 1;
+        var sep_col: u16 = 0;
+        while (sep_col < size.width) : (sep_col += 1) {
+            surface.writeCell(sep_col, current_row, .{
+                .char = .{ .grapheme = "─" },
+                .style = separator_style,
+            });
+        }
+        current_row += 1;
+
+        // Code section label
+        writeString(&surface, 2, current_row, "Selected Code:", label_style);
+        current_row += 1;
+
+        // Calculate space for code and answer
+        const remaining_rows = footer_row -| current_row -| 3; // -3 for separator and answer label
+        const max_code_rows = @min(code_line_count, remaining_rows / 2);
+        const code_section_end = current_row + max_code_rows;
+
+        // Draw the stored diff lines (use stored original lines)
+        if (self.view_mode == .split and size.width >= 80 and self.ask_original_split_rows.items.len > 0) {
+            // Split view for code
+            const panel_width = (size.width -| 1) / 2;
+            const separator_col = panel_width;
+            const left_content_start: u16 = 6;
+            const right_content_start: u16 = separator_col + 7;
+            const left_content_width = separator_col -| left_content_start -| 1;
+            const right_content_width = size.width -| right_content_start;
+
+            var code_row = current_row;
+            for (self.ask_original_split_rows.items) |split_row| {
+                if (code_row >= code_section_end) break;
+
+                // Draw separator
+                surface.writeCell(separator_col, code_row, .{
+                    .char = .{ .grapheme = "│" },
+                    .style = separator_style,
+                });
+
+                // Draw left panel
+                self.drawResponseCodeCell(&surface, code_row, 0, left_content_start, left_content_width, split_row.left, true);
+
+                // Draw right panel
+                self.drawResponseCodeCell(&surface, code_row, separator_col + 1, right_content_start, right_content_width, split_row.right, false);
+
+                code_row += 1;
+            }
+            current_row = code_row;
+        } else {
+            // Unified view for code (use stored original diff lines)
+            var code_row = current_row;
+            for (self.ask_original_diff_lines.items) |diff_line| {
+                if (code_row >= code_section_end) break;
+                self.drawResponseUnifiedLine(&surface, code_row, diff_line, size.width);
+                code_row += 1;
+            }
+            current_row = code_row;
+        }
+
+        // Separator before answer
+        current_row += 1;
+        sep_col = 0;
+        while (sep_col < size.width) : (sep_col += 1) {
+            surface.writeCell(sep_col, current_row, .{
+                .char = .{ .grapheme = "─" },
+                .style = separator_style,
+            });
+        }
+        current_row += 1;
+
+        // Answer section
+        writeString(&surface, 2, current_row, "Answer:", label_style);
+        current_row += 1;
+
         const response = self.ask_response orelse "(No response)";
+        var resp_iter = std.mem.splitScalar(u8, response, '\n');
+        
+        // Skip lines based on scroll offset for answer section
+        var lines_to_skip = self.ask_scroll_offset;
+        while (resp_iter.next()) |line| {
+            if (current_row >= footer_row) break;
 
-        // Split response into lines
-        var lines: std.ArrayList([]const u8) = .empty;
-        defer lines.deinit(ctx.arena);
-
-        var line_iter = std.mem.splitScalar(u8, response, '\n');
-        while (line_iter.next()) |line| {
             // Word wrap long lines
             if (line.len > size.width -| 4) {
                 var start: usize = 0;
                 while (start < line.len) {
+                    if (current_row >= footer_row) break;
                     const end = @min(start + size.width -| 4, line.len);
-                    lines.append(ctx.arena, line[start..end]) catch break;
+                    
+                    if (lines_to_skip > 0) {
+                        lines_to_skip -= 1;
+                    } else {
+                        writeString(&surface, 2, current_row, line[start..end], .{});
+                        current_row += 1;
+                    }
                     start = end;
                 }
             } else {
-                lines.append(ctx.arena, line) catch break;
+                if (lines_to_skip > 0) {
+                    lines_to_skip -= 1;
+                } else {
+                    writeString(&surface, 2, current_row, line, .{});
+                    current_row += 1;
+                }
             }
         }
 
-        // Clamp scroll offset
-        if (lines.items.len > 0 and self.ask_scroll_offset >= lines.items.len) {
-            self.ask_scroll_offset = lines.items.len - 1;
-        }
-
-        // Draw visible lines
-        var row: u16 = 1;
-        var line_idx = self.ask_scroll_offset;
-        while (row < content_height and line_idx < lines.items.len) : ({
-            row += 1;
-            line_idx += 1;
-        }) {
-            writeString(&surface, 2, row, lines.items[line_idx], .{});
-        }
-
         // Footer
+        writeString(&surface, 2, footer_row, "[↑↓/PgUp/PgDn] scroll  [c] add comment  [Esc/q] close", dim_style);
+
+        return surface;
+    }
+
+    fn drawAskResponseComment(self: *UI, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+        const size = ctx.max.size();
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
+
+        // Header
+        const header_style: vaxis.Style = .{
+            .bg = .{ .rgb = .{ 0x00, 0x5f, 0x87 } }, // Blue background
+            .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } },
+            .bold = true,
+        };
+        fillRow(&surface, 0, ' ', header_style);
+        writeString(&surface, 1, 0, " Add Comment", header_style);
+
         const dim_style: vaxis.Style = .{
             .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
         };
-        writeString(&surface, 2, @intCast(size.height -| 1), "[↑↓/PgUp/PgDn] scroll  [Esc/q] close", dim_style);
+        const label_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x5f, 0x87, 0xaf } }, // Blue for labels
+            .bold = true,
+        };
+        const separator_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x44, 0x44, 0x44 } },
+        };
+        const input_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } },
+        };
+
+        var current_row: u16 = 1;
+
+        // File and line info
+        if (self.ask_original_file) |file| {
+            var info_buf: [128]u8 = undefined;
+            const info = if (self.ask_context_lines) |l|
+                if (l.start == l.end)
+                    std.fmt.bufPrint(&info_buf, "File: {s}, Line {d}", .{ file, l.start }) catch "File: ?"
+                else
+                    std.fmt.bufPrint(&info_buf, "File: {s}, Lines {d}-{d}", .{ file, l.start, l.end }) catch "File: ?"
+            else
+                std.fmt.bufPrint(&info_buf, "File: {s}", .{file}) catch "File: ?";
+            writeString(&surface, 2, current_row, info, dim_style);
+            current_row += 1;
+        }
+
+        // Separator
+        current_row += 1;
+        var sep_col: u16 = 0;
+        while (sep_col < size.width) : (sep_col += 1) {
+            surface.writeCell(sep_col, current_row, .{
+                .char = .{ .grapheme = "─" },
+                .style = separator_style,
+            });
+        }
+        current_row += 1;
+
+        // Code section label
+        writeString(&surface, 2, current_row, "Code Context:", label_style);
+        current_row += 1;
+
+        // Show the code (limited)
+        const code_line_count: u16 = @intCast(self.ask_original_diff_lines.items.len);
+        const max_code_rows = @min(code_line_count, 8); // Max 8 lines of code
+        const code_section_end = current_row + max_code_rows;
+
+        if (self.view_mode == .split and size.width >= 80 and self.ask_original_split_rows.items.len > 0) {
+            const panel_width = (size.width -| 1) / 2;
+            const separator_col = panel_width;
+            const left_content_start: u16 = 6;
+            const right_content_start: u16 = separator_col + 7;
+            const left_content_width = separator_col -| left_content_start -| 1;
+            const right_content_width = size.width -| right_content_start;
+
+            var code_row = current_row;
+            for (self.ask_original_split_rows.items) |split_row| {
+                if (code_row >= code_section_end) break;
+
+                surface.writeCell(separator_col, code_row, .{
+                    .char = .{ .grapheme = "│" },
+                    .style = separator_style,
+                });
+
+                self.drawResponseCodeCell(&surface, code_row, 0, left_content_start, left_content_width, split_row.left, true);
+                self.drawResponseCodeCell(&surface, code_row, separator_col + 1, right_content_start, right_content_width, split_row.right, false);
+
+                code_row += 1;
+            }
+            current_row = code_row;
+        } else {
+            var code_row = current_row;
+            for (self.ask_original_diff_lines.items) |diff_line| {
+                if (code_row >= code_section_end) break;
+                self.drawResponseUnifiedLine(&surface, code_row, diff_line, size.width);
+                code_row += 1;
+            }
+            current_row = code_row;
+        }
+
+        // Show "..." if there's more code
+        if (code_line_count > max_code_rows) {
+            writeString(&surface, 2, current_row, "...", dim_style);
+            current_row += 1;
+        }
+
+        // Separator before input
+        current_row += 1;
+        sep_col = 0;
+        while (sep_col < size.width) : (sep_col += 1) {
+            surface.writeCell(sep_col, current_row, .{
+                .char = .{ .grapheme = "─" },
+                .style = separator_style,
+            });
+        }
+        current_row += 1;
+
+        // Comment input section
+        writeString(&surface, 2, current_row, "Comment:", label_style);
+        current_row += 1;
+
+        // Input field with cursor
+        const input_row = current_row;
+        writeString(&surface, 2, input_row, self.input_buffer.slice(), input_style);
+
+        // Draw cursor
+        const cursor_col: u16 = 2 + @as(u16, @intCast(self.input_buffer.slice().len));
+        surface.writeCell(cursor_col, input_row, .{
+            .char = .{ .grapheme = "▌" },
+            .style = .{ .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } } },
+        });
+
+        // Footer
+        const footer_row: u16 = size.height -| 1;
+        writeString(&surface, 2, footer_row, "[Enter] submit  [Esc] cancel", dim_style);
 
         return surface;
+    }
+
+    /// Draw a single cell in the response code section (for split view)
+    /// Note: Does not use syntax highlighting since stored lines may be from a different file
+    fn drawResponseCodeCell(
+        _: *UI,
+        surface: *vxfw.Surface,
+        row: u16,
+        panel_start: u16,
+        content_start: u16,
+        content_width: u16,
+        cell: ?SplitRow.SplitCell,
+        _: bool, // is_left - not used since no syntax highlighting
+    ) void {
+        const dim_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x60, 0x60, 0x60 } } };
+        const deletion_bg: vaxis.Color = .{ .rgb = .{ 0x3d, 0x1a, 0x1a } };
+        const addition_bg: vaxis.Color = .{ .rgb = .{ 0x1a, 0x3d, 0x1a } };
+        const deletion_fg: vaxis.Color = .{ .rgb = .{ 0xff, 0x5f, 0x5f } };
+        const addition_fg: vaxis.Color = .{ .rgb = .{ 0x5f, 0xff, 0x5f } };
+        const context_fg: vaxis.Color = .{ .rgb = .{ 0xa0, 0xa0, 0xa0 } };
+
+        const panel_end = content_start + content_width;
+
+        if (cell) |c| {
+            var line_num_style = dim_style;
+            var content_style: vaxis.Style = .{};
+
+            switch (c.line_type) {
+                .deletion => {
+                    line_num_style.fg = deletion_fg;
+                    content_style.fg = deletion_fg;
+                    content_style.bg = deletion_bg;
+                },
+                .addition => {
+                    line_num_style.fg = addition_fg;
+                    content_style.fg = addition_fg;
+                    content_style.bg = addition_bg;
+                },
+                .context => {
+                    content_style.fg = context_fg;
+                },
+                .modification => {
+                    content_style.fg = .{ .rgb = .{ 0xff, 0xd7, 0x00 } };
+                },
+            }
+
+            // Draw line number
+            var num_buf: [8]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "{d:>4} ", .{c.line_num}) catch "     ";
+            var col = panel_start;
+            for (num_str) |ch| {
+                if (col < content_start) {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = grapheme(ch) },
+                        .style = line_num_style,
+                    });
+                    col += 1;
+                }
+            }
+
+            // Draw content directly without syntax highlighting
+            var content = c.content;
+            while (content.len > 0 and (content[content.len - 1] == '\n' or content[content.len - 1] == '\r')) {
+                content = content[0 .. content.len - 1];
+            }
+
+            // Render content character by character
+            var visual_col: u16 = 0;
+            for (content) |ch| {
+                if (col >= panel_end) break;
+
+                if (ch == '\t') {
+                    const spaces_to_add = TAB_WIDTH - (visual_col % TAB_WIDTH);
+                    var i: u16 = 0;
+                    while (i < spaces_to_add and col < panel_end) : (i += 1) {
+                        surface.writeCell(col, row, .{
+                            .char = .{ .grapheme = " " },
+                            .style = content_style,
+                        });
+                        col += 1;
+                        visual_col += 1;
+                    }
+                } else {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = grapheme(ch) },
+                        .style = content_style,
+                    });
+                    col += 1;
+                    visual_col += 1;
+                }
+            }
+
+            // Fill remaining space
+            while (col < panel_end) : (col += 1) {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = " " },
+                    .style = content_style,
+                });
+            }
+        } else {
+            // Empty cell
+            var col = panel_start;
+            while (col < panel_end) : (col += 1) {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = " " },
+                    .style = dim_style,
+                });
+            }
+        }
+    }
+
+    /// Draw a single line in the response code section (for unified view)
+    /// Note: Does not use syntax highlighting since stored lines may be from a different file
+    fn drawResponseUnifiedLine(_: *UI, surface: *vxfw.Surface, row: u16, diff_line: DiffLine, width: u16) void {
+        const dim_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x60, 0x60, 0x60 } } };
+        const deletion_fg: vaxis.Color = .{ .rgb = .{ 0xd7, 0x00, 0x00 } };
+        const addition_fg: vaxis.Color = .{ .rgb = .{ 0x00, 0xd7, 0x00 } };
+        const deletion_bg: vaxis.Color = .{ .rgb = .{ 0x3d, 0x1a, 0x1a } };
+        const addition_bg: vaxis.Color = .{ .rgb = .{ 0x1a, 0x3d, 0x1a } };
+
+        var style: vaxis.Style = .{};
+        const prefix: u8 = switch (diff_line.line_type) {
+            .addition => blk: {
+                style.fg = addition_fg;
+                style.bg = addition_bg;
+                break :blk '+';
+            },
+            .deletion => blk: {
+                style.fg = deletion_fg;
+                style.bg = deletion_bg;
+                break :blk '-';
+            },
+            .modification => blk: {
+                style.fg = .{ .rgb = .{ 0xff, 0xd7, 0x00 } };
+                break :blk '~';
+            },
+            .context => blk: {
+                style.fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } };
+                break :blk ' ';
+            },
+        };
+
+        var col: u16 = 2; // Start with indent
+
+        // Line numbers
+        var num_buf: [8]u8 = undefined;
+        if (diff_line.old_line_num) |num| {
+            const num_str = std.fmt.bufPrint(&num_buf, "{d:>4}", .{num}) catch "    ";
+            for (num_str) |c| {
+                if (col < width) {
+                    surface.writeCell(col, row, .{ .char = .{ .grapheme = grapheme(c) }, .style = dim_style });
+                    col += 1;
+                }
+            }
+        } else {
+            while (col < 6) : (col += 1) {
+                surface.writeCell(col, row, .{ .char = .{ .grapheme = " " }, .style = dim_style });
+            }
+        }
+
+        if (col < width) {
+            surface.writeCell(col, row, .{ .char = .{ .grapheme = " " }, .style = dim_style });
+            col += 1;
+        }
+
+        if (diff_line.new_line_num) |num| {
+            const num_str = std.fmt.bufPrint(&num_buf, "{d:>4}", .{num}) catch "    ";
+            for (num_str) |c| {
+                if (col < width) {
+                    surface.writeCell(col, row, .{ .char = .{ .grapheme = grapheme(c) }, .style = dim_style });
+                    col += 1;
+                }
+            }
+        } else {
+            while (col < 11) : (col += 1) {
+                surface.writeCell(col, row, .{ .char = .{ .grapheme = " " }, .style = dim_style });
+            }
+        }
+
+        // Prefix
+        if (col < width) {
+            surface.writeCell(col, row, .{ .char = .{ .grapheme = " " }, .style = style });
+            col += 1;
+        }
+        if (col < width) {
+            surface.writeCell(col, row, .{ .char = .{ .grapheme = grapheme(prefix) }, .style = style });
+            col += 1;
+        }
+        if (col < width) {
+            surface.writeCell(col, row, .{ .char = .{ .grapheme = " " }, .style = style });
+            col += 1;
+        }
+
+        // Content - render directly without syntax highlighting
+        var content = diff_line.content;
+        while (content.len > 0 and (content[content.len - 1] == '\n' or content[content.len - 1] == '\r')) {
+            content = content[0 .. content.len - 1];
+        }
+
+        var visual_col: u16 = 0;
+        for (content) |ch| {
+            if (col >= width) break;
+
+            if (ch == '\t') {
+                const spaces_to_add = TAB_WIDTH - (visual_col % TAB_WIDTH);
+                var i: u16 = 0;
+                while (i < spaces_to_add and col < width) : (i += 1) {
+                    surface.writeCell(col, row, .{
+                        .char = .{ .grapheme = " " },
+                        .style = style,
+                    });
+                    col += 1;
+                    visual_col += 1;
+                }
+            } else {
+                surface.writeCell(col, row, .{
+                    .char = .{ .grapheme = grapheme(ch) },
+                    .style = style,
+                });
+                col += 1;
+                visual_col += 1;
+            }
+        }
+
+        // Fill remaining space with background
+        while (col < width) : (col += 1) {
+            surface.writeCell(col, row, .{
+                .char = .{ .grapheme = " " },
+                .style = style,
+            });
+        }
     }
 
     /// Run the UI with vxfw
@@ -4415,4 +5846,133 @@ test "line numbers: modification preserves line mapping" {
         }
     }
     try std.testing.expect(found_modification);
+}
+
+
+test "split view: deleted file shows content on left side" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .removed,
+        .chunks = &.{},
+        .allocator = allocator,
+    };
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, "line 1\nline 2"),
+        .new_content = try allocator.dupe(u8, ""),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Verify split rows are built correctly
+    try std.testing.expectEqual(@as(usize, 2), ui.split_rows.items.len);
+
+    // Row 1: deletion on left, empty on right
+    try std.testing.expect(ui.split_rows.items[0].left != null);
+    try std.testing.expect(ui.split_rows.items[0].right == null);
+    try std.testing.expectEqual(@as(u32, 1), ui.split_rows.items[0].left.?.line_num);
+    try std.testing.expectEqualStrings("line 1", ui.split_rows.items[0].left.?.content);
+    try std.testing.expectEqual(DiffLine.LineType.deletion, ui.split_rows.items[0].left.?.line_type);
+
+    // Row 2: deletion on left, empty on right
+    try std.testing.expect(ui.split_rows.items[1].left != null);
+    try std.testing.expect(ui.split_rows.items[1].right == null);
+    try std.testing.expectEqual(@as(u32, 2), ui.split_rows.items[1].left.?.line_num);
+    try std.testing.expectEqualStrings("line 2", ui.split_rows.items[1].left.?.content);
+}
+
+test "split view: added file shows content on right side" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "new.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .added,
+        .chunks = &.{},
+        .allocator = allocator,
+    };
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "new.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, ""),
+        .new_content = try allocator.dupe(u8, "fn main() {}\nreturn;"),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Verify split rows are built correctly
+    try std.testing.expectEqual(@as(usize, 2), ui.split_rows.items.len);
+
+    // Row 1: empty on left, addition on right
+    try std.testing.expect(ui.split_rows.items[0].left == null);
+    try std.testing.expect(ui.split_rows.items[0].right != null);
+    try std.testing.expectEqual(@as(u32, 1), ui.split_rows.items[0].right.?.line_num);
+    try std.testing.expectEqualStrings("fn main() {}", ui.split_rows.items[0].right.?.content);
+    try std.testing.expectEqual(DiffLine.LineType.addition, ui.split_rows.items[0].right.?.line_type);
+
+    // Row 2: empty on left, addition on right
+    try std.testing.expect(ui.split_rows.items[1].left == null);
+    try std.testing.expect(ui.split_rows.items[1].right != null);
+    try std.testing.expectEqual(@as(u32, 2), ui.split_rows.items[1].right.?.line_num);
+}
+
+test "split view: unchanged file shows same content on both sides" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "same.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .unchanged,
+        .chunks = &.{},
+        .allocator = allocator,
+    };
+
+    const content = "const x = 1;\nconst y = 2;";
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "same.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, content),
+        .new_content = try allocator.dupe(u8, content),
+    });
+
+    var ui = UI.init(allocator, &session);
+    defer ui.deinit();
+
+    try ui.buildDiffLines();
+
+    // Verify split rows show same content on both sides
+    try std.testing.expectEqual(@as(usize, 2), ui.split_rows.items.len);
+
+    // Both rows should have content on both sides
+    for (ui.split_rows.items) |row| {
+        try std.testing.expect(row.left != null);
+        try std.testing.expect(row.right != null);
+        try std.testing.expectEqual(row.left.?.line_num, row.right.?.line_num);
+        try std.testing.expectEqual(DiffLine.LineType.context, row.left.?.line_type);
+        try std.testing.expectEqual(DiffLine.LineType.context, row.right.?.line_type);
+    }
 }

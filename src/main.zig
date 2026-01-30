@@ -64,10 +64,15 @@ fn printUsage(writer: anytype) !void {
         \\  rv -c HEAD~1     Review changes from the last commit
         \\
         \\Controls:
-        \\  j/k              Navigate lines
-        \\  n/p              Next/previous file
-        \\  c                Add comment at cursor
-        \\  Space            Start/end line selection
+        \\  ↑/↓              Navigate lines
+        \\  Shift+↑/↓        Select lines
+        \\  ←/→              Previous/next file
+        \\  c                Add comment at cursor/selection
+        \\  a                Ask Pi about selected code
+        \\  v                Toggle split/unified view
+        \\  Tab              Toggle focus side (old/new)
+        \\  l                Show file list
+        \\  Esc              Clear selection
         \\  q                Quit and export markdown to stdout
         \\  ?                Show help
         \\

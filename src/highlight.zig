@@ -168,16 +168,28 @@ fn getTreeSitterLanguage(lang: Language) !*const treez.Language {
     };
 }
 
-/// Infer highlight type from node type name
+/// Infer highlight type from tree-sitter node type name.
+/// Tree-sitter grammars use semantic parent nodes (like `builtin_type`, `string`)
+/// that cover their children, so we match those container nodes rather than
+/// enumerating every possible child (e.g., we match `builtin_type` not `void`).
+/// Keywords are the exception - tree-sitter uses the keyword text as the node type.
 fn inferHighlight(node_type: []const u8) HighlightType {
-    // Comments
+    // Comments - any node containing "comment"
     if (std.mem.indexOf(u8, node_type, "comment") != null) return .comment;
 
-    // Strings
-    if (std.mem.indexOf(u8, node_type, "string") != null) return .string;
-    if (std.mem.eql(u8, node_type, "character") or std.mem.eql(u8, node_type, "char_literal")) return .string;
+    // Strings - container nodes (covers quotes and content)
+    if (std.mem.eql(u8, node_type, "string") or
+        std.mem.eql(u8, node_type, "string_literal") or
+        std.mem.eql(u8, node_type, "interpreted_string_literal") or
+        std.mem.eql(u8, node_type, "raw_string_literal") or
+        std.mem.eql(u8, node_type, "character") or
+        std.mem.eql(u8, node_type, "char_literal") or
+        std.mem.eql(u8, node_type, "rune_literal"))
+    {
+        return .string;
+    }
 
-    // Numbers
+    // Numbers - container nodes
     if (std.mem.eql(u8, node_type, "integer") or
         std.mem.eql(u8, node_type, "float") or
         std.mem.eql(u8, node_type, "number") or
@@ -187,7 +199,7 @@ fn inferHighlight(node_type: []const u8) HighlightType {
         return .number;
     }
 
-    // Built-in types
+    // Types - container nodes that wrap specific type names
     if (std.mem.eql(u8, node_type, "builtin_type") or
         std.mem.eql(u8, node_type, "primitive_type") or
         std.mem.eql(u8, node_type, "type_identifier"))
@@ -195,65 +207,150 @@ fn inferHighlight(node_type: []const u8) HighlightType {
         return .type_;
     }
 
-    // Common type keywords
-    if (std.mem.eql(u8, node_type, "void") or
-        std.mem.eql(u8, node_type, "bool") or
-        std.mem.eql(u8, node_type, "type") or
-        std.mem.eql(u8, node_type, "anytype") or
-        std.mem.eql(u8, node_type, "noreturn"))
-    {
-        return .type_;
+    // Builtin function calls (like @import, @intCast)
+    if (std.mem.eql(u8, node_type, "builtin_identifier")) {
+        return .function;
     }
 
-    // Functions
-    if (std.mem.indexOf(u8, node_type, "function") != null) return .function;
-    if (std.mem.eql(u8, node_type, "call_expression")) return .function;
-    if (std.mem.eql(u8, node_type, "builtin_identifier")) return .function;
-
-    // Keywords - common across languages
+    // Keywords - tree-sitter uses the keyword text as the node type
+    // These are common across many languages
     if (std.mem.eql(u8, node_type, "const") or
         std.mem.eql(u8, node_type, "var") or
         std.mem.eql(u8, node_type, "let") or
         std.mem.eql(u8, node_type, "fn") or
+        std.mem.eql(u8, node_type, "func") or
+        std.mem.eql(u8, node_type, "def") or
         std.mem.eql(u8, node_type, "pub") or
         std.mem.eql(u8, node_type, "return") or
         std.mem.eql(u8, node_type, "if") or
         std.mem.eql(u8, node_type, "else") or
         std.mem.eql(u8, node_type, "for") or
         std.mem.eql(u8, node_type, "while") or
+        std.mem.eql(u8, node_type, "loop") or
+        std.mem.eql(u8, node_type, "do") or
         std.mem.eql(u8, node_type, "break") or
         std.mem.eql(u8, node_type, "continue") or
         std.mem.eql(u8, node_type, "switch") or
+        std.mem.eql(u8, node_type, "match") or
+        std.mem.eql(u8, node_type, "case") or
+        std.mem.eql(u8, node_type, "default") or
         std.mem.eql(u8, node_type, "defer") or
-        std.mem.eql(u8, node_type, "errdefer") or
         std.mem.eql(u8, node_type, "try") or
         std.mem.eql(u8, node_type, "catch") or
+        std.mem.eql(u8, node_type, "throw") or
+        std.mem.eql(u8, node_type, "finally") or
         std.mem.eql(u8, node_type, "struct") or
         std.mem.eql(u8, node_type, "enum") or
         std.mem.eql(u8, node_type, "union") or
+        std.mem.eql(u8, node_type, "class") or
+        std.mem.eql(u8, node_type, "interface") or
+        std.mem.eql(u8, node_type, "trait") or
+        std.mem.eql(u8, node_type, "impl") or
         std.mem.eql(u8, node_type, "async") or
         std.mem.eql(u8, node_type, "await") or
-        std.mem.eql(u8, node_type, "comptime") or
-        std.mem.eql(u8, node_type, "inline") or
-        std.mem.eql(u8, node_type, "extern") or
-        std.mem.eql(u8, node_type, "export") or
         std.mem.eql(u8, node_type, "import") or
-        std.mem.eql(u8, node_type, "class") or
-        std.mem.eql(u8, node_type, "def") or
-        std.mem.eql(u8, node_type, "func"))
+        std.mem.eql(u8, node_type, "export") or
+        std.mem.eql(u8, node_type, "from") or
+        std.mem.eql(u8, node_type, "use") or
+        std.mem.eql(u8, node_type, "mod") or
+        std.mem.eql(u8, node_type, "package") or
+        std.mem.eql(u8, node_type, "static") or
+        std.mem.eql(u8, node_type, "extern") or
+        std.mem.eql(u8, node_type, "inline") or
+        std.mem.eql(u8, node_type, "public") or
+        std.mem.eql(u8, node_type, "private") or
+        std.mem.eql(u8, node_type, "protected") or
+        std.mem.eql(u8, node_type, "new") or
+        std.mem.eql(u8, node_type, "this") or
+        std.mem.eql(u8, node_type, "self") or
+        std.mem.eql(u8, node_type, "super") or
+        std.mem.eql(u8, node_type, "as") or
+        std.mem.eql(u8, node_type, "in") or
+        std.mem.eql(u8, node_type, "is") or
+        std.mem.eql(u8, node_type, "not") or
+        std.mem.eql(u8, node_type, "and") or
+        std.mem.eql(u8, node_type, "or") or
+        std.mem.eql(u8, node_type, "typeof") or
+        std.mem.eql(u8, node_type, "sizeof") or
+        std.mem.eql(u8, node_type, "yield") or
+        std.mem.eql(u8, node_type, "with") or
+        std.mem.eql(u8, node_type, "lambda") or
+        std.mem.eql(u8, node_type, "goto") or
+        std.mem.eql(u8, node_type, "select") or
+        std.mem.eql(u8, node_type, "chan") or
+        std.mem.eql(u8, node_type, "go") or
+        std.mem.eql(u8, node_type, "range") or
+        std.mem.eql(u8, node_type, "mut") or
+        std.mem.eql(u8, node_type, "ref") or
+        std.mem.eql(u8, node_type, "move") or
+        std.mem.eql(u8, node_type, "unsafe") or
+        std.mem.eql(u8, node_type, "where") or
+        std.mem.eql(u8, node_type, "dyn") or
+        std.mem.eql(u8, node_type, "crate") or
+        // Zig-specific keywords (node type = keyword text)
+        std.mem.eql(u8, node_type, "comptime") or
+        std.mem.eql(u8, node_type, "errdefer") or
+        std.mem.eql(u8, node_type, "orelse") or
+        std.mem.eql(u8, node_type, "test") or
+        std.mem.eql(u8, node_type, "error") or
+        std.mem.eql(u8, node_type, "suspend") or
+        std.mem.eql(u8, node_type, "resume") or
+        std.mem.eql(u8, node_type, "nosuspend") or
+        std.mem.eql(u8, node_type, "threadlocal") or
+        std.mem.eql(u8, node_type, "usingnamespace") or
+        std.mem.eql(u8, node_type, "asm") or
+        std.mem.eql(u8, node_type, "volatile") or
+        std.mem.eql(u8, node_type, "allowzero") or
+        std.mem.eql(u8, node_type, "packed") or
+        std.mem.eql(u8, node_type, "align") or
+        std.mem.eql(u8, node_type, "linksection") or
+        std.mem.eql(u8, node_type, "callconv") or
+        std.mem.eql(u8, node_type, "noinline"))
     {
         return .keyword;
     }
 
-    // Constants
+    // Constants / boolean literals
     if (std.mem.eql(u8, node_type, "true") or
         std.mem.eql(u8, node_type, "false") or
         std.mem.eql(u8, node_type, "null") or
-        std.mem.eql(u8, node_type, "undefined") or
         std.mem.eql(u8, node_type, "nil") or
-        std.mem.eql(u8, node_type, "none"))
+        std.mem.eql(u8, node_type, "none") or
+        std.mem.eql(u8, node_type, "None") or
+        std.mem.eql(u8, node_type, "True") or
+        std.mem.eql(u8, node_type, "False") or
+        std.mem.eql(u8, node_type, "undefined") or
+        std.mem.eql(u8, node_type, "unreachable") or
+        std.mem.eql(u8, node_type, "null_literal") or
+        std.mem.eql(u8, node_type, "boolean"))
     {
         return .constant;
+    }
+
+    // Operators (single and compound)
+    if (node_type.len <= 3 and node_type.len >= 1) {
+        const c = node_type[0];
+        if (c == '+' or c == '-' or c == '*' or c == '/' or c == '%' or
+            c == '=' or c == '!' or c == '<' or c == '>' or c == '&' or
+            c == '|' or c == '^' or c == '~' or c == '?' or c == '.')
+        {
+            return .operator;
+        }
+        if (node_type.len == 2 and (std.mem.eql(u8, node_type, "::") or
+            std.mem.eql(u8, node_type, "..")))
+        {
+            return .operator;
+        }
+    }
+
+    // Punctuation
+    if (node_type.len == 1) {
+        const c = node_type[0];
+        if (c == '(' or c == ')' or c == '[' or c == ']' or c == '{' or
+            c == '}' or c == ',' or c == ';' or c == ':' or c == '@' or c == '#')
+        {
+            return .punctuation;
+        }
     }
 
     return .none;
@@ -302,4 +399,32 @@ test "Highlighter finds keywords and types" {
     }
     try std.testing.expect(found_keyword);
     try std.testing.expect(found_type);
+}
+
+test "Highlighter finds strings numbers and operators" {
+    const allocator = std.testing.allocator;
+
+    var highlighter = try Highlighter.init(allocator, .zig);
+    defer highlighter.deinit();
+
+    const source =
+        \\const msg = "hello";
+        \\var x = 42;
+        \\if (x > 10) {}
+    ;
+
+    const spans = try highlighter.highlight(source);
+    defer allocator.free(spans);
+
+    var found_string = false;
+    var found_number = false;
+    var found_operator = false;
+    for (spans) |span| {
+        if (span.highlight == .string) found_string = true;
+        if (span.highlight == .number) found_number = true;
+        if (span.highlight == .operator) found_operator = true;
+    }
+    try std.testing.expect(found_string);
+    try std.testing.expect(found_number);
+    try std.testing.expect(found_operator);
 }

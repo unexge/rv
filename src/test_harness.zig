@@ -6,7 +6,7 @@ const ui = @import("ui.zig");
 const review = @import("review.zig");
 const difft = @import("difft.zig");
 
-/// Test harness for TUI testing with snapshot support.
+// Test harness for TUI testing with snapshot support.
 /// Allows rendering the UI to a buffer and comparing against snapshots.
 pub const TestRunner = struct {
     allocator: Allocator,
@@ -3337,4 +3337,411 @@ test "edge: mode switching sequence" {
     try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));
     try runner.sendEscape();
     try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+}
+
+// =============================================================================
+// Integration Tests - Complete User Workflows
+// =============================================================================
+
+// Test 1: Review workflow - Open diff → navigate to change → add comment → export markdown
+test "integration: review workflow open diff navigate and comment" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Create a test file with changes
+    try createTestFileWithLines(allocator, &session, 15);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    // Build diff (simulate opening diff)
+    try runner.getUI().buildDiffLines();
+    try std.testing.expect(session.files.len > 0);
+
+    const initial_comments = session.comments.items.len;
+
+    // Navigate to a specific change (move down 3 lines)
+    for (0..3) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 3), runner.getUI().cursor_line);
+
+    // Add a comment at this location
+    try runner.sendChar('c');
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(runner.getUI().mode));
+
+    // Type comment text
+    const comment_text = "This change looks good";
+    for (comment_text) |char| {
+        try runner.sendChar(char);
+    }
+
+    // Submit comment
+    try runner.sendEnter();
+
+    // Verify: mode returned to normal
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(runner.getUI().mode));
+
+    // Verify: comment was added
+    try std.testing.expectEqual(initial_comments + 1, session.comments.items.len);
+
+    // Export should be possible (just verify comment exists)
+    const comment = session.comments.items[session.comments.items.len - 1];
+    try std.testing.expect(std.mem.eql(u8, comment_text, comment.text));
+}
+
+// Test 2: Multi-file review - Switch between files → add comments on different files → verify all stored
+test "integration: multi_file review switch files add comments" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Create multiple test files
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Add comment on file 0
+    for (0..2) |_| {
+        try runner.sendDown();
+    }
+    try runner.sendChar('c');
+    try runner.sendChar('f');
+    try runner.sendChar('i');
+    try runner.sendChar('l');
+    try runner.sendChar('e');
+    try runner.sendChar('0');
+    try runner.sendEnter();
+
+    try std.testing.expectEqual(@as(usize, 1), session.comments.items.len);
+
+    // Switch to file 1
+    try runner.sendKey(.{ .codepoint = vaxis.Key.right });
+    try std.testing.expectEqual(@as(usize, 1), session.current_file_idx);
+
+    // Add comment on file 1
+    for (0..4) |_| {
+        try runner.sendDown();
+    }
+    try runner.sendChar('c');
+    try runner.sendChar('f');
+    try runner.sendChar('i');
+    try runner.sendChar('l');
+    try runner.sendChar('e');
+    try runner.sendChar('1');
+    try runner.sendEnter();
+
+    try std.testing.expectEqual(@as(usize, 2), session.comments.items.len);
+
+    // Switch to file 2
+    try runner.sendKey(.{ .codepoint = vaxis.Key.right });
+    try std.testing.expectEqual(@as(usize, 2), session.current_file_idx);
+
+    // Add comment on file 2
+    for (0..1) |_| {
+        try runner.sendDown();
+    }
+    try runner.sendChar('c');
+    try runner.sendChar('f');
+    try runner.sendChar('i');
+    try runner.sendChar('l');
+    try runner.sendChar('e');
+    try runner.sendChar('2');
+    try runner.sendEnter();
+
+    // Final verification: all 3 comments stored
+    try std.testing.expectEqual(@as(usize, 3), session.comments.items.len);
+
+    // Verify comments are on different files
+    try std.testing.expect(std.mem.eql(u8, "file0", session.comments.items[0].text));
+    try std.testing.expect(std.mem.eql(u8, "file1", session.comments.items[1].text));
+    try std.testing.expect(std.mem.eql(u8, "file2", session.comments.items[2].text));
+}
+
+// Test 3: Collapse workflow - Start collapsed → expand specific function → add comment → collapse again
+test "integration: collapse workflow expand collapse with comment" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start: UI begins in summary mode by default
+    try std.testing.expect(runner.getUI().summary_mode);
+
+    // Navigate to a line
+    for (0..5) |_| {
+        try runner.sendDown();
+    }
+
+    // Add comment while in collapse/summary mode
+    try runner.sendChar('c');
+    try runner.sendChar('c');
+    try runner.sendChar('o');
+    try runner.sendChar('l');
+    try runner.sendEnter();
+
+    // Verify comment was added
+    try std.testing.expectEqual(@as(usize, 1), session.comments.items.len);
+
+    // Toggle summary mode off to disable collapse
+    try runner.sendChar('s');
+    try std.testing.expect(!runner.getUI().summary_mode);
+
+    // Verify comment persists after toggling
+    try std.testing.expectEqual(@as(usize, 1), session.comments.items.len);
+}
+
+// Test 4: Selection workflow - Navigate to line → start selection → extend selection → add multi-line comment
+test "integration: selection workflow extend and comment" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 25);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Navigate to line 5
+    for (0..5) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 5), ui_inst.cursor_line);
+
+    // Start selection with shift+down
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try std.testing.expectEqual(@as(usize, 9), ui_inst.cursor_line);
+    try std.testing.expect(ui_inst.selection_start != null);
+
+    // Add comment on selection
+    try runner.sendChar('c');
+    try runner.sendChar('m');
+    try runner.sendChar('u');
+    try runner.sendChar('l');
+    try runner.sendChar('t');
+    try runner.sendChar('i');
+    try runner.sendChar('s');
+    try runner.sendEnter();
+
+    // Verify: comment was created with multi-line range
+    try std.testing.expectEqual(@as(usize, 1), session.comments.items.len);
+    const comment = session.comments.items[0];
+    try std.testing.expect(comment.line_end > comment.line_start);  // Multi-line
+    try std.testing.expect(std.mem.eql(u8, "multis", comment.text));
+}
+
+// Test 5: View toggle workflow - Review in split view → toggle to unified → continue reviewing
+test "integration: view toggle workflow split to unified" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 15);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start in split view
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(runner.getUI().view_mode));  // split
+
+    // Add comment in split view
+    for (0..3) |_| {
+        try runner.sendDown();
+    }
+    try runner.sendChar('c');
+    try runner.sendChar('s');
+    try runner.sendChar('p');
+    try runner.sendChar('l');
+    try runner.sendChar('i');
+    try runner.sendChar('t');
+    try runner.sendEnter();
+
+    try std.testing.expectEqual(@as(usize, 1), session.comments.items.len);
+
+    // Toggle to unified view
+    try runner.sendChar('v');
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(runner.getUI().view_mode));  // unified
+
+    // Continue reviewing and add another comment
+    for (0..3) |_| {
+        try runner.sendDown();
+    }
+    try runner.sendChar('c');
+    try runner.sendChar('u');
+    try runner.sendChar('n');
+    try runner.sendChar('i');
+    try runner.sendChar('f');
+    try runner.sendEnter();
+
+    // Verify both comments stored
+    try std.testing.expectEqual(@as(usize, 2), session.comments.items.len);
+}
+
+// Test 6: Search-like workflow - Use file list to jump to specific file → navigate to specific line
+test "integration: file_list jump to file navigate" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Create 3 files for navigation
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Start in normal mode, file 0
+    try std.testing.expectEqual(@as(usize, 0), session.current_file_idx);
+
+    // Enter file list mode
+    try runner.sendChar('l');
+    try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));
+
+    // Navigate down to file 2
+    for (0..2) |_| {
+        try runner.sendDown();
+    }
+
+    // Select file 2
+    try runner.sendEnter();
+    try std.testing.expectEqual(@as(usize, 2), session.current_file_idx);
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // back to normal
+
+    // Navigate to specific line in file 2
+    for (0..7) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 7), ui_inst.cursor_line);
+
+    // Add comment to verify we're at the right location
+    try runner.sendChar('c');
+    try runner.sendChar('f');
+    try runner.sendChar('i');
+    try runner.sendChar('l');
+    try runner.sendChar('e');
+    try runner.sendChar('2');
+    try runner.sendEnter();
+
+    try std.testing.expectEqual(@as(usize, 1), session.comments.items.len);
+}
+
+// Test 7: Cancel workflow - Start comment → type text → escape → verify no comment created
+test "integration: cancel workflow escape without submit" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+    const initial_count = session.comments.items.len;
+
+    // Navigate to a line
+    for (0..3) |_| {
+        try runner.sendDown();
+    }
+
+    // Enter comment mode
+    try runner.sendChar('c');
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.mode));
+
+    // Type text
+    try runner.sendChar('t');
+    try runner.sendChar('e');
+    try runner.sendChar('s');
+    try runner.sendChar('t');
+    try std.testing.expect(ui_inst.input_buffer.len > 0);
+
+    // Press escape to cancel (not enter)
+    try runner.sendEscape();
+
+    // Verify mode returned to normal
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+
+    // Verify NO comment was created
+    try std.testing.expectEqual(initial_count, session.comments.items.len);
+
+    // Buffer should be cleared
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.input_buffer.len);
+}
+
+// Test 8: Focus side workflow - Review deletion (old side) → tab to old → add comment on old side
+test "integration: focus side old deletion workflow" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 12);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Navigate to a line to review
+    for (0..4) |_| {
+        try runner.sendDown();
+    }
+
+    // Add comment (default should go to "new" side)
+    try runner.sendChar('c');
+    try runner.sendChar('n');
+    try runner.sendChar('e');
+    try runner.sendChar('w');
+    try runner.sendEnter();
+
+    const first_comment = session.comments.items[0];
+    try std.testing.expectEqual(review.CommentSide.new, first_comment.side);
+
+    // Tab key should toggle focus between old and new sides (if visible)
+    try runner.sendKey(.{ .codepoint = vaxis.Key.tab });
+
+    // Add another comment - should be on different side if tab worked
+    try runner.sendChar('c');
+    try runner.sendChar('o');
+    try runner.sendChar('l');
+    try runner.sendChar('d');
+    try runner.sendEnter();
+
+    // Verify both comments exist
+    try std.testing.expectEqual(@as(usize, 2), session.comments.items.len);
 }

@@ -53,3 +53,6 @@ zig build test
 - `src/review.zig` - Review state, comments, markdown export
 - `src/ui.zig` - TUI implementation
 - `src/root.zig` - Public library exports
+
+## Task Management
+Use `/dex` to break down complex work, track progress across sessions, and coordinate multi-step implementations.

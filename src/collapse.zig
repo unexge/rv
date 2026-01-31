@@ -119,7 +119,7 @@ pub const CollapseDetector = struct {
         if (cursor.gotoFirstChild()) {
             while (true) {
                 const node = cursor.getCurrentNode();
-                
+
                 // Try to extract a region from this node
                 if (self.tryExtractRegion(node, source, 1)) |region| {
                     try regions.append(self.allocator, region);
@@ -151,7 +151,7 @@ pub const CollapseDetector = struct {
         if (level > MAX_LEVEL) return;
 
         const parent_type = parent_node.getType();
-        
+
         // For Zig: if parent is a variable_declaration containing a struct/enum/union,
         // we need to look inside that container for nested items, not treat the container itself as nested
         if (self.language == .zig and std.mem.eql(u8, parent_type, "variable_declaration")) {
@@ -164,7 +164,7 @@ pub const CollapseDetector = struct {
                 const child = parent_node.getChild(@intCast(i));
                 if (child.isNull()) continue;
                 const child_type = child.getType();
-                
+
                 for (container_types) |ct| {
                     if (std.mem.eql(u8, child_type, ct)) {
                         // Look inside the container for nested items
@@ -235,7 +235,7 @@ pub const CollapseDetector = struct {
                         }
                     }
                 }
-                
+
                 // Also check direct children for other constructs
                 if (self.tryExtractRegion(child, source, level)) |region| {
                     try regions.append(self.allocator, region);
@@ -250,10 +250,10 @@ pub const CollapseDetector = struct {
     /// Try to extract a collapsible region from a node
     fn tryExtractRegion(self: *CollapseDetector, node: treez.Node, source: []const u8, level: u8) ?CollapsibleRegion {
         const node_type = node.getType();
-        
+
         // First, try direct classification
         var construct_type = self.classifyNode(node_type);
-        
+
         // For Zig: check if this is a variable declaration containing a struct/enum/union
         // Pattern: `pub const NAME = struct { ... }` or `const NAME = enum { ... }`
         if (construct_type == null and self.language == .zig) {
@@ -261,7 +261,7 @@ pub const CollapseDetector = struct {
                 construct_type = .struct_; // Could be struct, enum, or union
             }
         }
-        
+
         if (construct_type == null) return null;
 
         const start_point = node.getStartPoint();
@@ -290,18 +290,18 @@ pub const CollapseDetector = struct {
             .level = level,
         };
     }
-    
+
     /// Check if a Zig node is a variable declaration containing a struct/enum/union
     /// Handles patterns like: `pub const NAME = struct { ... }`
     fn isZigContainerVarDecl(self: *CollapseDetector, node: treez.Node) bool {
         _ = self;
         const node_type = node.getType();
-        
+
         // Check if this is a variable declaration type
         if (!std.mem.eql(u8, node_type, "variable_declaration")) {
             return false;
         }
-        
+
         // Look for a container (struct/enum/union) in the direct children
         const container_types = [_][]const u8{
             "struct_declaration",
@@ -311,12 +311,12 @@ pub const CollapseDetector = struct {
             "ContainerDecl",
             "container_decl",
         };
-        
+
         const child_count = node.getChildCount();
         for (0..child_count) |i| {
             const child = node.getChild(@intCast(i));
             if (child.isNull()) continue;
-            
+
             const child_type = child.getType();
             for (container_types) |ct| {
                 if (std.mem.eql(u8, child_type, ct)) {
@@ -324,7 +324,7 @@ pub const CollapseDetector = struct {
                 }
             }
         }
-        
+
         return false;
     }
 
@@ -579,7 +579,7 @@ pub fn isLineHidden(regions: []const CollapsibleRegion, line: u32) bool {
                     break;
                 }
             }
-            
+
             // If this line is a nested region's header, check if the parent is collapsed
             if (is_nested_header) {
                 // The nested header is visible only if its parent isn't collapsed
@@ -587,7 +587,7 @@ pub fn isLineHidden(regions: []const CollapsibleRegion, line: u32) bool {
                 // the parent IS collapsed, so nested header is hidden too
                 return true;
             }
-            
+
             return true;
         }
     }
@@ -893,7 +893,7 @@ test "CollapseDetector finds pub const NAME = struct pattern" {
     // We should find at least some collapsible regions
     // The exact count depends on tree-sitter grammar parsing
     // Main goal: verify the pub const X = struct pattern is detected
-    
+
     // We expect to find: MyEnum, MyStruct, init method, PrivateUnion
     try std.testing.expect(regions.len >= 3);
 }

@@ -11,13 +11,13 @@ const highlight = @import("highlight.zig");
 // Timing instrumentation - enable with RV_TIMING=1 environment variable
 const Timing = struct {
     const max_entries = 32;
-    
+
     labels: [max_entries][]const u8 = undefined,
     durations_ns: [max_entries]u64 = undefined,
     count: usize = 0,
     last_instant: ?std.time.Instant,
     enabled: bool,
-    
+
     pub fn init(environ_map: *std.process.Environ.Map) Timing {
         const enabled = environ_map.get("RV_TIMING") != null;
         const instant = if (enabled) std.time.Instant.now() catch null else null;
@@ -26,11 +26,11 @@ const Timing = struct {
             .enabled = enabled,
         };
     }
-    
+
     pub fn record(self: *Timing, label: []const u8) void {
         if (!self.enabled) return;
         if (self.count >= max_entries) return;
-        
+
         const now = std.time.Instant.now() catch return;
         if (self.last_instant) |last| {
             self.labels[self.count] = label;
@@ -39,10 +39,10 @@ const Timing = struct {
         }
         self.last_instant = now;
     }
-    
+
     pub fn print(self: *const Timing, writer: anytype) !void {
         if (!self.enabled or self.count == 0) return;
-        
+
         try writer.writeAll("\n--- rv Startup Timings ---\n");
         var total_ns: u64 = 0;
         var absolute_ns: u64 = 0;
@@ -50,8 +50,8 @@ const Timing = struct {
             absolute_ns += self.durations_ns[i];
             const ms = self.durations_ns[i] / std.time.ns_per_ms;
             const abs_ms = absolute_ns / std.time.ns_per_ms;
-            try writer.print("  {s}: {d}ms (@ {d}ms)\n", .{ 
-                self.labels[i], 
+            try writer.print("  {s}: {d}ms (@ {d}ms)\n", .{
+                self.labels[i],
                 ms,
                 abs_ms,
             });
@@ -142,7 +142,7 @@ fn printUsage(writer: anytype) !void {
 pub fn main(init: std.process.Init) !void {
     timing = Timing.init(init.environ_map);
     timing.record("init");
-    
+
     const allocator: Allocator = init.arena.allocator();
     const io = init.io;
 
@@ -173,7 +173,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const difft_installed = try difft.checkInstalled(allocator, io);
+    const difft_bin = init.environ_map.get("RV_DIFFT_BIN");
+    const difft_installed = try difft.checkInstalled(allocator, io, difft_bin);
     timing.record("difft.checkInstalled");
     if (!difft_installed) {
         try stderr.writeAll(
@@ -329,7 +330,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Set the project path for ask context
     tui.setProjectPath(repo_root);
-    
+
     // Set pi binary path from environment (cached at startup)
     tui.setPiBin(init.environ_map.get("RV_PI_BIN"));
 

@@ -910,7 +910,6 @@ test "cursor: arrow keys move cursor down/up" {
     try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
 }
 
-
 test "cursor: stays within upper bound (can't go below 0)" {
     const allocator = std.testing.allocator;
 

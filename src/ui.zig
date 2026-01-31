@@ -1032,7 +1032,7 @@ pub const UI = struct {
                 // Update spinner while ask is in progress (non-blocking)
                 if (self.ask_in_progress) {
                     self.spinner_frame +%= 1;
-                    
+
                     // Check if request completed
                     if (self.ask_thread_done.load(.acquire)) {
                         try self.handleAskComplete();
@@ -1291,16 +1291,16 @@ pub const UI = struct {
                     self.allocator.free(old);
                 }
                 self.ask_original_question = self.allocator.dupe(u8, self.input_buffer.slice()) catch null;
-                
+
                 // Start the ask request (non-blocking)
                 self.spinner_frame = 0;
                 try self.startAskRequest();
-                
+
                 // Return to normal mode - user can continue navigating
                 self.mode = .normal;
                 self.input_buffer.clear();
                 self.setMessage("Asking Pi...", false);
-                
+
                 // Start the spinner tick
                 try ctx.tick(1, self.widget());
             }
@@ -1871,7 +1871,7 @@ pub const UI = struct {
         if (!self.isRowVisible(self.cursor_line)) {
             // Find the nearest visible line (prefer going up to the header)
             var found = false;
-            
+
             // First try going up (to find the header of the collapsed region)
             var up_idx = self.cursor_line;
             while (up_idx > 0) {
@@ -1882,7 +1882,7 @@ pub const UI = struct {
                     break;
                 }
             }
-            
+
             // If not found going up, try going down
             if (!found) {
                 const row_count = self.getRowCount();
@@ -1896,13 +1896,13 @@ pub const UI = struct {
                     }
                 }
             }
-            
+
             // If still not found, go to top
             if (!found) {
                 self.cursor_line = 0;
             }
         }
-        
+
         // Also clear selection if it includes hidden lines
         if (self.selection_start) |sel| {
             if (!self.isRowVisible(sel)) {
@@ -2322,7 +2322,7 @@ pub const UI = struct {
                 yellow_line_num_style
             else
                 dim_style;
-            
+
             // Apply selection background to line numbers
             if (in_selection and !is_selected) {
                 old_num_style.bg = selection_bg;
@@ -3328,12 +3328,12 @@ pub const UI = struct {
                     const spinner_frames = [_][]const u8{ "⣶", "⣧", "⣏", "⡟", "⠿", "⢻", "⣹", "⣼" };
                     const frame_idx = self.spinner_frame % spinner_frames.len;
                     const spinner_char = spinner_frames[frame_idx];
-                    
+
                     const spinner_style: vaxis.Style = .{
                         .fg = .{ .rgb = .{ 0xaf, 0x5f, 0xff } }, // Purple
                         .bold = true,
                     };
-                    
+
                     surface.writeCell(0, status_row, .{
                         .char = .{ .grapheme = spinner_char, .width = 1 },
                         .style = spinner_style,
@@ -3592,7 +3592,7 @@ pub const UI = struct {
 
         const response = self.ask_response orelse "(No response)";
         var resp_iter = std.mem.splitScalar(u8, response, '\n');
-        
+
         // Skip lines based on scroll offset for answer section
         var lines_to_skip = self.ask_scroll_offset;
         while (resp_iter.next()) |line| {
@@ -3604,7 +3604,7 @@ pub const UI = struct {
                 while (start < line.len) {
                     if (current_row >= footer_row) break;
                     const end = @min(start + size.width -| 4, line.len);
-                    
+
                     if (lines_to_skip > 0) {
                         lines_to_skip -= 1;
                     } else {
@@ -6253,7 +6253,6 @@ test "line numbers: modification preserves line mapping" {
     }
     try std.testing.expect(found_modification);
 }
-
 
 test "split view: deleted file shows content on left side" {
     const allocator = std.testing.allocator;

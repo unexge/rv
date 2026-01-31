@@ -109,9 +109,11 @@ fn runCommand(allocator: Allocator, cmd: []const u8) DifftError![]u8 {
 }
 
 /// Check if difft is installed (uses direct execution, no shell)
-pub fn checkInstalled(allocator: Allocator, io: Io) !bool {
+/// difft_bin can be overridden via the difft_bin parameter (pass null to use default "difft")
+pub fn checkInstalled(allocator: Allocator, io: Io, difft_bin: ?[]const u8) !bool {
     // Use direct execution (no shell overhead)
-    const result = shell.runDirect(allocator, io, &.{ "difft", "--version" }) catch {
+    const bin = difft_bin orelse "difft";
+    const result = shell.runDirect(allocator, io, &.{ bin, "--version" }) catch {
         return false;
     };
     defer allocator.free(result.stdout);
@@ -566,4 +568,15 @@ test "parseGitDiffOutput difftastic status values" {
         }
         try std.testing.expectEqual(DiffStatus.changed, diffs[0].status);
     }
+}
+
+test "checkInstalled handles command not found without crashing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Pass a dummy path that definitely doesn't exist
+    const result = try checkInstalled(allocator, io, "/nonexistent/path/to/difft");
+
+    // Should return false gracefully when binary doesn't exist, not crash
+    try std.testing.expect(!result);
 }

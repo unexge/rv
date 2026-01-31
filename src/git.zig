@@ -235,7 +235,7 @@ fn parseNameStatus(allocator: Allocator, output: []const u8) GitError![]ChangedF
 pub fn getFileAtRevision(allocator: Allocator, io: Io, path: []const u8, rev: []const u8) GitError!?[]const u8 {
     const ref = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ rev, path });
     defer allocator.free(ref);
-    
+
     const result = runCommandDirect(allocator, io, &.{ "git", "show", ref }) catch return null;
     return result.stdout;
 }

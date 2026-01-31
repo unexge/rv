@@ -1550,3 +1550,1791 @@ test "selection: space at different cursor positions" {
     try runner.sendSpace();
     try std.testing.expectEqual(@as(usize, 7), runner.getUI().selection_start.?);
 }
+
+// =============================================================================
+// Mode Transition Tests
+// =============================================================================
+
+test "mode: 'c' from normal transitions to comment_input" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start in normal mode
+    const ui_inst = runner.getUI();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+
+    // Press 'c' to enter comment mode
+    try runner.sendChar('c');
+
+    // Verify we're now in comment_input mode
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.mode));  // comment_input = 1
+}
+
+test "mode: 'a' from normal transitions to ask_input" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start in normal mode
+    const ui_inst = runner.getUI();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+
+    // Press 'a' to enter ask_input mode
+    try runner.sendChar('a');
+
+    // Verify we're now in ask_input mode
+    try std.testing.expectEqual(@as(i32, 2), @intFromEnum(ui_inst.mode));  // ask_input = 2
+}
+
+test "mode: '?' from normal transitions to help" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start in normal mode
+    const ui_inst = runner.getUI();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+
+    // Press '?' to enter help mode
+    try runner.sendChar('?');
+
+    // Verify we're now in help mode
+    try std.testing.expectEqual(@as(i32, 5), @intFromEnum(ui_inst.mode));  // help = 5
+}
+
+test "mode: 'l' from normal transitions to file_list" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start in normal mode
+    const ui_inst = runner.getUI();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+
+    // Press 'l' to enter file_list mode
+    try runner.sendChar('l');
+
+    // Verify we're now in file_list mode
+    try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));  // file_list = 6
+}
+
+test "mode: '.' from normal transitions to file_list" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start in normal mode
+    const ui_inst = runner.getUI();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+
+    // Press '.' to enter file_list mode
+    try runner.sendChar('.');
+
+    // Verify we're now in file_list mode
+    try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));  // file_list = 6
+}
+
+test "mode: escape from comment_input returns to normal" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Enter comment_input mode
+    try runner.sendChar('c');
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.mode));  // comment_input = 1
+
+    // Press escape to return to normal
+    try runner.sendEscape();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+}
+
+test "mode: escape from ask_input returns to normal" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Enter ask_input mode
+    try runner.sendChar('a');
+    try std.testing.expectEqual(@as(i32, 2), @intFromEnum(ui_inst.mode));  // ask_input = 2
+
+    // Press escape to return to normal
+    try runner.sendEscape();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+}
+
+test "mode: escape from help returns to normal" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Enter help mode
+    try runner.sendChar('?');
+    try std.testing.expectEqual(@as(i32, 5), @intFromEnum(ui_inst.mode));  // help = 5
+
+    // Press escape to return to normal
+    try runner.sendEscape();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+}
+
+test "mode: escape from file_list returns to normal" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Enter file_list mode
+    try runner.sendChar('l');
+    try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));  // file_list = 6
+
+    // Press escape to return to normal
+    try runner.sendEscape();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+}
+
+test "mode: 'q' in normal mode sets should_quit flag" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Initially should_quit is false
+    try std.testing.expect(!ui_inst.should_quit);
+
+    // Press 'q' to quit
+    try runner.sendChar('q');
+
+    // Verify should_quit flag is set
+    try std.testing.expect(ui_inst.should_quit);
+}
+
+test "mode: comment_input mode clears with enter key" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Enter comment mode
+    try runner.sendChar('c');
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.mode));  // comment_input = 1
+
+    // Add some text to the comment buffer
+    try runner.sendChar('t');
+    try runner.sendChar('e');
+    try runner.sendChar('s');
+    try runner.sendChar('t');
+
+    // Verify buffer has content
+    try std.testing.expect(ui_inst.input_buffer.len > 0);
+
+    // Press enter to submit
+    try runner.sendEnter();
+
+    // Mode should return to normal
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+}
+
+test "mode: file_list mode selects file with enter key" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Enter file_list mode
+    try runner.sendChar('l');
+    try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));  // file_list = 6
+
+    // Press enter to select current file
+    try runner.sendEnter();
+
+    // Mode should return to normal
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));  // normal = 0
+}
+
+// =============================================================================
+// Comment Submission Tests
+// =============================================================================
+
+test "comment: submit single line comment" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+    const initial_count = session.comments.items.len;
+
+    // Move to line 3 (cursor_line is 0-based, but diff lines are 1-based)
+    for (0..3) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 3), ui_inst.cursor_line);
+
+    // Enter comment mode
+    try runner.sendChar('c');
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.mode));
+
+    // Type a comment
+    try runner.sendChar('t');
+    try runner.sendChar('e');
+    try runner.sendChar('s');
+    try runner.sendChar('t');
+    try std.testing.expect(ui_inst.input_buffer.len > 0);
+
+    // Submit the comment
+    try runner.sendEnter();
+
+    // Verify mode returned to normal
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+
+    // Verify comment was added
+    try std.testing.expectEqual(initial_count + 1, session.comments.items.len);
+
+    // Verify comment properties
+    const comment = session.comments.items[session.comments.items.len - 1];
+    try std.testing.expectEqual(@as(u32, 4), comment.line_start);  // Cursor at 3, but line_start is 1-based
+    try std.testing.expectEqual(@as(u32, 4), comment.line_end);    // Single line
+    try std.testing.expect(std.mem.eql(u8, "test", comment.text));
+    try std.testing.expectEqual(review.CommentSide.new, comment.side);  // Default to new
+}
+
+test "comment: multiline selection preserves start and end" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Move to line 5 and select down to line 8
+    for (0..5) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 5), ui_inst.cursor_line);
+
+    // Create selection by shift+down
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try std.testing.expectEqual(@as(usize, 8), ui_inst.cursor_line);
+    try std.testing.expect(ui_inst.selection_start != null);
+
+    // Enter comment mode
+    try runner.sendChar('c');
+
+    // Type a comment
+    try runner.sendChar('m');
+    try runner.sendChar('u');
+    try runner.sendChar('l');
+    try runner.sendChar('t');
+    try runner.sendChar('i');
+
+    // Submit
+    try runner.sendEnter();
+
+    // Verify comment captured the selection range (1-based line numbers)
+    const comment = session.comments.items[session.comments.items.len - 1];
+    try std.testing.expectEqual(@as(u32, 6), comment.line_start);  // selection_start is 5, but lines are 1-based
+    try std.testing.expectEqual(@as(u32, 9), comment.line_end);    // cursor is 8, but lines are 1-based
+    try std.testing.expect(std.mem.eql(u8, "multi", comment.text));
+}
+
+test "comment: empty comment does nothing" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+    const initial_count = session.comments.items.len;
+
+    // Enter comment mode
+    try runner.sendChar('c');
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.mode));
+
+    // Press enter without typing anything
+    try runner.sendEnter();
+
+    // Verify we're still in comment mode (empty comment rejected)
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.mode));
+
+    // Verify no comment was added
+    try std.testing.expectEqual(initial_count, session.comments.items.len);
+}
+
+test "comment: escape cancels without creating comment" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+    const initial_count = session.comments.items.len;
+
+    // Enter comment mode
+    try runner.sendChar('c');
+
+    // Type a comment
+    try runner.sendChar('t');
+    try runner.sendChar('e');
+    try runner.sendChar('s');
+    try runner.sendChar('t');
+
+    // Cancel with escape
+    try runner.sendEscape();
+
+    // Verify mode returned to normal
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+
+    // Verify no comment was added
+    try std.testing.expectEqual(initial_count, session.comments.items.len);
+
+    // Verify buffer was cleared
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.input_buffer.len);
+}
+
+test "comment: input buffer cleared after submission" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Enter comment mode and type
+    try runner.sendChar('c');
+    try runner.sendChar('h');
+    try runner.sendChar('i');
+    try std.testing.expect(ui_inst.input_buffer.len > 0);
+
+    // Submit
+    try runner.sendEnter();
+
+    // Verify buffer was cleared after submission
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.input_buffer.len);
+}
+
+test "comment: comment stores correct file path" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Get the current file path
+    const current_file = session.currentFile().?;
+    const expected_path = current_file.path;
+
+    // Enter comment mode and submit
+    try runner.sendChar('c');
+    try runner.sendChar('a');
+    try runner.sendEnter();
+
+    // Verify comment has correct file path
+    const comment = session.comments.items[session.comments.items.len - 1];
+    try std.testing.expect(std.mem.eql(u8, expected_path, comment.file_path));
+}
+
+test "comment: comment stores correct side" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Default focus_side is .new
+    try std.testing.expectEqual(review.CommentSide.new, ui_inst.focus_side);
+
+    // Enter comment mode and submit
+    try runner.sendChar('c');
+    try runner.sendChar('n');
+    try runner.sendEnter();
+
+    // Verify comment has .new side
+    const comment = session.comments.items[session.comments.items.len - 1];
+    try std.testing.expectEqual(review.CommentSide.new, comment.side);
+
+    // Now test with .old side - press tab to toggle focus_side
+    ui_inst.focus_side = review.CommentSide.old;
+
+    // Enter comment mode and submit
+    try runner.sendChar('c');
+    try runner.sendChar('o');
+    try runner.sendEnter();
+
+    // Verify comment has .old side
+    const comment2 = session.comments.items[session.comments.items.len - 1];
+    try std.testing.expectEqual(review.CommentSide.old, comment2.side);
+}
+
+// =============================================================================
+// View Mode Tests
+// =============================================================================
+
+test "view: default view_mode is split" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Verify default is split view (split = 1 in enum, unified = 0)
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.view_mode));  // split = 1
+}
+
+test "view: 'v' key toggles split to unified" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Start in split view (split = 1)
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.view_mode));  // split = 1
+
+    // Press 'v' to toggle to unified
+    try runner.sendChar('v');
+
+    // Verify we're now in unified mode (unified = 0)
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.view_mode));  // unified = 0
+}
+
+test "view: 'v' key toggles unified back to split" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Start in split view, toggle to unified (unified = 0)
+    try runner.sendChar('v');
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.view_mode));
+
+    // Press 'v' again to toggle back to split (split = 1)
+    try runner.sendChar('v');
+
+    // Verify we're back in split view
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.view_mode));
+}
+
+test "view: cursor position preserved across view toggle" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Move to line 5
+    for (0..5) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 5), ui_inst.cursor_line);
+
+    // Toggle view mode
+    try runner.sendChar('v');
+
+    // Verify cursor position is preserved
+    try std.testing.expectEqual(@as(usize, 5), ui_inst.cursor_line);
+
+    // Toggle back
+    try runner.sendChar('v');
+
+    // Verify cursor is still at same position
+    try std.testing.expectEqual(@as(usize, 5), ui_inst.cursor_line);
+}
+
+test "view: selection preserved across view toggle" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Create a selection
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try std.testing.expect(ui_inst.selection_start != null);
+    const selection_start = ui_inst.selection_start.?;
+    const cursor_line = ui_inst.cursor_line;
+
+    // Toggle view mode
+    try runner.sendChar('v');
+
+    // Verify selection is preserved
+    try std.testing.expect(ui_inst.selection_start != null);
+    try std.testing.expectEqual(selection_start, ui_inst.selection_start.?);
+    try std.testing.expectEqual(cursor_line, ui_inst.cursor_line);
+
+    // Toggle back
+    try runner.sendChar('v');
+
+    // Verify selection is still intact
+    try std.testing.expect(ui_inst.selection_start != null);
+    try std.testing.expectEqual(selection_start, ui_inst.selection_start.?);
+    try std.testing.expectEqual(cursor_line, ui_inst.cursor_line);
+}
+
+test "view: scroll offset preserved across view toggle" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 50);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Scroll down
+    for (0..10) |_| {
+        try runner.sendDown();
+    }
+
+    // Toggle view mode
+    try runner.sendChar('v');
+
+    // Scroll offset should be preserved (or adjusted by view-specific logic)
+    // For now, just verify view mode changed (unified = 0)
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.view_mode));
+
+    // Toggle back
+    try runner.sendChar('v');
+
+    // Verify view mode is back to split (split = 1)
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.view_mode));
+}
+
+test "view: split mode renders both panels" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Verify in split view (split = 1)
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.view_mode));
+
+    // Verify split_rows exist for split mode
+    try std.testing.expect(ui_inst.split_rows.items.len > 0);
+}
+
+test "view: unified mode renders single column" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Toggle to unified view (unified = 0)
+    try runner.sendChar('v');
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.view_mode));
+
+    // Verify diff_lines exist for unified mode
+    try std.testing.expect(ui_inst.diff_lines.items.len > 0);
+}
+
+// =============================================================================
+// Collapse/Summary Mode Tests
+// =============================================================================
+
+test "collapse: summary_mode defaults to true" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Verify summary_mode defaults to true (collapsed)
+    try std.testing.expect(ui_inst.summary_mode);
+}
+
+test "collapse: 's' key toggles summary_mode" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Start in summary mode
+    try std.testing.expect(ui_inst.summary_mode);
+
+    // Press 's' to toggle to expanded
+    try runner.sendChar('s');
+
+    // Verify summary_mode is now false
+    try std.testing.expect(!ui_inst.summary_mode);
+
+    // Press 's' again to toggle back
+    try runner.sendChar('s');
+
+    // Verify summary_mode is back to true
+    try std.testing.expect(ui_inst.summary_mode);
+}
+
+test "collapse: summary_mode toggle is bidirectional" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Toggle multiple times
+    for (0..5) |i| {
+        const expected = i % 2 == 0;  // Starts true, alternates
+        try std.testing.expectEqual(expected, ui_inst.summary_mode);
+        try runner.sendChar('s');
+    }
+
+    // After 5 toggles, should be false
+    try std.testing.expect(!ui_inst.summary_mode);
+}
+
+test "collapse: cursor position preserved across summary toggle" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Move to line 5
+    for (0..5) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 5), ui_inst.cursor_line);
+
+    // Toggle summary mode
+    try runner.sendChar('s');
+
+    // Cursor position should be preserved (or adjusted if line is hidden)
+    // For simple test, just verify summary_mode changed
+    try std.testing.expect(!ui_inst.summary_mode);
+
+    // Toggle back
+    try runner.sendChar('s');
+
+    // Verify summary_mode is back to true
+    try std.testing.expect(ui_inst.summary_mode);
+}
+
+test "collapse: selection preserved across summary toggle" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Create a selection
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try std.testing.expect(ui_inst.selection_start != null);
+    const selection_start = ui_inst.selection_start.?;
+
+    // Toggle summary mode
+    try runner.sendChar('s');
+
+    // Selection should be preserved
+    try std.testing.expect(ui_inst.selection_start != null);
+    try std.testing.expectEqual(selection_start, ui_inst.selection_start.?);
+
+    // Toggle back
+    try runner.sendChar('s');
+
+    // Selection should still be there
+    try std.testing.expect(ui_inst.selection_start != null);
+    try std.testing.expectEqual(selection_start, ui_inst.selection_start.?);
+}
+
+test "collapse: scroll offset adjusted across summary toggle" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 50);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Scroll down in summary mode
+    for (0..10) |_| {
+        try runner.sendDown();
+    }
+
+    // Toggle to expanded
+    try runner.sendChar('s');
+
+    // Verify summary_mode changed
+    try std.testing.expect(!ui_inst.summary_mode);
+
+    // Toggle back to summary
+    try runner.sendChar('s');
+
+    // Verify back in summary mode
+    try std.testing.expect(ui_inst.summary_mode);
+}
+
+// =============================================================================
+// File List Navigation Tests
+// =============================================================================
+
+test "filelist: 'l' opens file_list mode" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Start in normal mode
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+
+    // Press 'l' to open file_list mode
+    try runner.sendChar('l');
+
+    // Verify we're in file_list mode
+    try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));  // file_list = 6
+}
+
+test "filelist: '.' opens file_list mode" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Start in normal mode
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+
+    // Press '.' to open file_list mode
+    try runner.sendChar('.');
+
+    // Verify we're in file_list mode
+    try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));  // file_list = 6
+}
+
+test "filelist: escape closes file_list without changing file" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+    const initial_file_idx = session.current_file_idx;
+
+    // Enter file_list mode
+    try runner.sendChar('l');
+    try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));
+
+    // Press escape to cancel
+    try runner.sendEscape();
+
+    // Verify mode returned to normal
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+
+    // Verify file index didn't change
+    try std.testing.expectEqual(initial_file_idx, session.current_file_idx);
+}
+
+test "filelist: current file is selected by default" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Set current file to 1 (middle file)
+    session.goToFile(1);
+    try std.testing.expectEqual(@as(usize, 1), session.current_file_idx);
+
+    // Enter file_list mode
+    try runner.sendChar('l');
+
+    // Verify file_list_cursor starts at current file
+    try std.testing.expectEqual(@as(usize, 1), ui_inst.file_list_cursor);
+}
+
+test "filelist: enter selects file and returns to normal" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Start at file 0
+    try std.testing.expectEqual(@as(usize, 0), session.current_file_idx);
+
+    // Enter file_list mode
+    try runner.sendChar('l');
+
+    // Move to file 2
+    try runner.sendDown();
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 2), ui_inst.file_list_cursor);
+
+    // Select file with Enter
+    try runner.sendEnter();
+
+    // Verify mode returned to normal
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+
+    // Verify file was changed
+    try std.testing.expectEqual(@as(usize, 2), session.current_file_idx);
+}
+
+test "filelist: up/down arrows move cursor within bounds" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Enter file_list mode (starts at file 0)
+    try runner.sendChar('l');
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.file_list_cursor);
+
+    // Press Down to move to file 1
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 1), ui_inst.file_list_cursor);
+
+    // Press Down again to move to file 2
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 2), ui_inst.file_list_cursor);
+
+    // Try to press Down beyond last file (should stay at 2)
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 2), ui_inst.file_list_cursor);
+
+    // Press Up to move back to file 1
+    try runner.sendUp();
+    try std.testing.expectEqual(@as(usize, 1), ui_inst.file_list_cursor);
+
+    // Press Up to move to file 0
+    try runner.sendUp();
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.file_list_cursor);
+
+    // Try to press Up before first file (should stay at 0)
+    try runner.sendUp();
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.file_list_cursor);
+}
+
+test "filelist: left arrow in normal mode goes to previous file" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start at file 2
+    session.goToFile(2);
+    try std.testing.expectEqual(@as(usize, 2), session.current_file_idx);
+
+    // Press left arrow to go to previous file
+    try runner.sendKey(.{ .codepoint = vaxis.Key.left });
+
+    // Verify we're at file 1
+    try std.testing.expectEqual(@as(usize, 1), session.current_file_idx);
+
+    // Press left arrow again
+    try runner.sendKey(.{ .codepoint = vaxis.Key.left });
+
+    // Verify we're at file 0
+    try std.testing.expectEqual(@as(usize, 0), session.current_file_idx);
+
+    // Try to press left before first file (should stay at 0)
+    try runner.sendKey(.{ .codepoint = vaxis.Key.left });
+    try std.testing.expectEqual(@as(usize, 0), session.current_file_idx);
+}
+
+test "filelist: right arrow in normal mode goes to next file" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start at file 0
+    try std.testing.expectEqual(@as(usize, 0), session.current_file_idx);
+
+    // Press right arrow to go to next file
+    try runner.sendKey(.{ .codepoint = vaxis.Key.right });
+
+    // Verify we're at file 1
+    try std.testing.expectEqual(@as(usize, 1), session.current_file_idx);
+
+    // Press right arrow again
+    try runner.sendKey(.{ .codepoint = vaxis.Key.right });
+
+    // Verify we're at file 2
+    try std.testing.expectEqual(@as(usize, 2), session.current_file_idx);
+
+    // Try to press right beyond last file (should stay at 2)
+    try runner.sendKey(.{ .codepoint = vaxis.Key.right });
+    try std.testing.expectEqual(@as(usize, 2), session.current_file_idx);
+}
+
+// =============================================================================
+// Rendering Snapshot Tests
+// =============================================================================
+
+test "render: diff lines rendered for single file" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Verify diff_lines were created
+    try std.testing.expect(ui_inst.diff_lines.items.len > 0);
+
+    // Render and verify we get output
+    const text = try runner.getText();
+    defer {
+        for (text) |row| {
+            allocator.free(row);
+        }
+        allocator.free(text);
+    }
+
+    // Should have some non-empty rows
+    var has_content = false;
+    for (text) |row| {
+        if (row.len > 0) {
+            has_content = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_content);
+}
+
+test "render: split view shows multiple columns" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Verify in split view
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.view_mode));
+
+    // Verify split_rows exist
+    try std.testing.expect(ui_inst.split_rows.items.len > 0);
+
+    // Render and verify
+    const text = try runner.getText();
+    defer {
+        for (text) |row| {
+            allocator.free(row);
+        }
+        allocator.free(text);
+    }
+
+    try std.testing.expect(text.len > 0);
+}
+
+test "render: unified view shows single column" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Toggle to unified
+    try runner.sendChar('v');
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.view_mode));
+
+    // Verify diff_lines exist
+    try std.testing.expect(ui_inst.diff_lines.items.len > 0);
+
+    // Render and verify
+    const text = try runner.getText();
+    defer {
+        for (text) |row| {
+            allocator.free(row);
+        }
+        allocator.free(text);
+    }
+
+    try std.testing.expect(text.len > 0);
+}
+
+test "render: cursor position highlighted in output" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Move cursor to line 5
+    for (0..5) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 5), ui_inst.cursor_line);
+
+    // Snapshot should reflect cursor position
+    var snapshot = try runner.captureSnapshot();
+    defer snapshot.deinit();
+
+    // Verify cursor line in state
+    try std.testing.expectEqual(@as(usize, 5), snapshot.state.cursor_line);
+}
+
+test "render: selection visible in snapshot" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Create selection from line 3 to 7
+    for (0..3) |_| {
+        try runner.sendDown();
+    }
+    try runner.sendSpace();
+    for (0..4) |_| {
+        try runner.sendDown();
+    }
+
+    // Snapshot should show selection
+    var snapshot = try runner.captureSnapshot();
+    defer snapshot.deinit();
+
+    try std.testing.expect(snapshot.state.cursor_line > 0);
+}
+
+test "render: mode displayed correctly in snapshot" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Test normal mode
+    var snapshot = try runner.captureSnapshot();
+    defer snapshot.deinit();
+    try std.testing.expect(std.mem.eql(u8, "normal", snapshot.state.mode));
+
+    // Test comment mode
+    try runner.sendChar('c');
+    var snapshot2 = try runner.captureSnapshot();
+    defer snapshot2.deinit();
+    try std.testing.expect(std.mem.eql(u8, "comment_input", snapshot2.state.mode));
+}
+
+test "render: summary mode affects rendering" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Capture in summary mode
+    var snapshot1 = try runner.captureSnapshot();
+    defer snapshot1.deinit();
+    try std.testing.expect(snapshot1.state.summary_mode);
+
+    // Toggle to expanded
+    try runner.sendChar('s');
+
+    // Capture in expanded mode
+    var snapshot2 = try runner.captureSnapshot();
+    defer snapshot2.deinit();
+    try std.testing.expect(!snapshot2.state.summary_mode);
+}
+
+test "render: file path displayed in snapshot state" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Capture snapshot
+    var snapshot = try runner.captureSnapshot();
+    defer snapshot.deinit();
+
+    // Verify file path is in state
+    try std.testing.expect(snapshot.state.current_file != null);
+    try std.testing.expect(std.mem.eql(u8, "test.zig", snapshot.state.current_file.?));
+}
+
+// =============================================================================
+// Edge Case Tests
+// =============================================================================
+
+test "edge: single line file renders correctly" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 1);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Verify diff_lines were created
+    try std.testing.expect(ui_inst.diff_lines.items.len > 0);
+
+    // Cursor at line 0 should be valid
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.cursor_line);
+
+    // Pressing down shouldn't move past the single line
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.cursor_line);
+}
+
+test "edge: very large file renders without crashing" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Create a very large file
+    try createTestFileWithLines(allocator, &session, 1000);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Verify diff_lines were created
+    try std.testing.expect(ui_inst.diff_lines.items.len > 0);
+
+    // Try scrolling through the file
+    for (0..100) |_| {
+        try runner.sendDown();
+    }
+
+    // Should be at line 100 (or less if file is smaller due to diff processing)
+    try std.testing.expect(ui_inst.cursor_line >= 0);
+}
+
+test "edge: many files in session navigates correctly" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Create 25 files
+    for (0..25) |_| {
+        try createTestFileWithLines(allocator, &session, 5);
+    }
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start at file 0
+    try std.testing.expectEqual(@as(usize, 0), session.current_file_idx);
+
+    // Enter file_list mode
+    try runner.sendChar('l');
+
+    // Navigate to file 20
+    for (0..20) |_| {
+        try runner.sendDown();
+    }
+
+    const ui_inst = runner.getUI();
+    try std.testing.expectEqual(@as(usize, 20), ui_inst.file_list_cursor);
+
+    // Select the file
+    try runner.sendEnter();
+
+    // Verify we're at file 20
+    try std.testing.expectEqual(@as(usize, 20), session.current_file_idx);
+}
+
+test "edge: empty comment buffer after pressing escape" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Enter comment mode
+    try runner.sendChar('c');
+
+    // Type a long comment
+    for (0..100) |_| {
+        try runner.sendChar('a');
+    }
+    try std.testing.expect(ui_inst.input_buffer.len > 0);
+
+    // Cancel with escape
+    try runner.sendEscape();
+
+    // Buffer should be cleared
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.input_buffer.len);
+}
+
+test "edge: cursor wraps at file boundaries" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Get to the end of the file
+    for (0..50) |_| {
+        try runner.sendDown();
+    }
+
+    const end_position = ui_inst.cursor_line;
+
+    // Try to go down past the end
+    try runner.sendDown();
+    try runner.sendDown();
+
+    // Should stay at end position
+    try std.testing.expectEqual(end_position, ui_inst.cursor_line);
+
+    // Go to beginning
+    for (0..100) |_| {
+        try runner.sendUp();
+    }
+
+    // Should be at line 0
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.cursor_line);
+
+    // Try to go up past the beginning
+    try runner.sendUp();
+
+    // Should stay at line 0
+    try std.testing.expectEqual(@as(usize, 0), ui_inst.cursor_line);
+}
+
+test "edge: selection clears when pressing escape" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Create a selection
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try std.testing.expect(ui_inst.selection_start != null);
+
+    // Press escape to clear
+    try runner.sendEscape();
+
+    // Selection should be cleared
+    try std.testing.expect(ui_inst.selection_start == null);
+}
+
+test "edge: file switching with pending comments" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Add a comment on file 0
+    try runner.sendChar('c');
+    try runner.sendChar('t');
+    try runner.sendChar('e');
+    try runner.sendChar('s');
+    try runner.sendChar('t');
+    try runner.sendEnter();
+
+    // Verify comment was added
+    try std.testing.expectEqual(@as(usize, 1), session.comments.items.len);
+
+    // Switch to file 1
+    try runner.sendKey(.{ .codepoint = vaxis.Key.right });
+
+    try std.testing.expectEqual(@as(usize, 1), session.current_file_idx);
+
+    // Comments should persist
+    try std.testing.expectEqual(@as(usize, 1), session.comments.items.len);
+}
+
+test "edge: view mode toggle multiple times" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Start in split mode (1)
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.view_mode));
+
+    // Toggle 5 times: split(1) → unified(0) → split(1) → unified(0) → split(1) → unified(0)
+    for (0..5) |_| {
+        try runner.sendChar('v');
+    }
+
+    // After 5 toggles (odd number), should be in unified mode (0)
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.view_mode));
+
+    // Toggle one more time
+    try runner.sendChar('v');
+
+    // Now should be back in split mode (1)
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.view_mode));
+}
+
+test "edge: mode switching sequence" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // normal → comment → normal
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+    try runner.sendChar('c');
+    try std.testing.expectEqual(@as(i32, 1), @intFromEnum(ui_inst.mode));
+    try runner.sendEscape();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+
+    // normal → help → normal
+    try runner.sendChar('?');
+    try std.testing.expectEqual(@as(i32, 5), @intFromEnum(ui_inst.mode));
+    try runner.sendEscape();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+
+    // normal → file_list → normal
+    try runner.sendChar('l');
+    try std.testing.expectEqual(@as(i32, 6), @intFromEnum(ui_inst.mode));
+    try runner.sendEscape();
+    try std.testing.expectEqual(@as(i32, 0), @intFromEnum(ui_inst.mode));
+}

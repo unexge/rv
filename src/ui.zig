@@ -438,6 +438,31 @@ pub const UI = struct {
                     } else |_| {}
                 } else |_| {}
             }
+
+            // Uncollapse regions that contain changed lines so diffs are visible
+            // Collect all changed line numbers from the diff chunks
+            for (file.diff.chunks) |chunk| {
+                for (chunk) |entry| {
+                    // Uncollapse regions containing RHS (new) changes
+                    if (entry.rhs) |rhs| {
+                        const line_num = rhs.line_number + 1; // Convert to 1-based
+                        for (self.collapse_regions) |*region| {
+                            if (region.containsBodyLine(line_num)) {
+                                region.collapsed = false;
+                            }
+                        }
+                    }
+                    // Uncollapse regions containing LHS (old) changes
+                    if (entry.lhs) |lhs| {
+                        const line_num = lhs.line_number + 1; // Convert to 1-based
+                        for (self.old_collapse_regions) |*region| {
+                            if (region.containsBodyLine(line_num)) {
+                                region.collapsed = false;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         var old_lines: std.ArrayList([]const u8) = .empty;

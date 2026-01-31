@@ -210,33 +210,33 @@ pub fn main(init: std.process.Init) !void {
         try git.getChangedFiles(allocator, io, args.staged);
     timing.record("git.getChangedFiles");
 
-    // Filter paths if specified
-    var filtered_paths: std.ArrayList([]const u8) = .empty;
-    defer filtered_paths.deinit(allocator);
+    // Filter files if specified
+    var filtered_files: std.ArrayList(git.ChangedFile) = .empty;
+    defer filtered_files.deinit(allocator);
 
     if (args.paths.len > 0) {
         for (changed_files) |file| {
             for (args.paths) |path| {
                 if (std.mem.indexOf(u8, file.path, path) != null) {
-                    try filtered_paths.append(allocator, file.path);
+                    try filtered_files.append(allocator, file);
                     break;
                 }
             }
         }
     } else {
         for (changed_files) |file| {
-            try filtered_paths.append(allocator, file.path);
+            try filtered_files.append(allocator, file);
         }
     }
 
-    if (filtered_paths.items.len == 0) {
+    if (filtered_files.items.len == 0) {
         try stderr.writeAll("No changes to review.\n");
         try stderr.flush();
         return;
     }
 
     // Run git diff with external difft tool
-    const diff_json = try git.runGitDiffWithDifft(allocator, io, args.staged, args.commit, filtered_paths.items);
+    const diff_json = try git.runGitDiffWithDifft(allocator, io, args.staged, args.commit, filtered_files.items);
     defer allocator.free(diff_json);
     timing.record("git.runGitDiffWithDifft");
 
@@ -261,6 +261,10 @@ pub fn main(init: std.process.Init) !void {
     // Add each diff to the session
     for (file_diffs) |file_diff| {
         // Fetch file contents for display
+        // Content loading must match the diff semantics:
+        // - Working tree mode: old=HEAD, new=filesystem
+        // - Staged mode: old=HEAD, new=index (:)
+        // - Commit mode: old=commit^, new=commit
         var old_content: []const u8 = "";
         var new_content: []const u8 = "";
 
@@ -269,7 +273,12 @@ pub fn main(init: std.process.Init) !void {
             const parent_rev = try std.fmt.allocPrint(allocator, "{s}^", .{commit});
             defer allocator.free(parent_rev);
 
-            old_content = (try git.getFileAtRevision(allocator, io, file_diff.path, parent_rev)) orelse "";
+            // For added files, there is no old content (parent doesn't have the file)
+            if (file_diff.status == .added) {
+                old_content = "";
+            } else {
+                old_content = (try git.getFileAtRevision(allocator, io, file_diff.path, parent_rev)) orelse "";
+            }
 
             // For deleted files, there is no new content
             if (file_diff.status == .removed) {
@@ -277,22 +286,33 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 new_content = (try git.getFileAtRevision(allocator, io, file_diff.path, commit)) orelse "";
             }
+        } else if (args.staged) {
+            // For staged changes: old=HEAD, new=index (:)
+            if (file_diff.status == .added) {
+                // For added files, there is no old content in HEAD
+                old_content = "";
+            } else {
+                old_content = (try git.getFileAtRevision(allocator, io, file_diff.path, "HEAD")) orelse "";
+            }
+
+            if (file_diff.status == .removed) {
+                new_content = "";
+            } else {
+                // Get content from the staging area (index)
+                new_content = (try git.getFileAtRevision(allocator, io, file_diff.path, ":")) orelse "";
+            }
         } else {
-            // For working directory/staged changes
+            // For working directory changes: old=HEAD, new=filesystem
             if (file_diff.status == .added) {
                 // For added files, there is no old content
                 old_content = "";
-                const full_path = try std.fs.path.join(allocator, &.{ repo_root, file_diff.path });
-                new_content = git.readFileContent(allocator, io, full_path) catch "";
-            } else if (file_diff.status == .removed) {
-                // For deleted files, old comes from HEAD/index, new is empty
-                const rev = if (args.staged) ":" else "HEAD";
-                old_content = (try git.getFileAtRevision(allocator, io, file_diff.path, rev)) orelse "";
+            } else {
+                old_content = (try git.getFileAtRevision(allocator, io, file_diff.path, "HEAD")) orelse "";
+            }
+
+            if (file_diff.status == .removed) {
                 new_content = "";
             } else {
-                // For modified files, get both from git and filesystem
-                const rev = if (args.staged) ":" else "HEAD";
-                old_content = (try git.getFileAtRevision(allocator, io, file_diff.path, rev)) orelse "";
                 const full_path = try std.fs.path.join(allocator, &.{ repo_root, file_diff.path });
                 new_content = git.readFileContent(allocator, io, full_path) catch "";
             }

@@ -90,77 +90,73 @@ pub fn getChangedFiles(allocator: Allocator, io: Io, staged: bool) GitError![]Ch
 
 /// Run git diff with external diff tool (difft) to get semantic diffs
 /// Returns raw JSON output from difft for all changed files
+/// files: list of ChangedFile structs with path and status information
 pub fn runGitDiffWithDifft(
     allocator: Allocator,
     io: Io,
     staged: bool,
     commit: ?[]const u8,
-    paths: []const []const u8,
+    files: []const ChangedFile,
 ) GitError![]const u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
 
-    const rev: []const u8 = if (commit) |c| c else if (staged) ":" else "HEAD";
+    for (files) |file| {
+        const escaped_path = try shell.escapeForDoubleQuotes(allocator, file.path);
+        defer allocator.free(escaped_path);
 
-    var cmd: std.ArrayList(u8) = .empty;
-    defer cmd.deinit(allocator);
-
-    if (commit) |c| {
-        try cmd.appendSlice(allocator, "git diff-tree --no-commit-id --name-only -r --root ");
-        try cmd.appendSlice(allocator, c);
-        try cmd.appendSlice(allocator, " 2>/dev/null");
-    } else if (staged) {
-        try cmd.appendSlice(allocator, "git diff --cached --name-only 2>/dev/null");
-    } else {
-        try cmd.appendSlice(allocator, "git diff --name-only 2>/dev/null");
-    }
-
-    const cmd_str = try cmd.toOwnedSlice(allocator);
-    defer allocator.free(cmd_str);
-
-    const result = try runCommand(allocator, io, cmd_str);
-    defer allocator.free(result.stdout);
-
-    var changed_files: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (changed_files.items) |file| {
-            allocator.free(file);
-        }
-        changed_files.deinit(allocator);
-    }
-
-    var file_iter = std.mem.splitScalar(u8, result.stdout, '\n');
-    while (file_iter.next()) |file| {
-        if (file.len == 0) continue;
-
-        if (paths.len > 0) {
-            var matched = false;
-            for (paths) |path| {
-                if (std.mem.indexOf(u8, file, path) != null) {
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched) continue;
-        }
-
-        try changed_files.append(allocator, try allocator.dupe(u8, file));
-    }
-
-    for (changed_files.items) |file| {
-        const escaped_file = try shell.escapeForDoubleQuotes(allocator, file);
-        defer allocator.free(escaped_file);
+        // For renames/copies, use old_path for the left side
+        const old_path = file.old_path orelse file.path;
+        const escaped_old_path = try shell.escapeForDoubleQuotes(allocator, old_path);
+        defer allocator.free(escaped_old_path);
 
         var difft_cmd: std.ArrayList(u8) = .empty;
         defer difft_cmd.deinit(allocator);
 
-        try difft_cmd.appendSlice(allocator, "bash -c 'DFT_UNSTABLE=yes difft --display json <(git show ");
-        try difft_cmd.appendSlice(allocator, rev);
-        try difft_cmd.appendSlice(allocator, ":\"");
-        try difft_cmd.appendSlice(allocator, escaped_file);
-        try difft_cmd.appendSlice(allocator, "\") \"");
-        try difft_cmd.appendSlice(allocator, escaped_file);
-        try difft_cmd.appendSlice(allocator, "\" 2>/dev/null' 2>/dev/null");
+        try difft_cmd.appendSlice(allocator, "bash -c 'DFT_UNSTABLE=yes difft --display json ");
+
+        // Build left side (old content)
+        if (file.status == .added or file.status == .untracked) {
+            // New file: compare against /dev/null
+            try difft_cmd.appendSlice(allocator, "/dev/null ");
+        } else if (commit) |c| {
+            // Commit mode: old is from parent commit
+            try difft_cmd.appendSlice(allocator, "<(git show ");
+            try difft_cmd.appendSlice(allocator, c);
+            try difft_cmd.appendSlice(allocator, "^:\"");
+            try difft_cmd.appendSlice(allocator, escaped_old_path);
+            try difft_cmd.appendSlice(allocator, "\" 2>/dev/null) ");
+        } else {
+            // Staged or working tree: old is from HEAD
+            try difft_cmd.appendSlice(allocator, "<(git show HEAD:\"");
+            try difft_cmd.appendSlice(allocator, escaped_old_path);
+            try difft_cmd.appendSlice(allocator, "\" 2>/dev/null) ");
+        }
+
+        // Build right side (new content)
+        if (file.status == .deleted) {
+            // Deleted file: compare against /dev/null
+            try difft_cmd.appendSlice(allocator, "/dev/null");
+        } else if (commit) |c| {
+            // Commit mode: new is from the commit
+            try difft_cmd.appendSlice(allocator, "<(git show ");
+            try difft_cmd.appendSlice(allocator, c);
+            try difft_cmd.appendSlice(allocator, ":\"");
+            try difft_cmd.appendSlice(allocator, escaped_path);
+            try difft_cmd.appendSlice(allocator, "\" 2>/dev/null)");
+        } else if (staged) {
+            // Staged mode: new is from the index
+            try difft_cmd.appendSlice(allocator, "<(git show :\"");
+            try difft_cmd.appendSlice(allocator, escaped_path);
+            try difft_cmd.appendSlice(allocator, "\" 2>/dev/null)");
+        } else {
+            // Working tree mode: new is from the filesystem
+            try difft_cmd.appendSlice(allocator, "\"");
+            try difft_cmd.appendSlice(allocator, escaped_path);
+            try difft_cmd.appendSlice(allocator, "\"");
+        }
+
+        try difft_cmd.appendSlice(allocator, " 2>/dev/null' 2>/dev/null");
 
         const difft_cmd_str = try difft_cmd.toOwnedSlice(allocator);
         defer allocator.free(difft_cmd_str);
@@ -169,7 +165,35 @@ pub fn runGitDiffWithDifft(
         defer allocator.free(difft_result.stdout);
 
         if (difft_result.stdout.len > 0) {
-            try output.appendSlice(allocator, difft_result.stdout);
+            // When using process substitution, difft may report the wrong path
+            // (e.g., "/dev/fd/63" instead of the actual file path).
+            // We need to fix the path in the JSON output.
+            // The JSON starts with {"language":"...", "path":"..."}
+            // We replace "path":"<anything>" with "path":"<actual_path>"
+            const json_path_pattern = "\"path\":\"";
+            if (std.mem.indexOf(u8, difft_result.stdout, json_path_pattern)) |pattern_start| {
+                const path_value_start = pattern_start + json_path_pattern.len;
+                // Find the closing quote of the path value
+                if (std.mem.indexOfScalarPos(u8, difft_result.stdout, path_value_start, '"')) |path_value_end| {
+                    // Build the corrected JSON: prefix + correct path + suffix
+                    try output.appendSlice(allocator, difft_result.stdout[0..path_value_start]);
+                    // Escape the path for JSON (handle backslashes and quotes)
+                    for (file.path) |c| {
+                        switch (c) {
+                            '\\' => try output.appendSlice(allocator, "\\\\"),
+                            '"' => try output.appendSlice(allocator, "\\\""),
+                            else => try output.append(allocator, c),
+                        }
+                    }
+                    try output.appendSlice(allocator, difft_result.stdout[path_value_end..]);
+                } else {
+                    // Couldn't parse path - use raw output
+                    try output.appendSlice(allocator, difft_result.stdout);
+                }
+            } else {
+                // No path field found - use raw output
+                try output.appendSlice(allocator, difft_result.stdout);
+            }
         }
     }
 

@@ -450,7 +450,8 @@ fn classifyZigNode(node_type: []const u8) ?NodeType {
     }
     // Test declarations
     if (std.mem.eql(u8, node_type, "TestDecl") or
-        std.mem.eql(u8, node_type, "test_decl"))
+        std.mem.eql(u8, node_type, "test_decl") or
+        std.mem.eql(u8, node_type, "test_declaration"))
     {
         return .test_decl;
     }
@@ -901,4 +902,40 @@ test "CollapseDetector finds pub const NAME = struct pattern" {
 
     // We expect to find: MyEnum, MyStruct, init method, PrivateUnion
     try std.testing.expect(regions.len >= 3);
+}
+
+test "CollapseDetector finds Zig test declarations" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\pub fn main() void {
+        \\    const x = 42;
+        \\    _ = x;
+        \\}
+        \\
+        \\test "example test" {
+        \\    const y = 1;
+        \\    _ = y;
+        \\    try std.testing.expect(true);
+        \\}
+        \\
+        \\test "another test" {
+        \\    try std.testing.expect(1 == 1);
+        \\}
+    ;
+
+    var detector = CollapseDetector.init(allocator, .zig) catch {
+        return; // Skip if tree-sitter not available
+    };
+    defer detector.deinit();
+
+    const regions = try detector.findRegions(source);
+    defer freeRegions(allocator, @constCast(regions));
+
+    // We expect to find: main function + 2 test declarations
+    var test_count: usize = 0;
+    for (regions) |region| {
+        if (region.node_type == .test_decl) test_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), test_count);
 }

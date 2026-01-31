@@ -399,4 +399,5 @@ comptime {
     _ = highlight;
     _ = @import("pi.zig");
     _ = @import("shell.zig");
+    _ = @import("test_harness.zig");
 }

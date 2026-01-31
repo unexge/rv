@@ -55,17 +55,17 @@ pub const TestRunner = struct {
 
     /// Send a key press event to the UI
     pub fn sendKey(self: *TestRunner, key: vaxis.Key) !void {
-        var cmds: vxfw.CommandList = .empty;
-        defer cmds.deinit(self.allocator);
-
+        // Create a minimal event context for key handling
         var ctx = vxfw.EventContext{
             .phase = .at_target,
             .alloc = self.allocator,
-            .cmds = cmds,
+            .cmds = .empty,
             .io = undefined, // Not used for key handling
         };
+        defer ctx.cmds.deinit(self.allocator);
 
-        try self.ui_instance.widget().handleEvent(&ctx, .{ .key_press = key });
+        // Call handleKeyPress directly to bypass widget layer
+        try self.ui_instance.handleKeyPress(&ctx, key);
     }
 
     /// Send a character key press (convenience method)
@@ -88,6 +88,19 @@ pub const TestRunner = struct {
 
     pub fn sendEscape(self: *TestRunner) !void {
         try self.sendKey(.{ .codepoint = vaxis.Key.escape });
+    }
+
+    pub fn sendSpace(self: *TestRunner) !void {
+        try self.sendKey(.{ .codepoint = ' ' });
+    }
+
+    /// Send keys with modifiers
+    pub fn sendShiftUp(self: *TestRunner) !void {
+        try self.sendKey(.{ .codepoint = vaxis.Key.up, .mods = .{ .shift = true } });
+    }
+
+    pub fn sendShiftDown(self: *TestRunner) !void {
+        try self.sendKey(.{ .codepoint = vaxis.Key.down, .mods = .{ .shift = true } });
     }
 
     /// Capture the current render as a Snapshot
@@ -383,9 +396,6 @@ pub const Snapshot = struct {
         defer result.deinit();
 
         if (!result.match) {
-            const diff_text = try result.format(self.allocator);
-            defer self.allocator.free(diff_text);
-            std.debug.print("\nSnapshot mismatch:\n{s}\n", .{diff_text});
             return error.SnapshotMismatch;
         }
     }
@@ -755,4 +765,789 @@ test "TestRunner serializeSnapshot returns valid data" {
 
 test "refAllDecls" {
     std.testing.refAllDecls(@This());
+}
+
+// =============================================================================
+// Test Helpers for creating diff data
+// =============================================================================
+
+/// Helper to create a simple file with specified number of lines (all additions)
+fn createTestFileWithLines(allocator: Allocator, session: *review.ReviewSession, num_lines: usize) !void {
+    var content_builder: std.ArrayList(u8) = .empty;
+    defer content_builder.deinit(allocator);
+
+    for (0..num_lines) |i| {
+        if (i > 0) try content_builder.append(allocator, '\n');
+        const line = try std.fmt.allocPrint(allocator, "line {}", .{i + 1});
+        defer allocator.free(line);
+        try content_builder.appendSlice(allocator, line);
+    }
+
+    const new_content = try content_builder.toOwnedSlice(allocator);
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .added,
+        .chunks = &.{},
+        .allocator = allocator,
+    };
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, ""),
+        .new_content = new_content,
+    });
+}
+
+/// Helper to create a file with context lines and separators (multi-chunk diff)
+fn createTestFileWithSeparators(allocator: Allocator, session: *review.ReviewSession) !void {
+    // Create a file with 30 lines where lines 5-7 and 25-27 are changed
+    // This produces a separator ("...") between the two change regions
+    var chunk_entries1: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries1.deinit(allocator);
+
+    // First chunk: change at line 5-7 (0-based: 4-6)
+    for (4..7) |line_num| {
+        try chunk_entries1.append(allocator, .{
+            .lhs = .{ .line_number = @intCast(line_num), .changes = &.{} },
+            .rhs = .{ .line_number = @intCast(line_num), .changes = &.{} },
+        });
+    }
+
+    var chunk_entries2: std.ArrayList(difft.DiffEntry) = .empty;
+    defer chunk_entries2.deinit(allocator);
+
+    // Second chunk: change at line 25-27 (0-based: 24-26)
+    for (24..27) |line_num| {
+        try chunk_entries2.append(allocator, .{
+            .lhs = .{ .line_number = @intCast(line_num), .changes = &.{} },
+            .rhs = .{ .line_number = @intCast(line_num), .changes = &.{} },
+        });
+    }
+
+    var chunks: std.ArrayList([]const difft.DiffEntry) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.append(allocator, try chunk_entries1.toOwnedSlice(allocator));
+    try chunks.append(allocator, try chunk_entries2.toOwnedSlice(allocator));
+
+    const file_diff = difft.FileDiff{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .language = try allocator.dupe(u8, "Zig"),
+        .status = .changed,
+        .chunks = try chunks.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+
+    // Build 30-line old and new content
+    var old_content_builder: std.ArrayList(u8) = .empty;
+    defer old_content_builder.deinit(allocator);
+    var new_content_builder: std.ArrayList(u8) = .empty;
+    defer new_content_builder.deinit(allocator);
+
+    for (0..30) |i| {
+        if (i > 0) {
+            try old_content_builder.append(allocator, '\n');
+            try new_content_builder.append(allocator, '\n');
+        }
+        const old_line = try std.fmt.allocPrint(allocator, "old line {}", .{i + 1});
+        defer allocator.free(old_line);
+        try old_content_builder.appendSlice(allocator, old_line);
+
+        const new_line = try std.fmt.allocPrint(allocator, "new line {}", .{i + 1});
+        defer allocator.free(new_line);
+        try new_content_builder.appendSlice(allocator, new_line);
+    }
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .diff = file_diff,
+        .is_binary = false,
+        .old_content = try old_content_builder.toOwnedSlice(allocator),
+        .new_content = try new_content_builder.toOwnedSlice(allocator),
+    });
+}
+
+// =============================================================================
+// Cursor Movement Tests
+// =============================================================================
+
+test "cursor: arrow keys move cursor down/up" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Verify we have lines to navigate
+    try std.testing.expect(runner.getUI().diff_lines.items.len > 0);
+
+    // Initial cursor position should be 0
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    // Press down arrow to move down
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 1), runner.getUI().cursor_line);
+
+    // Press down arrow again
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 2), runner.getUI().cursor_line);
+
+    // Press up arrow to move up
+    try runner.sendUp();
+    try std.testing.expectEqual(@as(usize, 1), runner.getUI().cursor_line);
+
+    // Press up arrow again
+    try runner.sendUp();
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+}
+
+
+test "cursor: stays within upper bound (can't go below 0)" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 5);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Cursor starts at 0
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    // Press up arrow multiple times - should stay at 0
+    try runner.sendUp();
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    try runner.sendUp();
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    try runner.sendUp();
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+}
+
+test "cursor: stays within lower bound (can't exceed row_count - 1)" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 5);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const row_count = runner.getUI().diff_lines.items.len;
+    try std.testing.expect(row_count == 5);
+
+    // Move to the last line using down arrows
+    for (0..10) |_| {
+        try runner.sendDown();
+    }
+
+    // Should be at the last line (row_count - 1)
+    try std.testing.expectEqual(row_count - 1, runner.getUI().cursor_line);
+
+    // Try to move past - should stay at last line
+    try runner.sendDown();
+    try std.testing.expectEqual(row_count - 1, runner.getUI().cursor_line);
+
+    try runner.sendDown();
+    try std.testing.expectEqual(row_count - 1, runner.getUI().cursor_line);
+}
+
+test "cursor: 'g' goes to first line" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Move to middle of file using down arrows
+    for (0..5) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 5), runner.getUI().cursor_line);
+
+    // Press 'g' to go to first line
+    try runner.sendChar('g');
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+}
+
+test "cursor: 'G' goes to last line" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const row_count = runner.getUI().diff_lines.items.len;
+
+    // Cursor starts at 0
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    // Press 'G' to go to last line
+    try runner.sendChar('G');
+    try std.testing.expectEqual(row_count - 1, runner.getUI().cursor_line);
+}
+
+test "cursor: skips non-selectable separator rows" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithSeparators(allocator, &session);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Find a separator line (non-selectable)
+    var has_separator = false;
+    var separator_idx: usize = 0;
+    for (runner.getUI().diff_lines.items, 0..) |line, idx| {
+        if (!line.selectable) {
+            has_separator = true;
+            separator_idx = idx;
+            break;
+        }
+    }
+
+    // If there's a separator, verify cursor skips it
+    if (has_separator) {
+        // Move cursor to just before separator
+        runner.getUI().cursor_line = if (separator_idx > 0) separator_idx - 1 else 0;
+
+        // Move down - should skip separator
+        try runner.sendDown();
+        try std.testing.expect(runner.getUI().cursor_line != separator_idx);
+
+        // If we landed after separator, verify
+        if (runner.getUI().cursor_line > separator_idx) {
+            // Moving back up should also skip separator
+            try runner.sendUp();
+            try std.testing.expect(runner.getUI().cursor_line != separator_idx);
+        }
+    }
+}
+
+test "cursor: page down ('f') moves by 20 lines" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // Create file with enough lines for page movement
+    try createTestFileWithLines(allocator, &session, 50);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Cursor starts at 0
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    // Press 'f' for page down
+    try runner.sendChar('f');
+
+    // Should move by approximately 20 lines (may be adjusted for selectability)
+    try std.testing.expect(runner.getUI().cursor_line >= 15);
+    try std.testing.expect(runner.getUI().cursor_line <= 25);
+}
+
+test "cursor: page up ('p') moves by 20 lines" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 50);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // First go to line 30
+    runner.getUI().cursor_line = 30;
+
+    // Press 'p' for page up
+    try runner.sendChar('p');
+
+    // Should move back by approximately 20 lines
+    try std.testing.expect(runner.getUI().cursor_line >= 5);
+    try std.testing.expect(runner.getUI().cursor_line <= 15);
+}
+
+test "cursor: page up at top stays at 0" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 50);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start at line 5
+    runner.getUI().cursor_line = 5;
+
+    // Press 'p' for page up - should go to 0 since 5 < 20
+    try runner.sendChar('p');
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+}
+
+test "cursor: page down at bottom stays at last line" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 30);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const row_count = runner.getUI().diff_lines.items.len;
+
+    // Move to near the end
+    runner.getUI().cursor_line = row_count - 5;
+
+    // Press 'f' for page down - should go to last line
+    try runner.sendChar('f');
+    try std.testing.expectEqual(row_count - 1, runner.getUI().cursor_line);
+}
+
+test "cursor: movement works with empty file" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    // No files added - empty session
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    // Don't call buildDiffLines - no file
+
+    // Cursor should be at 0
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    // Movement commands should not crash with empty content
+    try runner.sendDown();
+    try runner.sendUp();
+    try runner.sendChar('g');
+    try runner.sendChar('G');
+    try runner.sendChar('f');
+    try runner.sendChar('p');
+
+    // Cursor should still be at 0
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+}
+
+test "cursor: movement works with single line file" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 1);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    try std.testing.expectEqual(@as(usize, 1), runner.getUI().diff_lines.items.len);
+
+    // All movements should keep cursor at 0
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    try runner.sendUp();
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    try runner.sendChar('g');
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    try runner.sendChar('G');
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+}
+
+test "cursor: unified view mode navigation" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    // Switch to unified view mode
+    runner.getUI().view_mode = .unified;
+    try runner.getUI().buildDiffLines();
+
+    // Navigate in unified mode
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 1), runner.getUI().cursor_line);
+
+    try runner.sendChar('G');
+    const row_count = runner.getUI().diff_lines.items.len;
+    try std.testing.expectEqual(row_count - 1, runner.getUI().cursor_line);
+}
+
+test "cursor: split view mode navigation" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    // Ensure split view mode (default)
+    runner.getUI().view_mode = .split;
+    try runner.getUI().buildDiffLines();
+
+    // Navigate in split mode
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    try runner.sendDown();
+    try std.testing.expectEqual(@as(usize, 1), runner.getUI().cursor_line);
+
+    try runner.sendChar('G');
+    const row_count = runner.getUI().split_rows.items.len;
+    try std.testing.expectEqual(row_count - 1, runner.getUI().cursor_line);
+}
+
+// =============================================================================
+// Selection System Tests
+// =============================================================================
+
+test "selection: space bar toggles selection_start" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Initially no selection
+    try std.testing.expect(runner.getUI().selection_start == null);
+
+    // Press space to start selection at current position
+    try runner.sendSpace();
+    try std.testing.expect(runner.getUI().selection_start != null);
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().selection_start.?);
+
+    // Press space again to toggle off
+    try runner.sendSpace();
+    try std.testing.expect(runner.getUI().selection_start == null);
+}
+
+test "selection: shift+down extends selection" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Initially no selection
+    try std.testing.expect(runner.getUI().selection_start == null);
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().cursor_line);
+
+    // Shift+Down should start selection and move cursor
+    try runner.sendShiftDown();
+    try std.testing.expect(runner.getUI().selection_start != null);
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().selection_start.?);
+    try std.testing.expectEqual(@as(usize, 1), runner.getUI().cursor_line);
+
+    // Another Shift+Down extends selection
+    try runner.sendShiftDown();
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().selection_start.?); // start unchanged
+    try std.testing.expectEqual(@as(usize, 2), runner.getUI().cursor_line);
+}
+
+test "selection: shift+up extends selection" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Move to middle first
+    for (0..5) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 5), runner.getUI().cursor_line);
+    try std.testing.expect(runner.getUI().selection_start == null);
+
+    // Shift+Up should start selection and move cursor
+    try runner.sendShiftUp();
+    try std.testing.expect(runner.getUI().selection_start != null);
+    try std.testing.expectEqual(@as(usize, 5), runner.getUI().selection_start.?);
+    try std.testing.expectEqual(@as(usize, 4), runner.getUI().cursor_line);
+
+    // Another Shift+Up extends selection
+    try runner.sendShiftUp();
+    try std.testing.expectEqual(@as(usize, 5), runner.getUI().selection_start.?); // start unchanged
+    try std.testing.expectEqual(@as(usize, 3), runner.getUI().cursor_line);
+}
+
+test "selection: plain arrow movement clears selection" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start a selection
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try std.testing.expect(runner.getUI().selection_start != null);
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().selection_start.?);
+    try std.testing.expectEqual(@as(usize, 2), runner.getUI().cursor_line);
+
+    // Plain down (no shift) clears selection
+    try runner.sendDown();
+    try std.testing.expect(runner.getUI().selection_start == null);
+    try std.testing.expectEqual(@as(usize, 3), runner.getUI().cursor_line);
+
+    // Start another selection
+    try runner.sendShiftUp();
+    try std.testing.expect(runner.getUI().selection_start != null);
+
+    // Plain up clears selection
+    try runner.sendUp();
+    try std.testing.expect(runner.getUI().selection_start == null);
+}
+
+test "selection: escape clears selection" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start a selection
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try std.testing.expect(runner.getUI().selection_start != null);
+
+    // Escape clears selection
+    try runner.sendEscape();
+    try std.testing.expect(runner.getUI().selection_start == null);
+}
+
+test "selection: selection range computes min/max correctly" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Move to middle, then select upward (selection_start > cursor_line)
+    for (0..5) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 5), runner.getUI().cursor_line);
+
+    // Select upward
+    try runner.sendShiftUp();
+    try runner.sendShiftUp();
+    try std.testing.expectEqual(@as(usize, 5), runner.getUI().selection_start.?);
+    try std.testing.expectEqual(@as(usize, 3), runner.getUI().cursor_line);
+
+    // The selection range should be [3, 5] (min cursor, max selection_start)
+    const start = runner.getUI().selection_start.?;
+    const cursor = runner.getUI().cursor_line;
+    const min_line = @min(start, cursor);
+    const max_line = @max(start, cursor);
+    try std.testing.expectEqual(@as(usize, 3), min_line);
+    try std.testing.expectEqual(@as(usize, 5), max_line);
+}
+
+test "selection: selection with shift+pagedown" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 50);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Initially no selection
+    try std.testing.expect(runner.getUI().selection_start == null);
+
+    // Shift+f (page down with shift) should start selection
+    try runner.sendKey(.{ .codepoint = 'f', .mods = .{ .shift = true } });
+    try std.testing.expect(runner.getUI().selection_start != null);
+    try std.testing.expectEqual(@as(usize, 0), runner.getUI().selection_start.?);
+    try std.testing.expect(runner.getUI().cursor_line > 10); // Should have moved significantly
+}
+
+test "selection: selection with shift+pageup" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 50);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Move to middle
+    runner.getUI().cursor_line = 30;
+
+    // Shift+p (page up with shift) should start selection
+    try runner.sendKey(.{ .codepoint = 'p', .mods = .{ .shift = true } });
+    try std.testing.expect(runner.getUI().selection_start != null);
+    try std.testing.expectEqual(@as(usize, 30), runner.getUI().selection_start.?);
+    try std.testing.expect(runner.getUI().cursor_line < 20); // Should have moved up
+}
+
+test "selection: selection persists while extending with shift" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 20);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Start selection with shift+down
+    try runner.sendShiftDown();
+    const initial_start = runner.getUI().selection_start;
+    try std.testing.expect(initial_start != null);
+
+    // Multiple shift+down should not change selection_start
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+    try runner.sendShiftDown();
+
+    try std.testing.expectEqual(initial_start, runner.getUI().selection_start);
+    try std.testing.expectEqual(@as(usize, 4), runner.getUI().cursor_line);
+}
+
+test "selection: space at different cursor positions" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithLines(allocator, &session, 10);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    // Move to line 3
+    for (0..3) |_| {
+        try runner.sendDown();
+    }
+    try std.testing.expectEqual(@as(usize, 3), runner.getUI().cursor_line);
+
+    // Toggle selection at line 3
+    try runner.sendSpace();
+    try std.testing.expect(runner.getUI().selection_start != null);
+    try std.testing.expectEqual(@as(usize, 3), runner.getUI().selection_start.?);
+
+    // Toggle off
+    try runner.sendSpace();
+    try std.testing.expect(runner.getUI().selection_start == null);
+
+    // Move to line 7 and toggle again
+    for (0..4) |_| {
+        try runner.sendDown();
+    }
+    try runner.sendSpace();
+    try std.testing.expectEqual(@as(usize, 7), runner.getUI().selection_start.?);
 }

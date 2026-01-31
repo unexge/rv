@@ -1048,7 +1048,7 @@ pub const UI = struct {
         }
     }
 
-    fn handleKeyPress(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+    pub fn handleKeyPress(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
         switch (self.mode) {
             .normal => try self.handleNormalKey(ctx, key),
             .comment_input => try self.handleCommentInputKey(ctx, key),

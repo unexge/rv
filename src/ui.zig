@@ -382,41 +382,54 @@ pub const UI = struct {
 
         // Initialize syntax highlighter for this file (new content)
         if (highlight.Language.fromPath(file.path)) |lang| {
-            if (highlight.Highlighter.init(self.allocator, lang)) |hl| {
-                self.highlighter = hl;
-                // Highlight the new content (what we display for context lines)
-                if (self.highlighter.?.highlight(file.new_content)) |spans| {
-                    self.syntax_spans = spans;
+            // Only highlight if new_content is not empty
+            if (file.new_content.len > 0) {
+                if (highlight.Highlighter.init(self.allocator, lang)) |hl| {
+                    self.highlighter = hl;
+                    // Highlight the new content (what we display for context lines)
+                    if (self.highlighter.?.highlight(file.new_content)) |spans| {
+                        self.syntax_spans = spans;
+                    } else |_| {
+                        // Highlighting failed, continue without it
+                    }
                 } else |_| {
-                    // Highlighting failed, continue without it
+                    // Language not supported or init failed
                 }
-            } else |_| {
-                // Language not supported or init failed
             }
 
             // Also highlight old content for split view
-            if (highlight.Highlighter.init(self.allocator, lang)) |hl| {
-                self.old_highlighter = hl;
-                if (self.old_highlighter.?.highlight(file.old_content)) |spans| {
-                    self.old_syntax_spans = spans;
+            // Only highlight if old_content is not empty
+            if (file.old_content.len > 0) {
+                if (highlight.Highlighter.init(self.allocator, lang)) |hl| {
+                    self.old_highlighter = hl;
+                    if (self.old_highlighter.?.highlight(file.old_content)) |spans| {
+                        self.old_syntax_spans = spans;
+                    } else |_| {
+                        // Highlighting failed, continue without it
+                    }
                 } else |_| {
-                    // Highlighting failed, continue without it
+                    // Language not supported or init failed
                 }
-            } else |_| {
-                // Language not supported or init failed
             }
 
             // Detect collapsible regions for summary mode
             self.freeCollapseRegions();
-            if (collapse.CollapseDetector.init(self.allocator, lang)) |detector_val| {
-                var detector = detector_val;
-                defer detector.deinit();
-                if (detector.findRegions(file.new_content)) |regions| {
-                    self.collapse_regions = regions;
+            // Only detect regions if content is not empty
+            if (file.new_content.len > 0) {
+                if (collapse.CollapseDetector.init(self.allocator, lang)) |detector_val| {
+                    var detector = detector_val;
+                    defer detector.deinit();
+                    if (detector.findRegions(file.new_content)) |regions| {
+                        self.collapse_regions = regions;
+                    } else |_| {
+                        // Detection failed, continue without collapse
+                    }
                 } else |_| {
-                    // Detection failed, continue without collapse
+                    // Language not supported
                 }
-                // Also detect for old content
+            }
+            // Also detect for old content
+            if (file.old_content.len > 0) {
                 if (collapse.CollapseDetector.init(self.allocator, lang)) |old_detector_val| {
                     var old_detector = old_detector_val;
                     defer old_detector.deinit();
@@ -424,8 +437,6 @@ pub const UI = struct {
                         self.old_collapse_regions = old_regions;
                     } else |_| {}
                 } else |_| {}
-            } else |_| {
-                // Language not supported
             }
         }
 

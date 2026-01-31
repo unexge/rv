@@ -100,6 +100,11 @@ pub const CollapseDetector = struct {
 
     /// Find all collapsible regions in the source code (up to 3 levels deep)
     pub fn findRegions(self: *CollapseDetector, source: []const u8) Error![]CollapsibleRegion {
+        // Return empty slice for empty source
+        if (source.len == 0) {
+            return &.{};
+        }
+        
         const tree = self.parser.parseString(null, source) catch return error.ParseFailed;
         defer tree.destroy();
 

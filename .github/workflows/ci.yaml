@@ -11,7 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
-      - run: |
-          sudo apt-get update
-          sudo apt-get install -y difftastic
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - run: cargo install difftastic
       - run: zig build test --summary all

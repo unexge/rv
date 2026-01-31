@@ -33,6 +33,20 @@ zig build test         # Run tests
 - Return meaningful error messages
 - Validate JSON parsing
 
+## Commit Conventions
+
+Use [Conventional Commits](https://www.conventionalcommits.org/) format:
+
+- `feat:` - New features
+- `fix:` - Bug fixes
+- `test:` - Adding or updating tests
+- `chore:` - Maintenance tasks
+- `ci:` - CI/CD changes
+- `docs:` - Documentation changes
+- `refactor:` - Code refactoring
+
+Example: `feat: add support for collapsing test blocks`
+
 ## Testing
 
 Add tests to each module:

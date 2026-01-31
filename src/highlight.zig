@@ -106,6 +106,18 @@ pub const Highlighter = struct {
             return &.{};
         }
         
+        // Return empty slice for very small source (just whitespace/newlines)
+        var has_content = false;
+        for (source) |ch| {
+            if (ch > 32) {
+                has_content = true;
+                break;
+            }
+        }
+        if (!has_content) {
+            return &.{};
+        }
+        
         const tree = self.parser.parseString(null, source) catch return error.ParseFailed;
         defer tree.destroy();
 

@@ -14,6 +14,13 @@ pub const CommentSide = enum {
     }
 };
 
+/// Review mode indicating what type of changes are being reviewed
+pub const ReviewMode = enum {
+    unstaged, // Working tree changes (can be staged)
+    staged, // Already staged changes (cannot be staged again)
+    commit, // Viewing a specific commit (cannot be staged)
+};
+
 pub const Comment = struct {
     file_path: []const u8,
     side: CommentSide,
@@ -25,6 +32,18 @@ pub const Comment = struct {
     pub fn deinit(self: *Comment) void {
         self.allocator.free(self.file_path);
         self.allocator.free(self.text);
+    }
+};
+
+pub const StagedRange = struct {
+    file_path: []const u8,
+    line_start: u32,
+    line_end: u32,
+    side: CommentSide,
+    allocator: Allocator,
+
+    pub fn deinit(self: *StagedRange) void {
+        self.allocator.free(self.file_path);
     }
 };
 
@@ -40,6 +59,7 @@ pub const ReviewSession = struct {
     allocator: Allocator,
     files: []ReviewedFile,
     comments: std.ArrayList(Comment),
+    staged_ranges: std.ArrayList(StagedRange),
     current_file_idx: usize,
 
     pub fn init(allocator: Allocator) ReviewSession {
@@ -47,6 +67,7 @@ pub const ReviewSession = struct {
             .allocator = allocator,
             .files = &.{},
             .comments = .empty,
+            .staged_ranges = .empty,
             .current_file_idx = 0,
         };
     }
@@ -56,6 +77,11 @@ pub const ReviewSession = struct {
             comment.deinit();
         }
         self.comments.deinit(self.allocator);
+
+        for (self.staged_ranges.items) |*range| {
+            range.deinit();
+        }
+        self.staged_ranges.deinit(self.allocator);
 
         for (self.files) |*file| {
             self.allocator.free(file.path);
@@ -79,6 +105,38 @@ pub const ReviewSession = struct {
 
     pub fn addComment(self: *ReviewSession, comment: Comment) !void {
         try self.comments.append(self.allocator, comment);
+    }
+
+    pub fn addStagedRange(self: *ReviewSession, range: StagedRange) !void {
+        try self.staged_ranges.append(self.allocator, range);
+    }
+
+    pub fn isStagedLine(self: *ReviewSession, file_path: []const u8, line_num: u32, side: CommentSide) bool {
+        for (self.staged_ranges.items) |range| {
+            if (range.side == side and
+                std.mem.eql(u8, range.file_path, file_path) and
+                line_num >= range.line_start and
+                line_num <= range.line_end)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn clearStagedRanges(self: *ReviewSession) void {
+        for (self.staged_ranges.items) |*range| {
+            range.deinit();
+        }
+        self.staged_ranges.clearRetainingCapacity();
+    }
+
+    pub fn getStagedLineCount(self: *ReviewSession) usize {
+        var count: usize = 0;
+        for (self.staged_ranges.items) |range| {
+            count += @as(usize, range.line_end - range.line_start + 1);
+        }
+        return count;
     }
 
     pub fn removeComment(self: *ReviewSession, index: usize) void {
@@ -292,4 +350,131 @@ test "file navigation" {
     session.prevFile();
     session.goToFile(5);
     try std.testing.expectEqual(@as(usize, 0), session.current_file_idx);
+}
+
+test "StagedRange addStagedRange and isStagedLine" {
+    const allocator = std.testing.allocator;
+
+    var session = ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try session.addStagedRange(.{
+        .file_path = try allocator.dupe(u8, "src/main.zig"),
+        .line_start = 10,
+        .line_end = 20,
+        .side = .new,
+        .allocator = allocator,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), session.staged_ranges.items.len);
+
+    // Lines within range
+    try std.testing.expect(session.isStagedLine("src/main.zig", 10, .new));
+    try std.testing.expect(session.isStagedLine("src/main.zig", 15, .new));
+    try std.testing.expect(session.isStagedLine("src/main.zig", 20, .new));
+
+    // Lines outside range
+    try std.testing.expect(!session.isStagedLine("src/main.zig", 9, .new));
+    try std.testing.expect(!session.isStagedLine("src/main.zig", 21, .new));
+
+    // Wrong side
+    try std.testing.expect(!session.isStagedLine("src/main.zig", 15, .old));
+
+    // Wrong file
+    try std.testing.expect(!session.isStagedLine("src/other.zig", 15, .new));
+}
+
+test "StagedRange overlapping ranges" {
+    const allocator = std.testing.allocator;
+
+    var session = ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try session.addStagedRange(.{
+        .file_path = try allocator.dupe(u8, "file.zig"),
+        .line_start = 10,
+        .line_end = 20,
+        .side = .new,
+        .allocator = allocator,
+    });
+
+    try session.addStagedRange(.{
+        .file_path = try allocator.dupe(u8, "file.zig"),
+        .line_start = 15,
+        .line_end = 25,
+        .side = .new,
+        .allocator = allocator,
+    });
+
+    // Line in first range only
+    try std.testing.expect(session.isStagedLine("file.zig", 12, .new));
+
+    // Line in overlap
+    try std.testing.expect(session.isStagedLine("file.zig", 18, .new));
+
+    // Line in second range only
+    try std.testing.expect(session.isStagedLine("file.zig", 23, .new));
+
+    // Line outside both
+    try std.testing.expect(!session.isStagedLine("file.zig", 5, .new));
+    try std.testing.expect(!session.isStagedLine("file.zig", 30, .new));
+}
+
+test "StagedRange clearStagedRanges" {
+    const allocator = std.testing.allocator;
+
+    var session = ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try session.addStagedRange(.{
+        .file_path = try allocator.dupe(u8, "file1.zig"),
+        .line_start = 1,
+        .line_end = 10,
+        .side = .new,
+        .allocator = allocator,
+    });
+
+    try session.addStagedRange(.{
+        .file_path = try allocator.dupe(u8, "file2.zig"),
+        .line_start = 5,
+        .line_end = 15,
+        .side = .old,
+        .allocator = allocator,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), session.staged_ranges.items.len);
+
+    session.clearStagedRanges();
+
+    try std.testing.expectEqual(@as(usize, 0), session.staged_ranges.items.len);
+    try std.testing.expect(!session.isStagedLine("file1.zig", 5, .new));
+}
+
+test "StagedRange getStagedLineCount" {
+    const allocator = std.testing.allocator;
+
+    var session = ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), session.getStagedLineCount());
+
+    try session.addStagedRange(.{
+        .file_path = try allocator.dupe(u8, "file.zig"),
+        .line_start = 10,
+        .line_end = 14,
+        .side = .new,
+        .allocator = allocator,
+    });
+
+    try std.testing.expectEqual(@as(usize, 5), session.getStagedLineCount());
+
+    try session.addStagedRange(.{
+        .file_path = try allocator.dupe(u8, "file.zig"),
+        .line_start = 20,
+        .line_end = 22,
+        .side = .old,
+        .allocator = allocator,
+    });
+
+    try std.testing.expectEqual(@as(usize, 8), session.getStagedLineCount());
 }

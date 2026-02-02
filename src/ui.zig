@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const review = @import("review.zig");
 const difft = @import("difft.zig");
+const git = @import("git.zig");
 const highlight = @import("highlight.zig");
 const collapse = @import("collapse.zig");
 const pi = @import("pi.zig");
@@ -116,6 +117,8 @@ pub const UI = struct {
     summary_mode: bool = true, // Start in summary mode (collapsed)
     collapse_regions: []collapse.CollapsibleRegion = &.{}, // Collapsible regions for current file
     old_collapse_regions: []collapse.CollapsibleRegion = &.{}, // Regions for old file content
+    // Review mode (affects whether staging is allowed)
+    review_mode: review.ReviewMode = .unstaged,
 
     const InputBuffer = struct {
         buffer: [4096]u8 = undefined,
@@ -170,6 +173,10 @@ pub const UI = struct {
 
     pub fn setPiBin(self: *UI, path: ?[]const u8) void {
         self.pi_bin = path;
+    }
+
+    pub fn setReviewMode(self: *UI, mode: review.ReviewMode) void {
+        self.review_mode = mode;
     }
 
     pub fn deinit(self: *UI) void {
@@ -1255,19 +1262,24 @@ pub const UI = struct {
                 self.goToBottom();
                 return ctx.consumeAndRedraw();
             },
-            's' => {
-                // Toggle summary mode (collapse/expand all)
-                self.summary_mode = !self.summary_mode;
-                // Update all regions' collapsed state
-                for (self.collapse_regions) |*region| {
-                    region.collapsed = self.summary_mode;
+            's', 'S' => {
+                if (key.mods.shift or cp == 'S') {
+                    // Shift+s or S: Stage selected lines (only in unstaged mode)
+                    try self.submitStage();
+                } else {
+                    // Plain s: Toggle summary mode (collapse/expand all)
+                    self.summary_mode = !self.summary_mode;
+                    // Update all regions' collapsed state
+                    for (self.collapse_regions) |*region| {
+                        region.collapsed = self.summary_mode;
+                    }
+                    for (self.old_collapse_regions) |*region| {
+                        region.collapsed = self.summary_mode;
+                    }
+                    // Adjust cursor if it's now on a hidden line
+                    self.adjustCursorAfterCollapse();
+                    self.setMessage(if (self.summary_mode) "Summary mode (collapsed)" else "Expanded view", false);
                 }
-                for (self.old_collapse_regions) |*region| {
-                    region.collapsed = self.summary_mode;
-                }
-                // Adjust cursor if it's now on a hidden line
-                self.adjustCursorAfterCollapse();
-                self.setMessage(if (self.summary_mode) "Summary mode (collapsed)" else "Expanded view", false);
                 return ctx.consumeAndRedraw();
             },
             vaxis.Key.enter => {
@@ -1536,6 +1548,69 @@ pub const UI = struct {
         self.selection_start = null;
         self.mode = .normal;
         self.setMessage("Comment added", false);
+    }
+
+    fn submitStage(self: *UI) !void {
+        // Check if we're in a mode where staging is allowed
+        if (self.review_mode != .unstaged) {
+            const msg = switch (self.review_mode) {
+                .staged => "Cannot stage: already viewing staged changes",
+                .commit => "Cannot stage: viewing a commit",
+                .unstaged => unreachable,
+            };
+            self.setMessage(msg, true);
+            return;
+        }
+
+        const file = self.session.currentFile() orelse {
+            self.setMessage("No file selected", true);
+            return;
+        };
+
+        // Get line range from cursor/selection
+        const line_start: u32 = @intCast(self.getLineNumber() orelse {
+            self.setMessage("No line at cursor", true);
+            return;
+        });
+        const line_end: u32 = if (self.selection_start) |sel|
+            @intCast(self.getLineNumberAt(sel) orelse line_start)
+        else
+            line_start;
+
+        const start = @min(line_start, line_end);
+        const end = @max(line_start, line_end);
+
+        // Stage the lines using git
+        git.stageLineRange(self.allocator, self.io, file.path, start, end) catch |err| {
+            const msg = switch (err) {
+                error.CommandFailed => "Git staging failed",
+                error.ParseError => "Cannot stage binary files",
+                else => "Staging error",
+            };
+            self.setMessage(msg, true);
+            return;
+        };
+
+        // Record the staged range in the session
+        const staged_range = review.StagedRange{
+            .file_path = try self.allocator.dupe(u8, file.path),
+            .line_start = start,
+            .line_end = end,
+            .side = self.focus_side,
+            .allocator = self.allocator,
+        };
+        try self.session.addStagedRange(staged_range);
+
+        // Clear selection and show success
+        self.selection_start = null;
+
+        // Format success message
+        var msg_buf: [64]u8 = undefined;
+        const msg = if (start == end)
+            std.fmt.bufPrint(&msg_buf, "Staged line {d}", .{start}) catch "Staged"
+        else
+            std.fmt.bufPrint(&msg_buf, "Staged lines {d}-{d}", .{ start, end }) catch "Staged";
+        self.setMessage(msg, false);
     }
 
     fn startAskRequest(self: *UI) !void {
@@ -2262,6 +2337,13 @@ pub const UI = struct {
             else
                 false;
 
+            // Check if this line is staged
+            const line_num = diff_line.new_line_num orelse diff_line.old_line_num;
+            const is_staged = if (line_num) |num|
+                self.session.isStagedLine(file.path, num, self.focus_side)
+            else
+                false;
+
             // Determine style and prefix based on line type
             // For partial changes: unchanged parts in white, changed parts in color (red/green)
             // For full line changes: entire line in color
@@ -2315,6 +2397,19 @@ pub const UI = struct {
                 style.reverse = true;
             } else if (in_selection) {
                 style.bg = .{ .rgb = .{ 0x30, 0x30, 0x50 } }; // Subtle highlight
+            }
+
+            // Apply staged styling - use muted colors to de-emphasize
+            if (is_staged and !is_selected) {
+                const staged_color: vaxis.Color = .{ .rgb = .{ 0x50, 0x70, 0x50 } }; // Muted green
+                style.fg = staged_color;
+                novel_style.fg = staged_color;
+                novel_style.bold = false;
+                old_style.fg = staged_color;
+                old_style.strikethrough = false;
+                old_novel_style.fg = staged_color;
+                old_novel_style.bold = false;
+                old_novel_style.strikethrough = false;
             }
 
             // Line number styles
@@ -2472,12 +2567,24 @@ pub const UI = struct {
                 col += 1;
             }
 
-            // Diff prefix (+, -, or space)
+            // Diff prefix (+, -, or space) - show checkmark for staged lines
             if (col < width) {
-                surface.writeCell(col, display_row, .{
-                    .char = .{ .grapheme = grapheme(prefix) },
-                    .style = style,
-                });
+                if (is_staged) {
+                    // Show checkmark for staged lines
+                    const staged_style: vaxis.Style = .{
+                        .fg = .{ .rgb = .{ 0x00, 0xd7, 0x00 } }, // Green checkmark
+                        .bold = true,
+                    };
+                    surface.writeCell(col, display_row, .{
+                        .char = .{ .grapheme = "✓" },
+                        .style = if (is_selected) vaxis.Style{ .reverse = true } else staged_style,
+                    });
+                } else {
+                    surface.writeCell(col, display_row, .{
+                        .char = .{ .grapheme = grapheme(prefix) },
+                        .style = style,
+                    });
+                }
                 col += 1;
             }
 
@@ -3429,6 +3536,7 @@ pub const UI = struct {
             "  Actions:",
             "    c                   Add comment at cursor/selection",
             "    a                   Ask Pi about cursor/selection",
+            "    S                   Stage selected lines (unstaged mode only)",
             "    Space               Toggle line selection",
             "    Esc                 Clear selection/message",
             "    q                   Quit and export markdown",

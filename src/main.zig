@@ -354,6 +354,15 @@ pub fn main(init: std.process.Init) !void {
     // Set pi binary path from environment (cached at startup)
     tui.setPiBin(init.environ_map.get("RV_PI_BIN"));
 
+    // Set review mode based on args
+    if (args.commit != null) {
+        tui.setReviewMode(.commit);
+    } else if (args.staged) {
+        tui.setReviewMode(.staged);
+    } else {
+        tui.setReviewMode(.unstaged);
+    }
+
     var run_error: ?anyerror = null;
     tui.run(init) catch |err| {
         run_error = err;

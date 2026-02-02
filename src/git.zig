@@ -296,3 +296,477 @@ test "isBinaryFile" {
     try std.testing.expect(isBinaryFile("hello\x00world"));
     try std.testing.expect(!isBinaryFile(""));
 }
+
+/// Represents a parsed diff hunk
+const DiffHunk = struct {
+    header: []const u8,
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+    content: []const u8,
+};
+
+/// Parse a unified diff hunk header like "@@ -1,3 +1,4 @@"
+fn parseHunkHeader(header: []const u8) ?struct { old_start: u32, old_count: u32, new_start: u32, new_count: u32 } {
+    if (!std.mem.startsWith(u8, header, "@@ -")) return null;
+
+    var rest = header[4..];
+
+    const old_start = std.fmt.parseInt(u32, parseNumber(rest), 10) catch return null;
+    rest = skipNumber(rest);
+
+    var old_count: u32 = 1;
+    if (rest.len > 0 and rest[0] == ',') {
+        rest = rest[1..];
+        old_count = std.fmt.parseInt(u32, parseNumber(rest), 10) catch return null;
+        rest = skipNumber(rest);
+    }
+
+    if (!std.mem.startsWith(u8, rest, " +")) return null;
+    rest = rest[2..];
+
+    const new_start = std.fmt.parseInt(u32, parseNumber(rest), 10) catch return null;
+    rest = skipNumber(rest);
+
+    var new_count: u32 = 1;
+    if (rest.len > 0 and rest[0] == ',') {
+        rest = rest[1..];
+        new_count = std.fmt.parseInt(u32, parseNumber(rest), 10) catch return null;
+    }
+
+    return .{ .old_start = old_start, .old_count = old_count, .new_start = new_start, .new_count = new_count };
+}
+
+fn parseNumber(s: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < s.len and (s[end] >= '0' and s[end] <= '9')) : (end += 1) {}
+    return s[0..end];
+}
+
+fn skipNumber(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len and (s[i] >= '0' and s[i] <= '9')) : (i += 1) {}
+    return s[i..];
+}
+
+/// Check if a hunk overlaps with the given line range (in new file coordinates)
+fn hunkOverlapsRange(new_start: u32, new_count: u32, range_start: u32, range_end: u32) bool {
+    if (new_count == 0) {
+        return new_start >= range_start and new_start <= range_end;
+    }
+    const hunk_end = new_start + new_count - 1;
+    return new_start <= range_end and hunk_end >= range_start;
+}
+
+/// Stage specific lines from a file to the git index
+/// Uses unified diff to extract hunks that overlap with the specified line range
+pub fn stageLineRange(
+    allocator: Allocator,
+    io: Io,
+    file_path: []const u8,
+    start_line: u32,
+    end_line: u32,
+) GitError!void {
+    const diff_result = try runCommandDirect(allocator, io, &.{ "git", "diff", "-U0", "--", file_path });
+    defer allocator.free(diff_result.stdout);
+
+    if (diff_result.exit_code != 0) {
+        return GitError.CommandFailed;
+    }
+
+    if (diff_result.stdout.len == 0) {
+        return;
+    }
+
+    if (isBinaryFile(diff_result.stdout)) {
+        return GitError.ParseError;
+    }
+
+    const patch = try buildPartialPatch(allocator, diff_result.stdout, start_line, end_line);
+    defer allocator.free(patch);
+
+    if (patch.len == 0) {
+        return;
+    }
+
+    try applyPatchToIndex(allocator, io, patch);
+}
+
+/// Build a partial patch containing only the specified lines from hunks
+/// This filters individual lines within hunks, not just whole hunks
+fn buildPartialPatch(allocator: Allocator, diff: []const u8, start_line: u32, end_line: u32) GitError![]u8 {
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+
+    var diff_lines = std.mem.splitScalar(u8, diff, '\n');
+    var header_lines: std.ArrayList([]const u8) = .empty;
+    defer header_lines.deinit(allocator);
+
+    var in_header = true;
+    var header_written = false;
+
+    // Collect all hunks first, then process them
+    var hunks: std.ArrayList(HunkData) = .empty;
+    defer {
+        for (hunks.items) |*h| {
+            h.lines.deinit(allocator);
+        }
+        hunks.deinit(allocator);
+    }
+
+    var current_hunk: ?HunkData = null;
+
+    while (diff_lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "@@")) {
+            // Save previous hunk
+            if (current_hunk) |h| {
+                try hunks.append(allocator, h);
+            }
+            // Start new hunk
+            const parsed = parseHunkHeader(line) orelse return GitError.ParseError;
+            current_hunk = HunkData{
+                .header = line,
+                .old_start = parsed.old_start,
+                .old_count = parsed.old_count,
+                .new_start = parsed.new_start,
+                .new_count = parsed.new_count,
+                .lines = .empty,
+            };
+            in_header = false;
+        } else if (in_header) {
+            try header_lines.append(allocator, line);
+        } else if (current_hunk != null) {
+            if (line.len > 0 and (line[0] == '+' or line[0] == '-' or line[0] == ' ' or line[0] == '\\')) {
+                try current_hunk.?.lines.append(allocator, line);
+            }
+        }
+    }
+    // Save last hunk
+    if (current_hunk) |h| {
+        try hunks.append(allocator, h);
+    }
+
+    // Process each hunk and filter lines
+    for (hunks.items) |hunk| {
+        const filtered = try filterHunkLines(allocator, hunk, start_line, end_line);
+        defer allocator.free(filtered.lines);
+
+        if (filtered.lines.len == 0) continue;
+
+        // Write header once
+        if (!header_written) {
+            for (header_lines.items) |h| {
+                try result.appendSlice(allocator, h);
+                try result.append(allocator, '\n');
+            }
+            header_written = true;
+        }
+
+        // Write new hunk header with adjusted counts
+        var hunk_header_buf: [64]u8 = undefined;
+        const hunk_header = std.fmt.bufPrint(&hunk_header_buf, "@@ -{d},{d} +{d},{d} @@\n", .{
+            filtered.old_start,
+            filtered.old_count,
+            filtered.new_start,
+            filtered.new_count,
+        }) catch return GitError.ParseError;
+        try result.appendSlice(allocator, hunk_header);
+
+        // Write filtered lines
+        try result.appendSlice(allocator, filtered.lines);
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+const HunkData = struct {
+    header: []const u8,
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+    lines: std.ArrayList([]const u8),
+};
+
+const FilteredHunk = struct {
+    old_start: u32,
+    old_count: u32,
+    new_start: u32,
+    new_count: u32,
+    lines: []u8,
+};
+
+/// Filter lines within a hunk to only include those in the specified range
+fn filterHunkLines(allocator: Allocator, hunk: HunkData, start_line: u32, end_line: u32) Allocator.Error!FilteredHunk {
+    var filtered_lines: std.ArrayList(u8) = .empty;
+    errdefer filtered_lines.deinit(allocator);
+
+    var new_line_num = hunk.new_start;
+    var old_line_num = hunk.old_start;
+
+    var old_count: u32 = 0;
+    var new_count: u32 = 0;
+    var first_old_line: ?u32 = null;
+    var first_new_line: ?u32 = null;
+
+    for (hunk.lines.items) |line| {
+        if (line.len == 0) continue;
+
+        const line_type = line[0];
+
+        // Track line numbers
+        const current_new_line = new_line_num;
+        const current_old_line = old_line_num;
+
+        switch (line_type) {
+            '+' => {
+                // Addition: only in new file
+                if (current_new_line >= start_line and current_new_line <= end_line) {
+                    try filtered_lines.appendSlice(allocator, line);
+                    try filtered_lines.append(allocator, '\n');
+                    new_count += 1;
+                    if (first_new_line == null) first_new_line = current_new_line;
+                }
+                new_line_num += 1;
+            },
+            '-' => {
+                // Deletion: only in old file
+                // Include deletions if they're adjacent to selected additions
+                // For simplicity, include if the corresponding new line position is in range
+                if (current_new_line >= start_line and current_new_line <= end_line + 1) {
+                    try filtered_lines.appendSlice(allocator, line);
+                    try filtered_lines.append(allocator, '\n');
+                    old_count += 1;
+                    if (first_old_line == null) first_old_line = current_old_line;
+                }
+                old_line_num += 1;
+            },
+            ' ' => {
+                // Context line: in both files
+                // Include context if it's adjacent to selected changes
+                if (current_new_line >= start_line and current_new_line <= end_line) {
+                    try filtered_lines.appendSlice(allocator, line);
+                    try filtered_lines.append(allocator, '\n');
+                    old_count += 1;
+                    new_count += 1;
+                    if (first_old_line == null) first_old_line = current_old_line;
+                    if (first_new_line == null) first_new_line = current_new_line;
+                }
+                new_line_num += 1;
+                old_line_num += 1;
+            },
+            '\\' => {
+                // "No newline at end of file" - include if we have any content
+                if (filtered_lines.items.len > 0) {
+                    try filtered_lines.appendSlice(allocator, line);
+                    try filtered_lines.append(allocator, '\n');
+                }
+            },
+            else => {},
+        }
+    }
+
+    return FilteredHunk{
+        .old_start = first_old_line orelse hunk.old_start,
+        .old_count = old_count,
+        .new_start = first_new_line orelse hunk.new_start,
+        .new_count = new_count,
+        .lines = try filtered_lines.toOwnedSlice(allocator),
+    };
+}
+
+/// Apply a patch to the git index using git apply --cached
+fn applyPatchToIndex(allocator: Allocator, io: Io, patch: []const u8) GitError!void {
+    const process = std.process;
+
+    var child = process.spawn(io, .{
+        .argv = &.{ "git", "apply", "--cached", "--unidiff-zero", "-" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return GitError.CommandFailed;
+
+    var stdin_file = child.stdin orelse return GitError.PipeFailed;
+    stdin_file.writeStreamingAll(io, patch) catch return GitError.CommandFailed;
+    stdin_file.close(io);
+    child.stdin = null;
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    child.collectOutput(allocator, &stdout, &stderr, 1024 * 1024) catch return GitError.CommandFailed;
+
+    const term = child.wait(io) catch return GitError.CommandFailed;
+    const exit_code = switch (term) {
+        .exited => |code| code,
+        else => return GitError.CommandFailed,
+    };
+
+    if (exit_code != 0) {
+        return GitError.CommandFailed;
+    }
+}
+
+test "parseHunkHeader" {
+    {
+        const result = parseHunkHeader("@@ -1,3 +1,4 @@").?;
+        try std.testing.expectEqual(@as(u32, 1), result.old_start);
+        try std.testing.expectEqual(@as(u32, 3), result.old_count);
+        try std.testing.expectEqual(@as(u32, 1), result.new_start);
+        try std.testing.expectEqual(@as(u32, 4), result.new_count);
+    }
+    {
+        const result = parseHunkHeader("@@ -10 +10,2 @@").?;
+        try std.testing.expectEqual(@as(u32, 10), result.old_start);
+        try std.testing.expectEqual(@as(u32, 1), result.old_count);
+        try std.testing.expectEqual(@as(u32, 10), result.new_start);
+        try std.testing.expectEqual(@as(u32, 2), result.new_count);
+    }
+    {
+        const result = parseHunkHeader("@@ -0,0 +1,5 @@").?;
+        try std.testing.expectEqual(@as(u32, 0), result.old_start);
+        try std.testing.expectEqual(@as(u32, 0), result.old_count);
+        try std.testing.expectEqual(@as(u32, 1), result.new_start);
+        try std.testing.expectEqual(@as(u32, 5), result.new_count);
+    }
+    try std.testing.expect(parseHunkHeader("not a header") == null);
+}
+
+test "hunkOverlapsRange" {
+    try std.testing.expect(hunkOverlapsRange(5, 3, 1, 10));
+    try std.testing.expect(hunkOverlapsRange(5, 3, 6, 10));
+    try std.testing.expect(hunkOverlapsRange(5, 3, 1, 5));
+    try std.testing.expect(!hunkOverlapsRange(5, 3, 10, 15));
+    try std.testing.expect(!hunkOverlapsRange(5, 3, 1, 4));
+    try std.testing.expect(hunkOverlapsRange(5, 0, 5, 10));
+    try std.testing.expect(!hunkOverlapsRange(5, 0, 6, 10));
+}
+
+test "buildPartialPatch - selects only specified lines" {
+    const allocator = std.testing.allocator;
+
+    // Diff with multiple additions in one hunk
+    const diff =
+        \\diff --git a/test.txt b/test.txt
+        \\index 1234567..abcdefg 100644
+        \\--- a/test.txt
+        \\+++ b/test.txt
+        \\@@ -1,0 +1,4 @@
+        \\+line 1
+        \\+line 2
+        \\+line 3
+        \\+line 4
+    ;
+
+    // Select only line 2
+    {
+        const patch = try buildPartialPatch(allocator, diff, 2, 2);
+        defer allocator.free(patch);
+        // Should contain only line 2
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 1") == null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 3") == null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 4") == null);
+    }
+
+    // Select lines 2-3
+    {
+        const patch = try buildPartialPatch(allocator, diff, 2, 3);
+        defer allocator.free(patch);
+        // Should contain lines 2 and 3
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 3") != null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 1") == null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 4") == null);
+    }
+
+    // Select all lines
+    {
+        const patch = try buildPartialPatch(allocator, diff, 1, 4);
+        defer allocator.free(patch);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 3") != null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+line 4") != null);
+    }
+
+    // Select no lines (out of range)
+    {
+        const patch = try buildPartialPatch(allocator, diff, 100, 200);
+        defer allocator.free(patch);
+        try std.testing.expectEqual(@as(usize, 0), patch.len);
+    }
+}
+
+test "buildPartialPatch - handles multiple hunks" {
+    const allocator = std.testing.allocator;
+
+    // Simpler test with two separate hunks, no context lines
+    const diff =
+        \\diff --git a/test.txt b/test.txt
+        \\index 1234567..abcdefg 100644
+        \\--- a/test.txt
+        \\+++ b/test.txt
+        \\@@ -0,0 +1,1 @@
+        \\+added line 1
+        \\@@ -10,0 +12,1 @@
+        \\+added line 12
+    ;
+
+    // Select only from first hunk (line 1)
+    {
+        const patch = try buildPartialPatch(allocator, diff, 1, 1);
+        defer allocator.free(patch);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+added line 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+added line 12") == null);
+    }
+
+    // Select only from second hunk (line 12)
+    {
+        const patch = try buildPartialPatch(allocator, diff, 12, 12);
+        defer allocator.free(patch);
+        // Use "+added line 1\n" to avoid matching "+added line 12"
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+added line 1\n") == null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+added line 12") != null);
+    }
+
+    // Select both hunks
+    {
+        const patch = try buildPartialPatch(allocator, diff, 1, 12);
+        defer allocator.free(patch);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+added line 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, patch, "+added line 12") != null);
+    }
+}
+
+test "filterHunkLines - filters additions correctly" {
+    const allocator = std.testing.allocator;
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    try lines.append(allocator, "+line 1");
+    try lines.append(allocator, "+line 2");
+    try lines.append(allocator, "+line 3");
+
+    const hunk = HunkData{
+        .header = "@@ -0,0 +1,3 @@",
+        .old_start = 0,
+        .old_count = 0,
+        .new_start = 1,
+        .new_count = 3,
+        .lines = lines,
+    };
+
+    // Select only line 2
+    const filtered = try filterHunkLines(allocator, hunk, 2, 2);
+    defer allocator.free(filtered.lines);
+
+    try std.testing.expect(std.mem.indexOf(u8, filtered.lines, "+line 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered.lines, "+line 1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered.lines, "+line 3") == null);
+    try std.testing.expectEqual(@as(u32, 1), filtered.new_count);
+    try std.testing.expectEqual(@as(u32, 0), filtered.old_count);
+}

@@ -7,6 +7,7 @@ const git = @import("git.zig");
 const highlight = @import("highlight.zig");
 const collapse = @import("collapse.zig");
 const pi = @import("pi.zig");
+const summary = @import("summary.zig");
 
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
@@ -17,7 +18,7 @@ pub const UIError = error{
     TtyError,
 } || Allocator.Error;
 
-const Mode = enum {
+pub const Mode = enum {
     normal,
     comment_input,
     ask_input,
@@ -119,6 +120,8 @@ pub const UI = struct {
     old_collapse_regions: []collapse.CollapsibleRegion = &.{}, // Regions for old file content
     // Review mode (affects whether staging is allowed)
     review_mode: review.ReviewMode = .unstaged,
+    // Summary view state (semantic overview of changes)
+    session_summary: ?summary.SessionSummary = null,
 
     const InputBuffer = struct {
         buffer: [4096]u8 = undefined,
@@ -243,6 +246,10 @@ pub const UI = struct {
         }
         // Clean up collapse regions
         self.freeCollapseRegions();
+        // Clean up summary view state
+        if (self.session_summary) |*s| {
+            s.deinit();
+        }
     }
 
     fn freeCollapseRegions(self: *UI) void {
@@ -1529,6 +1536,52 @@ pub const UI = struct {
         }
     }
 
+    // ========================================================================
+    // Summary View Functions
+    // ========================================================================
+
+    /// Scroll the view to show a specific source line number
+    fn scrollToSourceLine(self: *UI, source_line: u32) void {
+        // Find the diff line that corresponds to this source line
+        switch (self.view_mode) {
+            .unified => {
+                for (self.diff_lines.items, 0..) |diff_line, idx| {
+                    if (diff_line.new_line_num) |ln| {
+                        if (ln >= source_line) {
+                            self.cursor_line = idx;
+                            // Adjust scroll to show cursor
+                            if (idx < self.scroll_offset) {
+                                self.scroll_offset = idx;
+                            }
+                            return;
+                        }
+                    }
+                }
+            },
+            .split => {
+                for (self.split_rows.items, 0..) |row, idx| {
+                    if (row.right) |right| {
+                        if (right.line_num >= source_line) {
+                            self.cursor_line = idx;
+                            if (idx < self.scroll_offset) {
+                                self.scroll_offset = idx;
+                            }
+                            return;
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    /// Invalidate the cached session summary (call when files change)
+    pub fn invalidateSummary(self: *UI) void {
+        if (self.session_summary) |*s| {
+            s.deinit();
+            self.session_summary = null;
+        }
+    }
+
     fn submitComment(self: *UI) !void {
         const file = self.session.currentFile() orelse {
             self.mode = .normal;
@@ -2196,16 +2249,41 @@ pub const UI = struct {
     }
 
     /// Get the collapsed region info for display (e.g., "... 15 lines ...")
-    fn getCollapsedInfo(self: *UI, line_num: u32, is_old_file: bool) ?struct { lines: u32, name: []const u8, node_type: collapse.NodeType } {
+    fn getCollapsedInfo(self: *UI, line_num: u32, is_old_file: bool) ?struct { 
+        lines: u32, 
+        name: []const u8, 
+        node_type: collapse.NodeType,
+        changes: u32, // Number of changed lines within this construct
+    } {
         const regions = if (is_old_file) self.old_collapse_regions else self.collapse_regions;
 
         for (regions) |region| {
             // Return info when we're at the header end line of a collapsed region
             if (region.collapsed and region.header_end_line == line_num and region.isCollapsible()) {
+                // Try to get change info from summary
+                var changes: u32 = 0;
+                if (self.session_summary) |sess_summary| {
+                    if (self.session.currentFile()) |file| {
+                        // Find matching file summary
+                        for (sess_summary.files) |file_sum| {
+                            if (std.mem.eql(u8, file_sum.path, file.path)) {
+                                // Find matching construct
+                                for (file_sum.constructs) |construct| {
+                                    if (std.mem.eql(u8, construct.name, region.name)) {
+                                        changes = construct.lines_changed;
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
                 return .{
                     .lines = region.bodyLineCount(),
                     .name = region.name,
                     .node_type = region.node_type,
+                    .changes = changes,
                 };
             }
         }
@@ -2344,11 +2422,11 @@ pub const UI = struct {
         const size = ctx.max.size();
         var surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
 
-        // Draw header (row 0)
+        // Draw header (row 0) and summary bar (row 1)
         self.drawHeader(&surface);
 
-        // Draw diff content (rows 1 to height-3)
-        const content_height = size.height -| 3;
+        // Draw diff content (rows 2 to height-3, accounting for header + summary bar)
+        const content_height = size.height -| 4;
 
         // Choose between split and unified view based on terminal width
         // Split view needs at least 80 columns to be usable
@@ -2392,6 +2470,83 @@ pub const UI = struct {
 
         // Write header text
         writeString(surface, 0, 0, header_text, header_style);
+
+        // Draw file summary on row 1
+        self.drawFileSummaryBar(surface);
+    }
+
+    /// Draw inline file summary bar showing changes overview
+    fn drawFileSummaryBar(self: *UI, surface: *vxfw.Surface) void {
+        const file = self.session.currentFile() orelse return;
+
+        // Get or compute file summary
+        const file_summary = self.getFileSummary(file.*) orelse {
+            // No summary available, show basic info
+            const summary_style: vaxis.Style = .{
+                .bg = .{ .rgb = .{ 0x26, 0x26, 0x26 } }, // Dark gray background
+                .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } }, // Gray text
+            };
+            fillRow(surface, 1, ' ', summary_style);
+            writeString(surface, 1, 1, " (analyzing...)", summary_style);
+            return;
+        };
+
+        // Summary bar style
+        const summary_style: vaxis.Style = .{
+            .bg = .{ .rgb = .{ 0x26, 0x26, 0x26 } }, // Dark gray background
+            .fg = .{ .rgb = .{ 0xb0, 0xb0, 0xb0 } }, // Light gray text
+        };
+
+        // Fill row with background
+        fillRow(surface, 1, ' ', summary_style);
+
+        // Build summary text
+        var summary_buf: [256]u8 = undefined;
+        var brief_buf: [128]u8 = undefined;
+        const brief = file_summary.briefDescription(&brief_buf);
+
+        const summary_text = if (brief.len > 0)
+            std.fmt.bufPrint(&summary_buf, " {s}  |  +{d} -{d} lines", .{
+                brief,
+                file_summary.stats.lines_added,
+                file_summary.stats.lines_deleted,
+            }) catch brief
+        else
+            std.fmt.bufPrint(&summary_buf, " +{d} -{d} lines", .{
+                file_summary.stats.lines_added,
+                file_summary.stats.lines_deleted,
+            }) catch "";
+
+        writeString(surface, 0, 1, summary_text, summary_style);
+
+        // Show construct count on the right if there are changed constructs
+        if (file_summary.constructs.len > 0) {
+            var count_buf: [32]u8 = undefined;
+            const count_text = std.fmt.bufPrint(&count_buf, "{d} constructs ", .{
+                file_summary.constructs.len,
+            }) catch "";
+            const count_x = surface.size.width -| @as(u16, @intCast(count_text.len));
+            writeString(surface, count_x, 1, count_text, summary_style);
+        }
+    }
+
+    /// Get file summary for the given file, computing session summary if needed
+    pub fn getFileSummary(self: *UI, file: review.ReviewedFile) ?summary.FileSummary {
+        // Ensure session summary is computed
+        if (self.session_summary == null) {
+            self.session_summary = summary.analyzeSession(self.allocator, self.session) catch return null;
+        }
+
+        // Find the matching file summary
+        if (self.session_summary) |sess_summary| {
+            for (sess_summary.files) |file_sum| {
+                if (std.mem.eql(u8, file_sum.path, file.path)) {
+                    return file_sum;
+                }
+            }
+        }
+
+        return null;
     }
 
     fn drawDiff(self: *UI, surface: *vxfw.Surface, height: u16) void {
@@ -2549,7 +2704,7 @@ pub const UI = struct {
             // Selection background color
             const selection_bg: vaxis.Color = .{ .rgb = .{ 0x30, 0x30, 0x50 } };
 
-            const display_row = row + 1; // +1 for header
+            const display_row = row + 2; // +2 for header and summary bar
             var col: u16 = 0;
 
             // Fill entire row with selection background first if in selection
@@ -2745,7 +2900,7 @@ pub const UI = struct {
                         self.computeLineByteOffset(ln)
                     else
                         0;
-                    self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection, byte_offset, diff_line.line_type);
+                    col = self.writeContentWithHighlightAndReturn(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection, byte_offset, diff_line.line_type);
                 }
             } else {
                 // Regular line (addition, deletion, context)
@@ -2761,7 +2916,36 @@ pub const UI = struct {
                     self.computeLineByteOffset(ln)
                 else
                     0;
-                self.writeContentWithHighlight(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection, byte_offset, diff_line.line_type);
+                col = self.writeContentWithHighlightAndReturn(surface, display_row, col, content, diff_line.changes, width -| col, style, novel_style, is_selected or in_selection, byte_offset, diff_line.line_type);
+            }
+
+            // Check if this line is a collapsed region header - show info after content
+            const line_num_for_collapse = diff_line.new_line_num orelse diff_line.old_line_num;
+            if (line_num_for_collapse) |ln| {
+                if (self.getCollapsedInfo(ln, diff_line.line_type == .deletion)) |info| {
+                    // Draw collapsed indicator: "... N lines (M changes)"
+                    var info_buf: [64]u8 = undefined;
+                    const info_text = if (info.changes > 0)
+                        std.fmt.bufPrint(&info_buf, " ··· {d} lines ({d} changed)", .{ info.lines, info.changes }) catch ""
+                    else
+                        std.fmt.bufPrint(&info_buf, " ··· {d} lines", .{info.lines}) catch "";
+
+                    const info_style: vaxis.Style = .{
+                        .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } }, // Gray
+                        .italic = true,
+                    };
+                    
+                    // Add some padding before the info
+                    col += 2;
+                    for (info_text) |c| {
+                        if (col >= width) break;
+                        surface.writeCell(col, display_row, .{
+                            .char = .{ .grapheme = grapheme(c) },
+                            .style = if (is_selected) vaxis.Style{ .reverse = true } else info_style,
+                        });
+                        col += 1;
+                    }
+                }
             }
         }
     }
@@ -2839,7 +3023,7 @@ pub const UI = struct {
             else
                 false;
 
-            const display_row = row + 1; // +1 for header
+            const display_row = row + 2; // +2 for header and summary bar
 
             // Draw separator
             const separator_style: vaxis.Style = .{
@@ -7010,4 +7194,9 @@ test "refreshIfHasStagedChanges only refreshes when staged ranges exist" {
     // Verify the current file has staged ranges
     const file = session.currentFile().?;
     try std.testing.expect(session.isStagedLine(file.path, 1, .new));
+}
+
+// Reference summary module to include its tests
+test {
+    _ = summary;
 }

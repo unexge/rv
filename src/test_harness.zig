@@ -5,6 +5,7 @@ const vxfw = vaxis.vxfw;
 const ui = @import("ui.zig");
 const review = @import("review.zig");
 const difft = @import("difft.zig");
+const summary = @import("summary.zig");
 
 // Test harness for TUI testing with snapshot support.
 /// Allows rendering the UI to a buffer and comparing against snapshots.
@@ -3744,4 +3745,105 @@ test "integration: focus side old deletion workflow" {
 
     // Verify both comments exist
     try std.testing.expectEqual(@as(usize, 2), session.comments.items.len);
+}
+
+// ============================================================================
+// Summary View Tests (semantic overview with 'O' key)
+// ============================================================================
+
+test "inline_summary: session_summary is computed when getting file summary" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithFunction(allocator, &session);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Summary should not be computed yet
+    try std.testing.expectEqual(@as(?summary.SessionSummary, null), ui_inst.session_summary);
+
+    // Get file summary - should trigger session summary computation
+    const file = session.currentFile() orelse unreachable;
+    _ = ui_inst.getFileSummary(file.*);
+
+    // Summary should now exist
+    try std.testing.expect(ui_inst.session_summary != null);
+}
+
+test "inline_summary: correct file count in session summary" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    try createTestFileWithFunction(allocator, &session);
+    try createTestFileWithStruct(allocator, &session);
+
+    var runner = TestRunner.init(allocator, &session, 80, 24);
+    defer runner.deinit();
+
+    try runner.getUI().buildDiffLines();
+
+    const ui_inst = runner.getUI();
+
+    // Get file summary to trigger computation
+    const file = session.currentFile() orelse unreachable;
+    _ = ui_inst.getFileSummary(file.*);
+
+    // Verify session summary has 2 files
+    const sess_summary = ui_inst.session_summary orelse unreachable;
+    try std.testing.expectEqual(@as(usize, 2), sess_summary.files.len);
+}
+
+// Helper: create a test file with a Zig function
+fn createTestFileWithFunction(allocator: std.mem.Allocator, session: *review.ReviewSession) !void {
+    const new_content =
+        \\pub fn testFunction() void {
+        \\    return;
+        \\}
+    ;
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "function_test.zig"),
+        .diff = difft.FileDiff{
+            .path = try allocator.dupe(u8, "function_test.zig"),
+            .language = try allocator.dupe(u8, "Zig"),
+            .status = .added,
+            .chunks = &.{},
+            .allocator = allocator,
+        },
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, ""),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
+}
+
+// Helper: create a test file with a Zig struct
+fn createTestFileWithStruct(allocator: std.mem.Allocator, session: *review.ReviewSession) !void {
+    const new_content =
+        \\const TestStruct = struct {
+        \\    field: u32,
+        \\};
+    ;
+
+    try session.addFile(.{
+        .path = try allocator.dupe(u8, "struct_test.zig"),
+        .diff = difft.FileDiff{
+            .path = try allocator.dupe(u8, "struct_test.zig"),
+            .language = try allocator.dupe(u8, "Zig"),
+            .status = .added,
+            .chunks = &.{},
+            .allocator = allocator,
+        },
+        .is_binary = false,
+        .old_content = try allocator.dupe(u8, ""),
+        .new_content = try allocator.dupe(u8, new_content),
+    });
 }

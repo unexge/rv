@@ -4,6 +4,7 @@ const collapse = @import("collapse.zig");
 const review = @import("review.zig");
 const difft = @import("difft.zig");
 const highlight = @import("highlight.zig");
+const cosmetic = @import("cosmetic.zig");
 
 /// Type of change for a construct
 pub const ChangeType = enum {
@@ -65,6 +66,10 @@ pub const ChangeStats = struct {
     lines_deleted: u32 = 0,
     lines_modified: u32 = 0,
 
+    // Cosmetic vs semantic change tracking
+    cosmetic_changes: u32 = 0,
+    semantic_changes: u32 = 0,
+
     /// Add another ChangeStats to this one (for aggregation)
     pub fn add(self: *ChangeStats, other: ChangeStats) void {
         self.functions_added += other.functions_added;
@@ -94,6 +99,9 @@ pub const ChangeStats = struct {
         self.lines_added += other.lines_added;
         self.lines_deleted += other.lines_deleted;
         self.lines_modified += other.lines_modified;
+
+        self.cosmetic_changes += other.cosmetic_changes;
+        self.semantic_changes += other.semantic_changes;
     }
 
     /// Increment the appropriate counter based on node type and change type
@@ -175,6 +183,8 @@ pub const ChangedConstruct = struct {
     line_start: u32, // Start line in the relevant file (new for added/modified, old for deleted)
     line_end: u32, // End line in the relevant file
     lines_changed: u32 = 0, // Number of lines actually changed within this construct
+    category: cosmetic.ChangeCategory = .semantic, // Cosmetic vs semantic classification
+    moved_from_line: ?u32 = null, // For moved constructs: original line number
 
     /// Get a human-readable description of the change
     pub fn description(self: ChangedConstruct, buffer: []u8) []const u8 {
@@ -215,9 +225,9 @@ pub const FileSummary = struct {
 
     /// Get a brief description of changes (e.g., "3 fn modified, 1 struct added")
     pub fn briefDescription(self: FileSummary, buffer: []u8) []const u8 {
-        var parts: [12][]const u8 = undefined;
+        var parts: [14][]const u8 = undefined;
         var count: usize = 0;
-        var temp_buffers: [12][32]u8 = undefined;
+        var temp_buffers: [14][32]u8 = undefined;
 
         // Functions
         if (self.stats.functions_added > 0) {
@@ -270,6 +280,12 @@ pub const FileSummary = struct {
             count += 1;
         }
 
+        // Add cosmetic count if any
+        if (self.stats.cosmetic_changes > 0 and count < parts.len) {
+            parts[count] = std.fmt.bufPrint(&temp_buffers[count], "{d} cosmetic", .{self.stats.cosmetic_changes}) catch "cosmetic";
+            count += 1;
+        }
+
         if (count == 0) {
             // No semantic changes detected, fall back to line counts
             if (self.stats.lines_added > 0 or self.stats.lines_deleted > 0) {
@@ -297,6 +313,28 @@ pub const FileSummary = struct {
         }
 
         return buffer[0..pos];
+    }
+
+    /// Count constructs that are cosmetic (comment, whitespace, rename, moved)
+    pub fn cosmeticConstructCount(self: FileSummary) u32 {
+        var count: u32 = 0;
+        for (self.constructs) |construct| {
+            if (construct.category.isCosmetic()) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Count constructs that are semantic (actual logic changes)
+    pub fn semanticConstructCount(self: FileSummary) u32 {
+        var count: u32 = 0;
+        for (self.constructs) |construct| {
+            if (!construct.category.isCosmetic()) {
+                count += 1;
+            }
+        }
+        return count;
     }
 };
 
@@ -349,20 +387,35 @@ pub fn analyzeFile(allocator: Allocator, file: review.ReviewedFile) AnalysisErro
     var changed_lines = std.AutoHashMap(u32, void).init(allocator);
     defer changed_lines.deinit();
 
+    // Track cosmetic classification for each changed line (by line number in new file)
+    var cosmetic_lines = std.AutoHashMap(u32, cosmetic.ChangeCategory).init(allocator);
+    defer cosmetic_lines.deinit();
+
     // Track which lines in new/old file have changes
     for (file.diff.chunks) |chunk| {
         for (chunk) |entry| {
+            // Analyze this entry for cosmetic classification
+            const analysis = cosmetic.analyzeChange(
+                allocator,
+                entry,
+                if (file.old_content.len > 0) file.old_content else null,
+                if (file.new_content.len > 0) file.new_content else null,
+                cosmetic.CosmeticConfig.default(),
+            ) catch cosmetic.CosmeticAnalysis.semantic();
+
             if (entry.lhs != null and entry.rhs != null) {
                 // Both sides present = modification
                 lines_modified += 1;
                 if (entry.rhs) |rhs| {
                     changed_lines.put(rhs.line_number, {}) catch {};
+                    cosmetic_lines.put(rhs.line_number, analysis.category) catch {};
                 }
             } else if (entry.rhs != null) {
                 // Only RHS = addition
                 lines_added += 1;
                 if (entry.rhs) |rhs| {
                     changed_lines.put(rhs.line_number, {}) catch {};
+                    cosmetic_lines.put(rhs.line_number, analysis.category) catch {};
                 }
             } else if (entry.lhs != null) {
                 // Only LHS = deletion
@@ -477,11 +530,24 @@ pub fn analyzeFile(allocator: Allocator, file: review.ReviewedFile) AnalysisErro
             matched_old.put(new_region.name, {}) catch {};
 
             // Count how many changed lines fall within this construct
+            // and determine if all changes are cosmetic
             var construct_changes: u32 = 0;
+            var all_cosmetic = true;
+            var dominant_category: cosmetic.ChangeCategory = .semantic;
             var line = new_region.start_line;
             while (line <= new_region.end_line) : (line += 1) {
                 if (changed_lines.contains(line)) {
                     construct_changes += 1;
+                    if (cosmetic_lines.get(line)) |cat| {
+                        if (!cat.isCosmetic()) {
+                            all_cosmetic = false;
+                        } else if (dominant_category == .semantic) {
+                            // Set dominant cosmetic category from first cosmetic line
+                            dominant_category = cat;
+                        }
+                    } else {
+                        all_cosmetic = false;
+                    }
                 }
             }
 
@@ -490,6 +556,21 @@ pub fn analyzeFile(allocator: Allocator, file: review.ReviewedFile) AnalysisErro
                 (old_region.end_line - old_region.start_line);
 
             if (construct_changes > 0 or size_changed) {
+                // Size changes (line count differs) are semantic unless it's just whitespace
+                const final_category = if (all_cosmetic and !size_changed)
+                    dominant_category
+                else if (all_cosmetic and size_changed)
+                    cosmetic.ChangeCategory.whitespace // Size change with all-cosmetic = likely formatting
+                else
+                    cosmetic.ChangeCategory.semantic;
+
+                // Update cosmetic/semantic counts
+                if (final_category.isCosmetic()) {
+                    stats.cosmetic_changes += 1;
+                } else {
+                    stats.semantic_changes += 1;
+                }
+
                 stats.increment(new_region.node_type, .modified);
                 try constructs.append(allocator, .{
                     .name = try allocator.dupe(u8, new_region.name),
@@ -498,11 +579,13 @@ pub fn analyzeFile(allocator: Allocator, file: review.ReviewedFile) AnalysisErro
                     .line_start = new_region.start_line,
                     .line_end = new_region.end_line,
                     .lines_changed = construct_changes,
+                    .category = final_category,
                 });
             }
         } else {
-            // Not in old - this is an addition
+            // Not in old - this is an addition (always semantic)
             stats.increment(new_region.node_type, .added);
+            stats.semantic_changes += 1;
             try constructs.append(allocator, .{
                 .name = try allocator.dupe(u8, new_region.name),
                 .node_type = new_region.node_type,
@@ -510,6 +593,7 @@ pub fn analyzeFile(allocator: Allocator, file: review.ReviewedFile) AnalysisErro
                 .line_start = new_region.start_line,
                 .line_end = new_region.end_line,
                 .lines_changed = new_region.end_line - new_region.start_line + 1,
+                .category = .semantic,
             });
         }
     }
@@ -521,6 +605,7 @@ pub fn analyzeFile(allocator: Allocator, file: review.ReviewedFile) AnalysisErro
 
         if (!matched_old.contains(old_region.name)) {
             stats.increment(old_region.node_type, .deleted);
+            stats.semantic_changes += 1;
             try constructs.append(allocator, .{
                 .name = try allocator.dupe(u8, old_region.name),
                 .node_type = old_region.node_type,
@@ -528,6 +613,7 @@ pub fn analyzeFile(allocator: Allocator, file: review.ReviewedFile) AnalysisErro
                 .line_start = old_region.start_line,
                 .line_end = old_region.end_line,
                 .lines_changed = old_region.end_line - old_region.start_line + 1,
+                .category = .semantic,
             });
         }
     }
@@ -1120,4 +1206,124 @@ test "analyzeFile: binary file returns empty summary" {
     // Binary file should have no constructs
     try std.testing.expectEqual(@as(usize, 0), file_summary.constructs.len);
     try std.testing.expectEqual(false, file_summary.stats.hasChanges());
+}
+
+// ============================================================================
+// Cosmetic Integration Tests
+// ============================================================================
+
+test "ChangeStats: cosmetic and semantic counts start at zero" {
+    const stats = ChangeStats{};
+    try std.testing.expectEqual(@as(u32, 0), stats.cosmetic_changes);
+    try std.testing.expectEqual(@as(u32, 0), stats.semantic_changes);
+}
+
+test "ChangeStats: add aggregates cosmetic counts" {
+    var stats1 = ChangeStats{
+        .cosmetic_changes = 2,
+        .semantic_changes = 3,
+    };
+    const stats2 = ChangeStats{
+        .cosmetic_changes = 1,
+        .semantic_changes = 5,
+    };
+
+    stats1.add(stats2);
+
+    try std.testing.expectEqual(@as(u32, 3), stats1.cosmetic_changes);
+    try std.testing.expectEqual(@as(u32, 8), stats1.semantic_changes);
+}
+
+test "ChangedConstruct: has category field" {
+    const construct = ChangedConstruct{
+        .name = "test",
+        .node_type = .function,
+        .change_type = .modified,
+        .line_start = 1,
+        .line_end = 10,
+        .category = .comment,
+    };
+
+    try std.testing.expectEqual(cosmetic.ChangeCategory.comment, construct.category);
+    try std.testing.expect(construct.category.isCosmetic());
+}
+
+test "ChangedConstruct: has moved_from_line field" {
+    const construct = ChangedConstruct{
+        .name = "test",
+        .node_type = .function,
+        .change_type = .modified,
+        .line_start = 50,
+        .line_end = 60,
+        .category = .moved,
+        .moved_from_line = 10,
+    };
+
+    try std.testing.expectEqual(@as(?u32, 10), construct.moved_from_line);
+}
+
+test "FileSummary: cosmeticConstructCount returns correct count" {
+    const allocator = std.testing.allocator;
+
+    // Create constructs with different categories
+    var constructs_list: [3]ChangedConstruct = .{
+        .{
+            .name = "fn1",
+            .node_type = .function,
+            .change_type = .modified,
+            .line_start = 1,
+            .line_end = 10,
+            .category = .comment, // cosmetic
+        },
+        .{
+            .name = "fn2",
+            .node_type = .function,
+            .change_type = .modified,
+            .line_start = 20,
+            .line_end = 30,
+            .category = .semantic, // not cosmetic
+        },
+        .{
+            .name = "fn3",
+            .node_type = .function,
+            .change_type = .modified,
+            .line_start = 40,
+            .line_end = 50,
+            .category = .whitespace, // cosmetic
+        },
+    };
+
+    var summary = FileSummary{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .stats = ChangeStats{},
+        .constructs = &constructs_list,
+        .allocator = allocator,
+    };
+    // Note: don't deinit since constructs are on the stack
+
+    try std.testing.expectEqual(@as(u32, 2), summary.cosmeticConstructCount());
+    try std.testing.expectEqual(@as(u32, 1), summary.semanticConstructCount());
+
+    // Clean up path only
+    allocator.free(summary.path);
+}
+
+test "FileSummary: briefDescription includes cosmetic count" {
+    const allocator = std.testing.allocator;
+
+    var summary = FileSummary{
+        .path = try allocator.dupe(u8, "test.zig"),
+        .stats = ChangeStats{
+            .functions_modified = 2,
+            .cosmetic_changes = 3,
+        },
+        .constructs = &.{},
+        .allocator = allocator,
+    };
+    defer allocator.free(summary.path);
+
+    var buffer: [256]u8 = undefined;
+    const desc = summary.briefDescription(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "2 fn modified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, desc, "3 cosmetic") != null);
 }

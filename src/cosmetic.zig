@@ -314,7 +314,7 @@ pub const CommentType = enum {
 
 /// Detect the type of comment from its content
 pub fn detectCommentType(content: []const u8) CommentType {
-    const trimmed = std.mem.trimLeft(u8, content, " \t");
+    const trimmed = std.mem.trimStart(u8, content, " \t");
 
     // Doc comments (Rust/Zig style)
     if (std.mem.startsWith(u8, trimmed, "///")) return .doc;
@@ -331,7 +331,7 @@ pub fn detectCommentType(content: []const u8) CommentType {
     if (std.mem.startsWith(u8, trimmed, "#")) return .line;
 
     // Check for end of block comment
-    if (std.mem.endsWith(u8, std.mem.trimRight(u8, content, " \t\n"), "*/")) return .block;
+    if (std.mem.endsWith(u8, std.mem.trimEnd(u8, content, " \t\n"), "*/")) return .block;
 
     return .unknown;
 }
@@ -426,8 +426,8 @@ fn detectWhitespaceChangeType(old: []const u8, new: []const u8) []const u8 {
     }
 
     // Check for trailing whitespace changes
-    const old_trimmed = std.mem.trimRight(u8, old, " \t");
-    const new_trimmed = std.mem.trimRight(u8, new, " \t");
+    const old_trimmed = std.mem.trimEnd(u8, old, " \t");
+    const new_trimmed = std.mem.trimEnd(u8, new, " \t");
     if (old_trimmed.len != old.len or new_trimmed.len != new.len) {
         if (old_trimmed.len != old.len and new_trimmed.len == new.len) {
             return "trailing whitespace removed";
@@ -551,16 +551,16 @@ pub fn compareConstructBodies(old_body: []const u8, new_body: []const u8) f32 {
 
 /// Strip all whitespace from content (allocates new string)
 pub fn stripWhitespace(allocator: Allocator, content: []const u8) ![]const u8 {
-    var result = std.ArrayList(u8).init(allocator);
-    errdefer result.deinit();
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
 
     for (content) |c| {
         if (!std.ascii.isWhitespace(c)) {
-            try result.append(c);
+            try result.append(allocator, c);
         }
     }
 
-    return result.toOwnedSlice();
+    return result.toOwnedSlice(allocator);
 }
 
 // ============================================================================

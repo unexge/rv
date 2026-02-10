@@ -122,6 +122,8 @@ pub const UI = struct {
     review_mode: review.ReviewMode = .unstaged,
     // Summary view state (semantic overview of changes)
     session_summary: ?summary.SessionSummary = null,
+    // Cosmetic filter state (when true, collapse/dim cosmetic changes)
+    cosmetic_filter: bool = false,
 
     const InputBuffer = struct {
         buffer: [4096]u8 = undefined,
@@ -1273,6 +1275,11 @@ pub const UI = struct {
                 self.goToBottom();
                 return ctx.consumeAndRedraw();
             },
+            'C' => {
+                // Toggle cosmetic filter (hide/show cosmetic changes)
+                self.toggleCosmeticFilter();
+                return ctx.consumeAndRedraw();
+            },
             's', 'S' => {
                 if (key.mods.shift or cp == 'S') {
                     // Shift+s or S: Stage selected lines (only in unstaged mode)
@@ -2140,6 +2147,17 @@ pub const UI = struct {
             self.selection_start = null;
         } else {
             self.selection_start = self.cursor_line;
+        }
+    }
+
+    /// Toggle cosmetic filter mode
+    /// When enabled, cosmetic changes (comments, whitespace, renames, moves) are visually de-emphasized
+    fn toggleCosmeticFilter(self: *UI) void {
+        self.cosmetic_filter = !self.cosmetic_filter;
+        if (self.cosmetic_filter) {
+            self.setMessage("Cosmetic changes hidden", false);
+        } else {
+            self.setMessage("Showing all changes", false);
         }
     }
 
@@ -3874,6 +3892,7 @@ pub const UI = struct {
             "    v                   Toggle split/unified view",
             "    Tab                 Toggle focus (old/new side)",
             "    s                   Toggle summary/expanded mode",
+            "    C                   Toggle cosmetic filter",
             "    Enter               Expand/collapse region at cursor",
             "",
             "  Actions:",
@@ -7199,4 +7218,40 @@ test "refreshIfHasStagedChanges only refreshes when staged ranges exist" {
 // Reference summary module to include its tests
 test {
     _ = summary;
+}
+
+test "toggleCosmeticFilter toggles state and sets message" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var ui_instance = UI.initForTest(allocator, &session);
+    defer ui_instance.deinit();
+
+    // Initial state: cosmetic_filter is false
+    try std.testing.expect(!ui_instance.cosmetic_filter);
+
+    // Toggle on
+    ui_instance.toggleCosmeticFilter();
+    try std.testing.expect(ui_instance.cosmetic_filter);
+    try std.testing.expect(ui_instance.message != null);
+    try std.testing.expectEqualStrings("Cosmetic changes hidden", ui_instance.message.?);
+
+    // Toggle off
+    ui_instance.toggleCosmeticFilter();
+    try std.testing.expect(!ui_instance.cosmetic_filter);
+    try std.testing.expectEqualStrings("Showing all changes", ui_instance.message.?);
+}
+
+test "cosmetic_filter defaults to false" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var ui_instance = UI.initForTest(allocator, &session);
+    defer ui_instance.deinit();
+
+    try std.testing.expect(!ui_instance.cosmetic_filter);
 }

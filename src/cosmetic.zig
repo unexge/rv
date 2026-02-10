@@ -208,9 +208,15 @@ pub fn analyzeChange(
 /// Check if a diff entry contains only comment changes
 /// Uses difft's highlight field to identify comment tokens
 pub fn isCommentOnly(entry: difft.DiffEntry) bool {
+    return areChangesCommentOnly(entry.lhs, entry.rhs);
+}
+
+/// Check if changes from both sides are comment-only
+/// This is the core logic shared between entry-level and change-level analysis
+fn areChangesCommentOnly(lhs: ?difft.Side, rhs: ?difft.Side) bool {
     // Check lhs changes
-    if (entry.lhs) |lhs| {
-        for (lhs.changes) |change| {
+    if (lhs) |l| {
+        for (l.changes) |change| {
             if (change.highlight != .comment) {
                 return false;
             }
@@ -218,8 +224,8 @@ pub fn isCommentOnly(entry: difft.DiffEntry) bool {
     }
 
     // Check rhs changes
-    if (entry.rhs) |rhs| {
-        for (rhs.changes) |change| {
+    if (rhs) |r| {
+        for (r.changes) |change| {
             if (change.highlight != .comment) {
                 return false;
             }
@@ -227,10 +233,107 @@ pub fn isCommentOnly(entry: difft.DiffEntry) bool {
     }
 
     // Both sides must have at least one change to be a "comment change"
-    const has_lhs_changes = entry.lhs != null and entry.lhs.?.changes.len > 0;
-    const has_rhs_changes = entry.rhs != null and entry.rhs.?.changes.len > 0;
+    const has_lhs_changes = lhs != null and lhs.?.changes.len > 0;
+    const has_rhs_changes = rhs != null and rhs.?.changes.len > 0;
 
     return has_lhs_changes or has_rhs_changes;
+}
+
+/// Check if an array of changes contains only comments
+/// Useful when analyzing individual change arrays separately
+pub fn isChangesArrayCommentOnly(changes: []const difft.Change) bool {
+    if (changes.len == 0) return false;
+
+    for (changes) |change| {
+        if (change.highlight != .comment) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Analyze a diff entry to determine if it's a comment-only change
+/// Returns a CosmeticAnalysis struct with category, confidence, and details
+pub fn analyzeLineForComments(entry: difft.DiffEntry) CosmeticAnalysis {
+    const lhs_comment_only = if (entry.lhs) |lhs|
+        isChangesArrayCommentOnly(lhs.changes)
+    else
+        true; // No lhs = nothing non-comment on lhs
+
+    const rhs_comment_only = if (entry.rhs) |rhs|
+        isChangesArrayCommentOnly(rhs.changes)
+    else
+        true; // No rhs = nothing non-comment on rhs
+
+    // Determine the type of comment change
+    const has_lhs = entry.lhs != null and entry.lhs.?.changes.len > 0;
+    const has_rhs = entry.rhs != null and entry.rhs.?.changes.len > 0;
+
+    // If neither side has changes, it's not a comment change
+    if (!has_lhs and !has_rhs) {
+        return CosmeticAnalysis.semantic();
+    }
+
+    // If only one side has changes and they're comments
+    if (has_lhs and !has_rhs and lhs_comment_only) {
+        return CosmeticAnalysis.commentOnly(1.0, "comment removed");
+    }
+    if (!has_lhs and has_rhs and rhs_comment_only) {
+        return CosmeticAnalysis.commentOnly(1.0, "comment added");
+    }
+
+    // Both sides have changes - check if all are comments
+    if (has_lhs and has_rhs and lhs_comment_only and rhs_comment_only) {
+        return CosmeticAnalysis.commentOnly(1.0, "comment modified");
+    }
+
+    // Mixed changes (code and comments) - this is semantic
+    return CosmeticAnalysis.semantic();
+}
+
+/// Categorize comment type based on content (for informational purposes)
+pub const CommentType = enum {
+    /// Single-line comment (// or #)
+    line,
+    /// Doc comment (/// or /** */)
+    doc,
+    /// Block comment (/* */)
+    block,
+    /// Unknown comment format
+    unknown,
+
+    pub fn label(self: CommentType) []const u8 {
+        return switch (self) {
+            .line => "line comment",
+            .doc => "doc comment",
+            .block => "block comment",
+            .unknown => "comment",
+        };
+    }
+};
+
+/// Detect the type of comment from its content
+pub fn detectCommentType(content: []const u8) CommentType {
+    const trimmed = std.mem.trimLeft(u8, content, " \t");
+
+    // Doc comments (Rust/Zig style)
+    if (std.mem.startsWith(u8, trimmed, "///")) return .doc;
+    if (std.mem.startsWith(u8, trimmed, "//!")) return .doc;
+
+    // Doc comments (Java/JS style)
+    if (std.mem.startsWith(u8, trimmed, "/**")) return .doc;
+
+    // Block comments
+    if (std.mem.startsWith(u8, trimmed, "/*")) return .block;
+
+    // Line comments
+    if (std.mem.startsWith(u8, trimmed, "//")) return .line;
+    if (std.mem.startsWith(u8, trimmed, "#")) return .line;
+
+    // Check for end of block comment
+    if (std.mem.endsWith(u8, std.mem.trimRight(u8, content, " \t\n"), "*/")) return .block;
+
+    return .unknown;
 }
 
 /// Check if a diff entry contains only whitespace changes
@@ -559,4 +662,182 @@ test "isWhitespaceOnly returns false for content change" {
     };
 
     try std.testing.expect(!isWhitespaceOnly(entry));
+}
+
+// ============================================================================
+// Comment-only detection tests (task e3kylg09)
+// ============================================================================
+
+test "isChangesArrayCommentOnly returns true for comment-only array" {
+    const changes = [_]difft.Change{
+        .{ .start = 0, .end = 10, .content = "// hello", .highlight = .comment },
+        .{ .start = 11, .end = 20, .content = "// world", .highlight = .comment },
+    };
+    try std.testing.expect(isChangesArrayCommentOnly(&changes));
+}
+
+test "isChangesArrayCommentOnly returns false for mixed array" {
+    const changes = [_]difft.Change{
+        .{ .start = 0, .end = 10, .content = "// hello", .highlight = .comment },
+        .{ .start = 11, .end = 20, .content = "code", .highlight = .normal },
+    };
+    try std.testing.expect(!isChangesArrayCommentOnly(&changes));
+}
+
+test "isChangesArrayCommentOnly returns false for empty array" {
+    const changes = [_]difft.Change{};
+    try std.testing.expect(!isChangesArrayCommentOnly(&changes));
+}
+
+test "analyzeLineForComments detects comment added" {
+    const comment_change = difft.Change{
+        .start = 0,
+        .end = 15,
+        .content = "// new comment",
+        .highlight = .comment,
+    };
+
+    const entry = difft.DiffEntry{
+        .lhs = null,
+        .rhs = .{
+            .line_number = 5,
+            .changes = &[_]difft.Change{comment_change},
+        },
+    };
+
+    const analysis = analyzeLineForComments(entry);
+    try std.testing.expectEqual(ChangeCategory.comment, analysis.category);
+    try std.testing.expectEqual(@as(f32, 1.0), analysis.confidence);
+    try std.testing.expectEqualStrings("comment added", analysis.details.?);
+}
+
+test "analyzeLineForComments detects comment removed" {
+    const comment_change = difft.Change{
+        .start = 0,
+        .end = 15,
+        .content = "// old comment",
+        .highlight = .comment,
+    };
+
+    const entry = difft.DiffEntry{
+        .lhs = .{
+            .line_number = 5,
+            .changes = &[_]difft.Change{comment_change},
+        },
+        .rhs = null,
+    };
+
+    const analysis = analyzeLineForComments(entry);
+    try std.testing.expectEqual(ChangeCategory.comment, analysis.category);
+    try std.testing.expectEqual(@as(f32, 1.0), analysis.confidence);
+    try std.testing.expectEqualStrings("comment removed", analysis.details.?);
+}
+
+test "analyzeLineForComments detects comment modified" {
+    const old_comment = difft.Change{
+        .start = 0,
+        .end = 10,
+        .content = "// old",
+        .highlight = .comment,
+    };
+    const new_comment = difft.Change{
+        .start = 0,
+        .end = 10,
+        .content = "// new",
+        .highlight = .comment,
+    };
+
+    const entry = difft.DiffEntry{
+        .lhs = .{
+            .line_number = 5,
+            .changes = &[_]difft.Change{old_comment},
+        },
+        .rhs = .{
+            .line_number = 5,
+            .changes = &[_]difft.Change{new_comment},
+        },
+    };
+
+    const analysis = analyzeLineForComments(entry);
+    try std.testing.expectEqual(ChangeCategory.comment, analysis.category);
+    try std.testing.expectEqual(@as(f32, 1.0), analysis.confidence);
+    try std.testing.expectEqualStrings("comment modified", analysis.details.?);
+}
+
+test "analyzeLineForComments returns semantic for code AND comment changed" {
+    const comment_change = difft.Change{
+        .start = 0,
+        .end = 10,
+        .content = "// comment",
+        .highlight = .comment,
+    };
+    const code_change = difft.Change{
+        .start = 0,
+        .end = 10,
+        .content = "let x = 1",
+        .highlight = .normal,
+    };
+
+    const entry = difft.DiffEntry{
+        .lhs = .{
+            .line_number = 5,
+            .changes = &[_]difft.Change{comment_change},
+        },
+        .rhs = .{
+            .line_number = 5,
+            .changes = &[_]difft.Change{code_change},
+        },
+    };
+
+    const analysis = analyzeLineForComments(entry);
+    try std.testing.expectEqual(ChangeCategory.semantic, analysis.category);
+}
+
+test "analyzeLineForComments returns semantic for no changes" {
+    const entry = difft.DiffEntry{
+        .lhs = null,
+        .rhs = null,
+    };
+
+    const analysis = analyzeLineForComments(entry);
+    try std.testing.expectEqual(ChangeCategory.semantic, analysis.category);
+}
+
+test "analyzeLineForComments returns semantic for empty changes" {
+    const entry = difft.DiffEntry{
+        .lhs = .{
+            .line_number = 1,
+            .changes = &[_]difft.Change{},
+        },
+        .rhs = .{
+            .line_number = 1,
+            .changes = &[_]difft.Change{},
+        },
+    };
+
+    const analysis = analyzeLineForComments(entry);
+    try std.testing.expectEqual(ChangeCategory.semantic, analysis.category);
+}
+
+test "detectCommentType identifies line comments" {
+    try std.testing.expectEqual(CommentType.line, detectCommentType("// hello"));
+    try std.testing.expectEqual(CommentType.line, detectCommentType("  // indented"));
+    try std.testing.expectEqual(CommentType.line, detectCommentType("# python style"));
+}
+
+test "detectCommentType identifies doc comments" {
+    try std.testing.expectEqual(CommentType.doc, detectCommentType("/// doc comment"));
+    try std.testing.expectEqual(CommentType.doc, detectCommentType("//! module doc"));
+    try std.testing.expectEqual(CommentType.doc, detectCommentType("/** javadoc"));
+}
+
+test "detectCommentType identifies block comments" {
+    try std.testing.expectEqual(CommentType.block, detectCommentType("/* block */"));
+    try std.testing.expectEqual(CommentType.block, detectCommentType("  /* indented"));
+    try std.testing.expectEqual(CommentType.block, detectCommentType("end of block */"));
+}
+
+test "detectCommentType returns unknown for non-comments" {
+    try std.testing.expectEqual(CommentType.unknown, detectCommentType("not a comment"));
+    try std.testing.expectEqual(CommentType.unknown, detectCommentType("x = 1"));
 }

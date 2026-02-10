@@ -8,6 +8,7 @@ const highlight = @import("highlight.zig");
 const collapse = @import("collapse.zig");
 const pi = @import("pi.zig");
 const summary = @import("summary.zig");
+const cosmetic = @import("cosmetic.zig");
 
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
@@ -46,6 +47,7 @@ const DiffLine = struct {
     is_partial_change: bool = false, // True if only part of line changed (unchanged parts shown in white)
     content_byte_offset: u32 = 0, // Byte offset of this line in the new file content (for syntax highlighting)
     old_content_byte_offset: u32 = 0, // Byte offset of this line in the old file content (for syntax highlighting)
+    cosmetic_category: cosmetic.ChangeCategory = .semantic, // Cosmetic classification (comment, whitespace, etc.)
 
     const LineType = enum {
         context, // Unchanged line (shown with space prefix)
@@ -68,6 +70,7 @@ const SplitRow = struct {
         changes: []const difft.Change = &.{},
         line_type: DiffLine.LineType,
         content_byte_offset: u32 = 0,
+        cosmetic_category: cosmetic.ChangeCategory = .semantic, // Cosmetic classification
     };
 };
 
@@ -124,6 +127,27 @@ pub const UI = struct {
     session_summary: ?summary.SessionSummary = null,
     // Cosmetic filter state (when true, collapse/dim cosmetic changes)
     cosmetic_filter: bool = false,
+    // Cosmetic change statistics for current file (for indicator lines)
+    cosmetic_counts: CosmeticCounts = .{},
+
+    /// Statistics about cosmetic changes for indicator display
+    const CosmeticCounts = struct {
+        comment_changes: u32 = 0,
+        whitespace_changes: u32 = 0,
+        rename_changes: u32 = 0,
+        moved_changes: u32 = 0,
+
+        pub fn total(self: CosmeticCounts) u32 {
+            return self.comment_changes + self.whitespace_changes + self.rename_changes + self.moved_changes;
+        }
+
+        pub fn reset(self: *CosmeticCounts) void {
+            self.comment_changes = 0;
+            self.whitespace_changes = 0;
+            self.rename_changes = 0;
+            self.moved_changes = 0;
+        }
+    };
 
     const InputBuffer = struct {
         buffer: [4096]u8 = undefined,
@@ -351,6 +375,9 @@ pub const UI = struct {
     }
 
     pub fn buildDiffLines(self: *UI) !void {
+        // Reset cosmetic counts for this file
+        self.cosmetic_counts.reset();
+
         for (self.diff_lines.items) |line| {
             if (line.content.len > 0) self.allocator.free(line.content);
             if (line.old_content) |oc| {
@@ -759,6 +786,25 @@ pub const UI = struct {
                         continue;
                     }
 
+                    // Analyze for cosmetic classification
+                    const cosm_analysis = cosmetic.analyzeChange(
+                        self.allocator,
+                        entry,
+                        if (file.old_content.len > 0) file.old_content else null,
+                        if (file.new_content.len > 0) file.new_content else null,
+                        cosmetic.CosmeticConfig.default(),
+                    ) catch cosmetic.CosmeticAnalysis.semantic();
+                    const cosm_category = cosm_analysis.category;
+
+                    // Track cosmetic counts
+                    switch (cosm_category) {
+                        .comment => self.cosmetic_counts.comment_changes += 1,
+                        .whitespace => self.cosmetic_counts.whitespace_changes += 1,
+                        .rename => self.cosmetic_counts.rename_changes += 1,
+                        .moved => self.cosmetic_counts.moved_changes += 1,
+                        .semantic => {},
+                    }
+
                     // Use difftastic's semantic changes if available, otherwise compute our own
                     var deleted_changes: []const difft.Change = &.{};
                     var added_changes: []const difft.Change = &.{};
@@ -816,6 +862,7 @@ pub const UI = struct {
                         .old_changes = deleted_changes, // Highlights for old content
                         .line_type = .modification,
                         .is_partial_change = is_partial_deletion or is_partial_addition,
+                        .cosmetic_category = cosm_category,
                     });
 
                     // Track both old and new line numbers for context calculation
@@ -832,12 +879,33 @@ pub const UI = struct {
                     const content = if (old_line_idx < old_lines.items.len) old_lines.items[old_line_idx] else "";
                     // Copy the changes array to avoid double-free
                     const changes_copy = try self.dupeChanges(entry.lhs.?.changes);
+
+                    // Analyze for cosmetic classification
+                    const cosm_analysis = cosmetic.analyzeChange(
+                        self.allocator,
+                        entry,
+                        if (file.old_content.len > 0) file.old_content else null,
+                        if (file.new_content.len > 0) file.new_content else null,
+                        cosmetic.CosmeticConfig.default(),
+                    ) catch cosmetic.CosmeticAnalysis.semantic();
+                    const cosm_category = cosm_analysis.category;
+
+                    // Track cosmetic counts
+                    switch (cosm_category) {
+                        .comment => self.cosmetic_counts.comment_changes += 1,
+                        .whitespace => self.cosmetic_counts.whitespace_changes += 1,
+                        .rename => self.cosmetic_counts.rename_changes += 1,
+                        .moved => self.cosmetic_counts.moved_changes += 1,
+                        .semantic => {},
+                    }
+
                     try self.diff_lines.append(self.allocator, .{
                         .old_line_num = display_line_num,
                         .new_line_num = null, // Deletion only: no new line
                         .content = try self.allocator.dupe(u8, content),
                         .changes = changes_copy,
                         .line_type = .deletion,
+                        .cosmetic_category = cosm_category,
                     });
                     // Track old line for deletions
                     last_shown_old_line = @max(last_shown_old_line, display_line_num);
@@ -851,12 +919,33 @@ pub const UI = struct {
                     const content = if (new_line_idx < new_lines.items.len) new_lines.items[new_line_idx] else "";
                     // Copy the changes array to avoid double-free
                     const changes_copy = try self.dupeChanges(entry.rhs.?.changes);
+
+                    // Analyze for cosmetic classification
+                    const cosm_analysis = cosmetic.analyzeChange(
+                        self.allocator,
+                        entry,
+                        if (file.old_content.len > 0) file.old_content else null,
+                        if (file.new_content.len > 0) file.new_content else null,
+                        cosmetic.CosmeticConfig.default(),
+                    ) catch cosmetic.CosmeticAnalysis.semantic();
+                    const cosm_category = cosm_analysis.category;
+
+                    // Track cosmetic counts
+                    switch (cosm_category) {
+                        .comment => self.cosmetic_counts.comment_changes += 1,
+                        .whitespace => self.cosmetic_counts.whitespace_changes += 1,
+                        .rename => self.cosmetic_counts.rename_changes += 1,
+                        .moved => self.cosmetic_counts.moved_changes += 1,
+                        .semantic => {},
+                    }
+
                     try self.diff_lines.append(self.allocator, .{
                         .old_line_num = null, // Addition only: no old line
                         .new_line_num = display_line_num,
                         .content = try self.allocator.dupe(u8, content),
                         .changes = changes_copy,
                         .line_type = .addition,
+                        .cosmetic_category = cosm_category,
                     });
                     last_shown_new_line = display_line_num;
                     last_displayed_new_line = display_line_num;
@@ -934,12 +1023,14 @@ pub const UI = struct {
                             .content = try self.allocator.dupe(u8, content),
                             .line_type = .context,
                             .content_byte_offset = old_offset,
+                            .cosmetic_category = diff_line.cosmetic_category,
                         } else null,
                         .right = if (new_ln > 0) .{
                             .line_num = new_ln,
                             .content = try self.allocator.dupe(u8, content),
                             .line_type = .context,
                             .content_byte_offset = new_offset,
+                            .cosmetic_category = diff_line.cosmetic_category,
                         } else null,
                         .selectable = diff_line.selectable,
                     });
@@ -965,6 +1056,7 @@ pub const UI = struct {
                             .changes = try self.dupeChanges(diff_line.old_changes),
                             .line_type = .deletion,
                             .content_byte_offset = old_offset,
+                            .cosmetic_category = diff_line.cosmetic_category,
                         } else null,
                         .right = .{
                             .line_num = new_ln,
@@ -972,6 +1064,7 @@ pub const UI = struct {
                             .changes = try self.dupeChanges(diff_line.changes),
                             .line_type = .addition,
                             .content_byte_offset = new_offset,
+                            .cosmetic_category = diff_line.cosmetic_category,
                         },
                     });
                     i += 1;
@@ -1003,6 +1096,7 @@ pub const UI = struct {
                                 .changes = try self.dupeChanges(diff_line.changes),
                                 .line_type = .deletion,
                                 .content_byte_offset = old_offset,
+                                .cosmetic_category = diff_line.cosmetic_category,
                             },
                             .right = .{
                                 .line_num = new_ln,
@@ -1010,6 +1104,7 @@ pub const UI = struct {
                                 .changes = try self.dupeChanges(next.changes),
                                 .line_type = .addition,
                                 .content_byte_offset = new_offset,
+                                .cosmetic_category = next.cosmetic_category,
                             },
                         });
                         i += 2; // Skip both
@@ -1022,6 +1117,7 @@ pub const UI = struct {
                                 .changes = try self.dupeChanges(diff_line.changes),
                                 .line_type = .deletion,
                                 .content_byte_offset = old_offset,
+                                .cosmetic_category = diff_line.cosmetic_category,
                             },
                             .right = null,
                         });
@@ -1044,6 +1140,7 @@ pub const UI = struct {
                             .changes = try self.dupeChanges(diff_line.changes),
                             .line_type = .addition,
                             .content_byte_offset = new_offset,
+                            .cosmetic_category = diff_line.cosmetic_category,
                         },
                     });
                     i += 1;
@@ -2308,8 +2405,12 @@ pub const UI = struct {
         return null;
     }
 
-    /// Build a list of visible diff line indices, respecting collapse state
+    /// Build a list of visible diff line indices, respecting collapse state and cosmetic filter
     fn buildVisibleIndices(self: *UI, indices: *std.ArrayList(usize)) !void {
+        // Track consecutive cosmetic lines for indicator generation
+        var cosmetic_run_start: ?usize = null;
+        var cosmetic_run_count: u32 = 0;
+
         for (self.diff_lines.items, 0..) |diff_line, idx| {
             // Get the line number to check visibility
             const new_line = diff_line.new_line_num;
@@ -2334,13 +2435,33 @@ pub const UI = struct {
                 }
             }
 
+            // Check if this line should be hidden due to cosmetic filter
+            // Only hide changed lines (not context lines)
+            if (!hidden and self.cosmetic_filter and diff_line.line_type != .context) {
+                if (diff_line.cosmetic_category.isCosmetic()) {
+                    hidden = true;
+                    // Track the cosmetic run for indicator line insertion
+                    if (cosmetic_run_start == null) {
+                        cosmetic_run_start = idx;
+                    }
+                    cosmetic_run_count += 1;
+                }
+            }
+
+            // If we hit a non-cosmetic line after a run, we could insert indicator
+            // (For now, we just hide them - indicators will be shown via drawDiff)
+            if (!hidden and cosmetic_run_start != null) {
+                cosmetic_run_start = null;
+                cosmetic_run_count = 0;
+            }
+
             if (!hidden) {
                 try indices.append(self.allocator, idx);
             }
         }
     }
 
-    /// Build a list of visible split row indices, respecting collapse state
+    /// Build a list of visible split row indices, respecting collapse state and cosmetic filter
     fn buildVisibleSplitIndices(self: *UI, indices: *std.ArrayList(usize)) !void {
         for (self.split_rows.items, 0..) |split_row, idx| {
             // Get line numbers from both sides
@@ -2361,6 +2482,28 @@ pub const UI = struct {
                     if (collapse.isLineHidden(self.collapse_regions, ln)) {
                         hidden = true;
                     }
+                }
+            }
+
+            // Check if this row should be hidden due to cosmetic filter
+            // Only hide rows that are entirely cosmetic changes (not context)
+            if (!hidden and self.cosmetic_filter) {
+                const left_cosmetic = if (split_row.left) |l|
+                    l.line_type != .context and l.cosmetic_category.isCosmetic()
+                else
+                    true; // null side is neutral
+                const right_cosmetic = if (split_row.right) |r|
+                    r.line_type != .context and r.cosmetic_category.isCosmetic()
+                else
+                    true; // null side is neutral
+
+                // Hide only if both sides are cosmetic (or null)
+                const has_change = split_row.left != null or split_row.right != null;
+                const is_context_only = (split_row.left == null or split_row.left.?.line_type == .context) and
+                    (split_row.right == null or split_row.right.?.line_type == .context);
+
+                if (has_change and !is_context_only and left_cosmetic and right_cosmetic) {
+                    hidden = true;
                 }
             }
 
@@ -2537,14 +2680,33 @@ pub const UI = struct {
 
         writeString(surface, 0, 1, summary_text, summary_style);
 
-        // Show construct count on the right if there are changed constructs
-        if (file_summary.constructs.len > 0) {
-            var count_buf: [32]u8 = undefined;
-            const count_text = std.fmt.bufPrint(&count_buf, "{d} constructs ", .{
+        // Show cosmetic filter indicator and/or construct count on the right
+        var right_text_buf: [64]u8 = undefined;
+        var right_text: []const u8 = "";
+
+        // Build right-side text
+        if (self.cosmetic_filter and self.cosmetic_counts.total() > 0) {
+            // Show hidden cosmetic count
+            right_text = std.fmt.bufPrint(&right_text_buf, "⋯ {d} cosmetic hidden ", .{
+                self.cosmetic_counts.total(),
+            }) catch "";
+        } else if (file_summary.constructs.len > 0) {
+            right_text = std.fmt.bufPrint(&right_text_buf, "{d} constructs ", .{
                 file_summary.constructs.len,
             }) catch "";
-            const count_x = surface.size.width -| @as(u16, @intCast(count_text.len));
-            writeString(surface, count_x, 1, count_text, summary_style);
+        }
+
+        if (right_text.len > 0) {
+            const cosmetic_style: vaxis.Style = if (self.cosmetic_filter)
+                .{
+                    .bg = .{ .rgb = .{ 0x26, 0x26, 0x26 } },
+                    .fg = .{ .rgb = .{ 0x80, 0x80, 0x60 } }, // Dim yellow for cosmetic indicator
+                    .italic = true,
+                }
+            else
+                summary_style;
+            const right_x = surface.size.width -| @as(u16, @intCast(right_text.len));
+            writeString(surface, right_x, 1, right_text, cosmetic_style);
         }
     }
 
@@ -2703,6 +2865,58 @@ pub const UI = struct {
                 old_novel_style.fg = staged_color;
                 old_novel_style.bold = false;
                 old_novel_style.strikethrough = false;
+            }
+
+            // Apply cosmetic styling - dim cosmetic changes when filter is NOT active
+            // (When filter IS active, they're hidden entirely)
+            // Even when not hidden, cosmetic changes get distinct styling
+            const is_cosmetic = diff_line.cosmetic_category.isCosmetic() and diff_line.line_type != .context;
+            if (is_cosmetic and !is_staged and !is_selected) {
+                switch (diff_line.cosmetic_category) {
+                    .comment => {
+                        // Comment changes: dim gray, italic
+                        const comment_color: vaxis.Color = .{ .rgb = .{ 0x60, 0x80, 0x60 } }; // Dim greenish-gray
+                        style.fg = comment_color;
+                        style.italic = true;
+                        novel_style.fg = comment_color;
+                        novel_style.italic = true;
+                        novel_style.bold = false;
+                        old_style.fg = .{ .rgb = .{ 0x80, 0x60, 0x60 } }; // Dim reddish-gray
+                        old_style.italic = true;
+                        old_style.strikethrough = false;
+                        old_novel_style.fg = old_style.fg;
+                        old_novel_style.italic = true;
+                        old_novel_style.bold = false;
+                    },
+                    .whitespace => {
+                        // Whitespace changes: very dim
+                        const ws_color: vaxis.Color = .{ .rgb = .{ 0x50, 0x50, 0x50 } }; // Very dim gray
+                        style.fg = ws_color;
+                        novel_style.fg = ws_color;
+                        novel_style.bold = false;
+                        old_style.fg = ws_color;
+                        old_style.strikethrough = false;
+                        old_novel_style.fg = ws_color;
+                        old_novel_style.bold = false;
+                    },
+                    .rename => {
+                        // Rename changes: yellow/orange
+                        const rename_color: vaxis.Color = .{ .rgb = .{ 0xd7, 0xaf, 0x00 } }; // Yellow-orange
+                        style.fg = rename_color;
+                        novel_style.fg = rename_color;
+                        old_style.fg = rename_color;
+                        old_novel_style.fg = rename_color;
+                    },
+                    .moved => {
+                        // Moved code: blue
+                        const moved_color: vaxis.Color = .{ .rgb = .{ 0x5f, 0x87, 0xd7 } }; // Blue
+                        style.fg = moved_color;
+                        novel_style.fg = moved_color;
+                        old_style.fg = moved_color;
+                        old_novel_style.fg = moved_color;
+                    },
+                    .semantic => {}, // Not cosmetic, normal styling
+                }
             }
 
             // Line number styles
@@ -3175,6 +3389,46 @@ pub const UI = struct {
                 line_num_style.fg = staged_color;
                 content_style.fg = staged_color;
                 bg_color = null; // Remove background color for staged lines
+            }
+
+            // Apply cosmetic styling - dim cosmetic changes
+            const is_cosmetic = c.cosmetic_category.isCosmetic() and c.line_type != .context;
+            if (is_cosmetic and !is_staged and !is_selected) {
+                switch (c.cosmetic_category) {
+                    .comment => {
+                        // Comment changes: dim gray, italic
+                        const comment_color: vaxis.Color = if (c.line_type == .deletion)
+                            .{ .rgb = .{ 0x80, 0x60, 0x60 } } // Dim reddish-gray
+                        else
+                            .{ .rgb = .{ 0x60, 0x80, 0x60 } }; // Dim greenish-gray
+                        line_num_style.fg = comment_color;
+                        content_style.fg = comment_color;
+                        content_style.italic = true;
+                        bg_color = null;
+                    },
+                    .whitespace => {
+                        // Whitespace changes: very dim
+                        const ws_color: vaxis.Color = .{ .rgb = .{ 0x50, 0x50, 0x50 } };
+                        line_num_style.fg = ws_color;
+                        content_style.fg = ws_color;
+                        bg_color = null;
+                    },
+                    .rename => {
+                        // Rename changes: yellow/orange
+                        const rename_color: vaxis.Color = .{ .rgb = .{ 0xd7, 0xaf, 0x00 } };
+                        line_num_style.fg = rename_color;
+                        content_style.fg = rename_color;
+                        bg_color = null;
+                    },
+                    .moved => {
+                        // Moved code: blue
+                        const moved_color: vaxis.Color = .{ .rgb = .{ 0x5f, 0x87, 0xd7 } };
+                        line_num_style.fg = moved_color;
+                        content_style.fg = moved_color;
+                        bg_color = null;
+                    },
+                    .semantic => {}, // Not cosmetic, normal styling
+                }
             }
 
             if (is_selected) {
@@ -7254,4 +7508,68 @@ test "cosmetic_filter defaults to false" {
     defer ui_instance.deinit();
 
     try std.testing.expect(!ui_instance.cosmetic_filter);
+}
+
+test "CosmeticCounts tracks cosmetic changes correctly" {
+    var counts = UI.CosmeticCounts{};
+
+    // Initial state should be all zeros
+    try std.testing.expectEqual(@as(u32, 0), counts.total());
+
+    // Add some counts
+    counts.comment_changes = 3;
+    counts.whitespace_changes = 2;
+    counts.rename_changes = 1;
+
+    try std.testing.expectEqual(@as(u32, 6), counts.total());
+
+    // Reset should clear all
+    counts.reset();
+    try std.testing.expectEqual(@as(u32, 0), counts.total());
+    try std.testing.expectEqual(@as(u32, 0), counts.comment_changes);
+    try std.testing.expectEqual(@as(u32, 0), counts.whitespace_changes);
+}
+
+test "DiffLine has cosmetic_category field" {
+    const line = DiffLine{
+        .content = "test",
+        .line_type = .addition,
+        .cosmetic_category = .comment,
+    };
+
+    try std.testing.expect(line.cosmetic_category.isCosmetic());
+    try std.testing.expectEqual(cosmetic.ChangeCategory.comment, line.cosmetic_category);
+}
+
+test "DiffLine defaults to semantic category" {
+    const line = DiffLine{
+        .content = "test",
+        .line_type = .addition,
+    };
+
+    try std.testing.expect(!line.cosmetic_category.isCosmetic());
+    try std.testing.expectEqual(cosmetic.ChangeCategory.semantic, line.cosmetic_category);
+}
+
+test "SplitCell has cosmetic_category field" {
+    const cell = SplitRow.SplitCell{
+        .line_num = 1,
+        .content = "test",
+        .line_type = .deletion,
+        .cosmetic_category = .whitespace,
+    };
+
+    try std.testing.expect(cell.cosmetic_category.isCosmetic());
+    try std.testing.expectEqual(cosmetic.ChangeCategory.whitespace, cell.cosmetic_category);
+}
+
+test "SplitCell defaults to semantic category" {
+    const cell = SplitRow.SplitCell{
+        .line_num = 1,
+        .content = "test",
+        .line_type = .addition,
+    };
+
+    try std.testing.expect(!cell.cosmetic_category.isCosmetic());
+    try std.testing.expectEqual(cosmetic.ChangeCategory.semantic, cell.cosmetic_category);
 }

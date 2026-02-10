@@ -187,6 +187,7 @@ pub const Snapshot = struct {
             .ask_response_comment => "ask_response_comment",
             .help => "help",
             .file_list => "file_list",
+            .summary_overview => "summary_overview",
         };
 
         const view_mode_str = switch (ui_instance.view_mode) {

@@ -27,6 +27,7 @@ pub const Mode = enum {
     ask_response_comment, // Comment input from response view
     help,
     file_list,
+    summary_overview, // Semantic overview of all changes
 };
 
 const ViewMode = enum {
@@ -129,6 +130,10 @@ pub const UI = struct {
     cosmetic_filter: bool = false,
     // Cosmetic change statistics for current file (for indicator lines)
     cosmetic_counts: CosmeticCounts = .{},
+    // Summary overview state (toggle showing cosmetic items in overview)
+    summary_show_cosmetic: bool = false,
+    summary_cursor: usize = 0, // Cursor position in summary overview list
+    summary_scroll_offset: usize = 0, // Scroll offset for summary overview,
 
     /// Statistics about cosmetic changes for indicator display
     const CosmeticCounts = struct {
@@ -1206,6 +1211,7 @@ pub const UI = struct {
             .ask_response_comment => try self.handleAskResponseCommentKey(ctx, key),
             .help => self.handleHelpKey(ctx, key),
             .file_list => try self.handleFileListKey(ctx, key),
+            .summary_overview => self.handleSummaryOverviewKey(ctx, key),
         }
     }
 
@@ -1313,6 +1319,13 @@ pub const UI = struct {
             'l', '.' => {
                 self.file_list_cursor = self.session.current_file_idx;
                 self.mode = .file_list;
+                return ctx.consumeAndRedraw();
+            },
+            'O' => {
+                // Open summary overview
+                self.summary_cursor = 0;
+                self.summary_scroll_offset = 0;
+                self.mode = .summary_overview;
                 return ctx.consumeAndRedraw();
             },
             'c' => {
@@ -1636,6 +1649,125 @@ pub const UI = struct {
                 try self.buildDiffLines();
                 self.mode = .normal;
                 return ctx.consumeAndRedraw();
+            }
+        }
+    }
+
+    fn handleSummaryOverviewKey(self: *UI, ctx: *vxfw.EventContext, key: vaxis.Key) void {
+        const cp = key.codepoint;
+
+        // Exit on Escape or O
+        if (cp == vaxis.Key.escape or cp == 'O' or cp == 'q') {
+            self.mode = .normal;
+            return ctx.consumeAndRedraw();
+        }
+
+        // Toggle showing cosmetic items with 'c'
+        if (cp == 'c') {
+            self.summary_show_cosmetic = !self.summary_show_cosmetic;
+            // Reset cursor when toggling
+            self.summary_cursor = 0;
+            self.summary_scroll_offset = 0;
+            return ctx.consumeAndRedraw();
+        }
+
+        // Navigation
+        if (cp == vaxis.Key.up or cp == 'k') {
+            if (self.summary_cursor > 0) {
+                self.summary_cursor -= 1;
+                // Adjust scroll if cursor goes above visible area
+                if (self.summary_cursor < self.summary_scroll_offset) {
+                    self.summary_scroll_offset = self.summary_cursor;
+                }
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.down or cp == 'j') {
+            // Get total item count to limit cursor
+            const item_count = self.getSummaryOverviewItemCount();
+            if (self.summary_cursor + 1 < item_count) {
+                self.summary_cursor += 1;
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        // Enter: navigate to selected construct
+        if (cp == vaxis.Key.enter) {
+            self.navigateToSummaryItem();
+            return ctx.consumeAndRedraw();
+        }
+
+        // Page navigation
+        if (cp == vaxis.Key.page_up) {
+            if (self.summary_cursor >= 10) {
+                self.summary_cursor -= 10;
+            } else {
+                self.summary_cursor = 0;
+            }
+            if (self.summary_cursor < self.summary_scroll_offset) {
+                self.summary_scroll_offset = self.summary_cursor;
+            }
+            return ctx.consumeAndRedraw();
+        }
+
+        if (cp == vaxis.Key.page_down) {
+            const item_count = self.getSummaryOverviewItemCount();
+            self.summary_cursor = @min(self.summary_cursor + 10, if (item_count > 0) item_count - 1 else 0);
+            return ctx.consumeAndRedraw();
+        }
+    }
+
+    /// Get total number of items in summary overview (constructs across all files)
+    fn getSummaryOverviewItemCount(self: *UI) usize {
+        // Ensure session summary is computed
+        if (self.session_summary == null) {
+            self.session_summary = summary.analyzeSession(self.allocator, self.session) catch return 0;
+        }
+
+        const sess_summary = self.session_summary orelse return 0;
+
+        var count: usize = 0;
+        for (sess_summary.files) |file_sum| {
+            for (file_sum.constructs) |construct| {
+                // Skip cosmetic if not showing them
+                if (!self.summary_show_cosmetic and construct.category.isCosmetic()) {
+                    continue;
+                }
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Navigate to the currently selected summary item
+    fn navigateToSummaryItem(self: *UI) void {
+        // Ensure session summary is computed
+        if (self.session_summary == null) {
+            self.session_summary = summary.analyzeSession(self.allocator, self.session) catch return;
+        }
+
+        const sess_summary = self.session_summary orelse return;
+
+        var current_idx: usize = 0;
+        for (sess_summary.files, 0..) |file_sum, file_idx| {
+            for (file_sum.constructs) |construct| {
+                // Skip cosmetic if not showing them
+                if (!self.summary_show_cosmetic and construct.category.isCosmetic()) {
+                    continue;
+                }
+
+                if (current_idx == self.summary_cursor) {
+                    // Navigate to this file and line
+                    self.refreshIfHasStagedChanges() catch {};
+                    self.session.goToFile(file_idx);
+                    self.resetView();
+                    self.buildDiffLines() catch return;
+                    self.scrollToSourceLine(construct.line_start);
+                    self.mode = .normal;
+                    return;
+                }
+                current_idx += 1;
             }
         }
     }
@@ -2566,6 +2698,7 @@ pub const UI = struct {
         return switch (self.mode) {
             .help => self.drawHelp(ctx),
             .file_list => self.drawFileList(ctx),
+            .summary_overview => self.drawSummaryOverview(ctx),
             .ask_response => self.drawAskResponse(ctx),
             .ask_response_comment => self.drawAskResponseComment(ctx),
             else => self.drawMainView(ctx),
@@ -4141,6 +4274,7 @@ pub const UI = struct {
             "    PgUp/PgDn           Page up/down",
             "    Shift+PgUp/PgDn     Page with selection",
             "    l or .              Show file list",
+            "    O                   Changes overview (semantic summary)",
             "",
             "  View:",
             "    v                   Toggle split/unified view",
@@ -4162,6 +4296,11 @@ pub const UI = struct {
             "    c                   Add comment on the code",
             "    Up/Down/PgUp/PgDn   Scroll answer",
             "    Esc/q               Close response",
+            "",
+            "  In Changes Overview:",
+            "    c                   Toggle cosmetic items",
+            "    Enter               Navigate to construct",
+            "    O/Esc               Close overview",
             "",
             "  Press ? or Esc to close",
         };
@@ -4212,6 +4351,206 @@ pub const UI = struct {
             .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
         };
         writeString(&surface, 2, @intCast(size.height -| 1), "[↑↓] navigate  [Enter] select  [l/Esc] close", dim_style);
+
+        return surface;
+    }
+
+    fn drawSummaryOverview(self: *UI, ctx: vxfw.DrawContext) Allocator.Error!vxfw.Surface {
+        const cosmetic_mod = @import("cosmetic.zig");
+        _ = cosmetic_mod; // Used for type reference
+        const size = ctx.max.size();
+        var surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
+
+        // Ensure session summary is computed
+        if (self.session_summary == null) {
+            self.session_summary = summary.analyzeSession(self.allocator, self.session) catch null;
+        }
+
+        const sess_summary = self.session_summary orelse {
+            writeString(&surface, 2, 2, "Unable to analyze session", .{});
+            return surface;
+        };
+
+        // Styles
+        const header_style: vaxis.Style = .{
+            .bg = .{ .rgb = .{ 0x00, 0x5f, 0x87 } }, // Blue background
+            .fg = .{ .rgb = .{ 0xff, 0xff, 0xff } },
+            .bold = true,
+        };
+        const dim_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x80, 0x80, 0x80 } },
+        };
+        const cosmetic_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x60, 0x60, 0x60 } }, // Dimmer for cosmetic
+            .italic = true,
+        };
+        const added_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0x00, 0xd7, 0x00 } }, // Green
+        };
+        const modified_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0xd7, 0xd7, 0x00 } }, // Yellow
+        };
+        const deleted_style: vaxis.Style = .{
+            .fg = .{ .rgb = .{ 0xd7, 0x00, 0x00 } }, // Red
+        };
+
+        // Header row
+        fillRow(&surface, 0, ' ', header_style);
+        writeString(&surface, 1, 0, " Changes Overview", header_style);
+
+        // Summary statistics (row 2)
+        var stats_buf: [128]u8 = undefined;
+        const total_constructs = sess_summary.total_stats.totalConstructs();
+        const total_semantic = sess_summary.total_stats.semantic_changes;
+        const total_cosmetic = sess_summary.total_stats.cosmetic_changes;
+
+        const stats_text = std.fmt.bufPrint(&stats_buf, "Total: {d} constructs ({d} semantic, {d} cosmetic) across {d} files", .{
+            total_constructs,
+            total_semantic,
+            total_cosmetic,
+            sess_summary.files.len,
+        }) catch "Total: ?";
+        writeString(&surface, 2, 2, stats_text, dim_style);
+
+        // Line change summary
+        var line_buf: [64]u8 = undefined;
+        const line_text = std.fmt.bufPrint(&line_buf, "Lines: +{d} -{d}", .{
+            sess_summary.total_stats.lines_added,
+            sess_summary.total_stats.lines_deleted,
+        }) catch "";
+        if (size.width > stats_text.len + line_text.len + 10) {
+            writeString(&surface, @intCast(size.width -| line_text.len -| 3), 2, line_text, dim_style);
+        }
+
+        // Separator
+        const sep_row: u16 = 3;
+        for (0..size.width) |col| {
+            surface.writeCell(@intCast(col), sep_row, .{
+                .char = .{ .grapheme = "─", .width = 1 },
+                .style = dim_style,
+            });
+        }
+
+        // Content area starts at row 4
+        var row: u16 = 4;
+        const footer_row: u16 = size.height -| 1;
+        const content_height = if (footer_row > row) footer_row - row else 0;
+
+        // Adjust scroll offset to keep cursor visible
+        if (self.summary_cursor < self.summary_scroll_offset) {
+            self.summary_scroll_offset = self.summary_cursor;
+        } else if (self.summary_cursor >= self.summary_scroll_offset + content_height) {
+            self.summary_scroll_offset = self.summary_cursor -| content_height + 1;
+        }
+
+        // Render constructs grouped by file
+        var current_idx: usize = 0;
+        var visible_idx: usize = 0;
+        var current_file_header: ?[]const u8 = null;
+
+        for (sess_summary.files) |file_sum| {
+            // Check if this file has any visible constructs
+            var file_has_visible_constructs = false;
+            for (file_sum.constructs) |construct| {
+                if (self.summary_show_cosmetic or !construct.category.isCosmetic()) {
+                    file_has_visible_constructs = true;
+                    break;
+                }
+            }
+            if (!file_has_visible_constructs) continue;
+
+            for (file_sum.constructs) |construct| {
+                // Skip cosmetic if not showing them
+                if (!self.summary_show_cosmetic and construct.category.isCosmetic()) {
+                    continue;
+                }
+
+                // Check if within visible scroll range
+                if (visible_idx >= self.summary_scroll_offset and row < footer_row) {
+                    // Show file header if changed
+                    if (current_file_header == null or !std.mem.eql(u8, current_file_header.?, file_sum.path)) {
+                        if (row < footer_row) {
+                            // File header
+                            var file_header_buf: [256]u8 = undefined;
+                            const sem_count = file_sum.semanticConstructCount();
+                            const cos_count = file_sum.cosmeticConstructCount();
+                            const file_header = std.fmt.bufPrint(&file_header_buf, "{s} ({d} semantic{s})", .{
+                                file_sum.path,
+                                sem_count,
+                                if (cos_count > 0) blk: {
+                                    var cos_buf: [32]u8 = undefined;
+                                    break :blk std.fmt.bufPrint(&cos_buf, ", {d} cosmetic", .{cos_count}) catch "";
+                                } else "",
+                            }) catch file_sum.path;
+                            writeString(&surface, 2, row, file_header, .{ .bold = true, .fg = .{ .rgb = .{ 0x5f, 0x87, 0xaf } } });
+                            row += 1;
+                            current_file_header = file_sum.path;
+                        }
+                    }
+
+                    if (row < footer_row) {
+                        // Construct line
+                        const is_selected = current_idx == self.summary_cursor;
+                        const is_cosmetic = construct.category.isCosmetic();
+
+                        // Choose style based on change type
+                        var base_style: vaxis.Style = switch (construct.change_type) {
+                            .added => added_style,
+                            .modified => modified_style,
+                            .deleted => deleted_style,
+                        };
+
+                        // Apply cosmetic styling
+                        if (is_cosmetic) {
+                            base_style = cosmetic_style;
+                        }
+
+                        // Apply selection
+                        if (is_selected) {
+                            base_style.bg = .{ .rgb = .{ 0x44, 0x44, 0x44 } };
+                            base_style.bold = true;
+                        }
+
+                        // Format construct line
+                        var construct_buf: [256]u8 = undefined;
+                        const symbol = construct.change_type.symbol();
+                        const type_label = construct.node_type.label();
+
+                        // Add cosmetic category indicator if showing cosmetic
+                        const cosmetic_indicator: []const u8 = if (is_cosmetic)
+                            switch (construct.category) {
+                                .comment => " [comment]",
+                                .whitespace => " [whitespace]",
+                                .rename => " [rename]",
+                                .moved => " [moved]",
+                                .semantic => "",
+                            }
+                        else
+                            "";
+
+                        const construct_text = std.fmt.bufPrint(&construct_buf, "    {s} {s} ({s}){s} L{d}", .{
+                            symbol,
+                            construct.name,
+                            type_label,
+                            cosmetic_indicator,
+                            construct.line_start,
+                        }) catch "    ?";
+
+                        writeString(&surface, 0, row, construct_text, base_style);
+                        row += 1;
+                    }
+                }
+
+                current_idx += 1;
+                visible_idx += 1;
+            }
+        }
+
+        // Footer
+        const cosmetic_toggle = if (self.summary_show_cosmetic) "cosmetic: ON" else "cosmetic: OFF";
+        var footer_buf: [128]u8 = undefined;
+        const footer_text = std.fmt.bufPrint(&footer_buf, "[↑↓] navigate  [Enter] go to  [c] toggle {s}  [O/Esc] close", .{cosmetic_toggle}) catch "[O/Esc] close";
+        writeString(&surface, 2, footer_row, footer_text, dim_style);
 
         return surface;
     }
@@ -7572,4 +7911,35 @@ test "SplitCell defaults to semantic category" {
 
     try std.testing.expect(!cell.cosmetic_category.isCosmetic());
     try std.testing.expectEqual(cosmetic.ChangeCategory.semantic, cell.cosmetic_category);
+}
+
+test "summary_show_cosmetic defaults to false" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var ui_instance = UI.initForTest(allocator, &session);
+    defer ui_instance.deinit();
+
+    try std.testing.expect(!ui_instance.summary_show_cosmetic);
+}
+
+test "summary_cursor defaults to 0" {
+    const allocator = std.testing.allocator;
+
+    var session = review.ReviewSession.init(allocator);
+    defer session.deinit();
+
+    var ui_instance = UI.initForTest(allocator, &session);
+    defer ui_instance.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), ui_instance.summary_cursor);
+    try std.testing.expectEqual(@as(usize, 0), ui_instance.summary_scroll_offset);
+}
+
+test "Mode enum includes summary_overview" {
+    // Verify the new mode is accessible
+    const mode: Mode = .summary_overview;
+    try std.testing.expectEqual(Mode.summary_overview, mode);
 }

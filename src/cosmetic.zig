@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const difft = @import("difft.zig");
 const highlight = @import("highlight.zig");
 const collapse = @import("collapse.zig");
+const treez = @import("treez");
 
 /// Category of a change - whether it's cosmetic or semantic
 pub const ChangeCategory = enum {
@@ -509,19 +510,425 @@ fn contentEqualIgnoringWhitespace(a: []const u8, b: []const u8) bool {
     return ai >= a.len and bi >= b.len;
 }
 
-/// Check if a change is a rename (stub - to be implemented in hi4eluj3)
+/// Check if a change is a rename (identifiers changed but structure is the same)
+/// Returns true if the code structure is identical after normalizing identifiers
 pub fn isRename(
     allocator: Allocator,
     old_content: []const u8,
     new_content: []const u8,
     lang: highlight.Language,
 ) !bool {
-    _ = allocator;
-    _ = old_content;
-    _ = new_content;
-    _ = lang;
-    // TODO: Implement in task hi4eluj3
-    return false;
+    // First quick check: if contents are identical, it's not a rename
+    if (std.mem.eql(u8, old_content, new_content)) {
+        return false;
+    }
+
+    // If content is identical ignoring whitespace, it's a whitespace change, not a rename
+    if (contentEqualIgnoringWhitespace(old_content, new_content)) {
+        return false;
+    }
+
+    // Try to normalize both versions and compare
+    const old_normalized = normalizeIdentifiers(allocator, old_content, lang) catch |err| {
+        // If parsing fails, we can't determine if it's a rename
+        if (err == error.LanguageNotSupported or err == error.ParserCreationFailed or err == error.ParseFailed) {
+            return false;
+        }
+        return err;
+    };
+    defer allocator.free(old_normalized);
+
+    const new_normalized = normalizeIdentifiers(allocator, new_content, lang) catch |err| {
+        if (err == error.LanguageNotSupported or err == error.ParserCreationFailed or err == error.ParseFailed) {
+            return false;
+        }
+        return err;
+    };
+    defer allocator.free(new_normalized);
+
+    // If normalized versions are equal (ignoring whitespace), it's a rename
+    return contentEqualIgnoringWhitespace(old_normalized, new_normalized);
+}
+
+/// Normalize identifiers in source code by replacing them with placeholders
+/// This allows comparing code structure while ignoring identifier names
+pub fn normalizeIdentifiers(
+    allocator: Allocator,
+    content: []const u8,
+    lang: highlight.Language,
+) ![]const u8 {
+    // Return empty slice for empty content
+    if (content.len == 0) {
+        return allocator.dupe(u8, "");
+    }
+
+    // Check if content has any meaningful text
+    var has_content = false;
+    for (content) |ch| {
+        if (ch > 32) {
+            has_content = true;
+            break;
+        }
+    }
+    if (!has_content) {
+        return allocator.dupe(u8, content);
+    }
+
+    // Get tree-sitter language
+    const ts_lang = getTreeSitterLanguage(lang) catch {
+        return error.LanguageNotSupported;
+    };
+
+    // Create parser
+    const parser = treez.Parser.create() catch {
+        return error.ParserCreationFailed;
+    };
+    defer parser.destroy();
+
+    parser.setLanguage(ts_lang) catch {
+        return error.ParserCreationFailed;
+    };
+
+    // Parse the content
+    const tree = parser.parseString(null, content) catch {
+        return error.ParseFailed;
+    };
+    defer tree.destroy();
+
+    // Extract all identifier spans
+    var identifiers: std.ArrayList(IdentifierSpan) = .empty;
+    defer identifiers.deinit(allocator);
+
+    // Walk the tree to find identifiers
+    var cursor = treez.Tree.Cursor.create(tree.getRootNode());
+    defer cursor.destroy();
+
+    var reached_root = false;
+    while (!reached_root) {
+        const node = cursor.getCurrentNode();
+        const node_type = node.getType();
+
+        // Check if this is an identifier node
+        if (isIdentifierNodeType(node_type)) {
+            const start = node.getStartByte();
+            const end = node.getEndByte();
+            if (start < content.len and end <= content.len and end > start) {
+                try identifiers.append(allocator, .{
+                    .start = start,
+                    .end = end,
+                    .name = content[start..end],
+                });
+            }
+        }
+
+        if (cursor.gotoFirstChild()) continue;
+        if (cursor.gotoNextSibling()) continue;
+
+        var retrace = true;
+        while (retrace) {
+            if (!cursor.gotoParent()) {
+                reached_root = true;
+                retrace = false;
+            } else if (cursor.gotoNextSibling()) {
+                retrace = false;
+            }
+        }
+    }
+
+    // Sort by position (should already be sorted but ensure it)
+    std.mem.sort(IdentifierSpan, identifiers.items, {}, struct {
+        fn lessThan(_: void, a: IdentifierSpan, b: IdentifierSpan) bool {
+            return a.start < b.start;
+        }
+    }.lessThan);
+
+    // Build normalized string by replacing identifiers with placeholders
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+
+    // Map from original identifier name to placeholder ID
+    var id_map = std.StringHashMap(u32).init(allocator);
+    defer id_map.deinit();
+
+    var next_id: u32 = 0;
+    var pos: usize = 0;
+
+    for (identifiers.items) |ident| {
+        // Add content before this identifier
+        if (ident.start > pos) {
+            try result.appendSlice(allocator, content[pos..ident.start]);
+        }
+
+        // Get or create placeholder ID for this identifier
+        const gop = try id_map.getOrPut(ident.name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = next_id;
+            next_id += 1;
+        }
+        const placeholder_id = gop.value_ptr.*;
+
+        // Write placeholder
+        var buf: [20]u8 = undefined;
+        const placeholder = std.fmt.bufPrint(&buf, "_id{d}", .{placeholder_id}) catch "_id";
+        try result.appendSlice(allocator, placeholder);
+
+        pos = ident.end;
+    }
+
+    // Add remaining content after the last identifier
+    if (pos < content.len) {
+        try result.appendSlice(allocator, content[pos..]);
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+/// A span representing an identifier in the source
+const IdentifierSpan = struct {
+    start: u32,
+    end: u32,
+    name: []const u8,
+};
+
+/// Check if a tree-sitter node type represents an identifier
+fn isIdentifierNodeType(node_type: []const u8) bool {
+    // Common identifier node types across languages
+    return std.mem.eql(u8, node_type, "identifier") or
+        std.mem.eql(u8, node_type, "field_identifier") or
+        std.mem.eql(u8, node_type, "type_identifier") or
+        std.mem.eql(u8, node_type, "property_identifier") or
+        std.mem.eql(u8, node_type, "shorthand_property_identifier") or
+        std.mem.eql(u8, node_type, "shorthand_property_identifier_pattern") or
+        // Rust-specific
+        std.mem.eql(u8, node_type, "field_identifier") or
+        std.mem.eql(u8, node_type, "type_identifier") or
+        // Python-specific
+        std.mem.eql(u8, node_type, "identifier") or
+        // Go-specific
+        std.mem.eql(u8, node_type, "field_identifier") or
+        std.mem.eql(u8, node_type, "type_identifier") or
+        std.mem.eql(u8, node_type, "package_identifier") or
+        // Java-specific
+        std.mem.eql(u8, node_type, "identifier") or
+        std.mem.eql(u8, node_type, "type_identifier");
+}
+
+/// Get tree-sitter language for parsing
+fn getTreeSitterLanguage(lang: highlight.Language) !*const treez.Language {
+    return switch (lang) {
+        .zig => treez.Language.get("zig"),
+        .rust => treez.Language.get("rust"),
+        .python => treez.Language.get("python"),
+        .javascript => treez.Language.get("javascript"),
+        .typescript => treez.Language.get("typescript"),
+        .go => treez.Language.get("go"),
+        .c => treez.Language.get("c"),
+        .cpp => treez.Language.get("cpp"),
+        .java => treez.Language.get("java"),
+        .json => treez.Language.get("json"),
+        .yaml => treez.Language.get("yaml"),
+        .toml => treez.Language.get("toml"),
+        .bash => treez.Language.get("bash"),
+    };
+}
+
+/// Extract identifier mappings between old and new versions
+/// Returns a list of old_name → new_name mappings
+pub fn extractIdentifierMappings(
+    allocator: Allocator,
+    old_content: []const u8,
+    new_content: []const u8,
+    lang: highlight.Language,
+) ![]IdentifierMapping {
+    // Extract identifiers from both versions in order
+    var old_identifiers = try extractIdentifiersOrdered(allocator, old_content, lang);
+    defer allocator.free(old_identifiers);
+
+    var new_identifiers = try extractIdentifiersOrdered(allocator, new_content, lang);
+    defer allocator.free(new_identifiers);
+
+    // If different number of identifiers, can't map
+    if (old_identifiers.len != new_identifiers.len) {
+        return &[_]IdentifierMapping{};
+    }
+
+    // Build mappings for identifiers that changed
+    var mappings: std.ArrayList(IdentifierMapping) = .empty;
+    errdefer mappings.deinit(allocator);
+
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+
+    for (old_identifiers, 0..) |old_ident, i| {
+        const new_ident = new_identifiers[i];
+        if (!std.mem.eql(u8, old_ident, new_ident)) {
+            // Only add unique mappings
+            const key = try std.fmt.allocPrint(allocator, "{s}->{s}", .{ old_ident, new_ident });
+            defer allocator.free(key);
+
+            const gop = try seen.getOrPut(key);
+            if (!gop.found_existing) {
+                // Count occurrences
+                var count: u32 = 1;
+                for (old_identifiers[i + 1 ..], i + 1..) |other_old, j| {
+                    if (j < new_identifiers.len and
+                        std.mem.eql(u8, other_old, old_ident) and
+                        std.mem.eql(u8, new_identifiers[j], new_ident))
+                    {
+                        count += 1;
+                    }
+                }
+
+                try mappings.append(allocator, .{
+                    .old_name = try allocator.dupe(u8, old_ident),
+                    .new_name = try allocator.dupe(u8, new_ident),
+                    .count = count,
+                });
+            }
+        }
+    }
+
+    return mappings.toOwnedSlice(allocator);
+}
+
+/// Extract all identifiers from source in order of appearance
+fn extractIdentifiersOrdered(
+    allocator: Allocator,
+    content: []const u8,
+    lang: highlight.Language,
+) ![][]const u8 {
+    if (content.len == 0) {
+        return &[_][]const u8{};
+    }
+
+    // Get tree-sitter language
+    const ts_lang = getTreeSitterLanguage(lang) catch {
+        return &[_][]const u8{};
+    };
+
+    // Create parser
+    const parser = treez.Parser.create() catch {
+        return &[_][]const u8{};
+    };
+    defer parser.destroy();
+
+    parser.setLanguage(ts_lang) catch {
+        return &[_][]const u8{};
+    };
+
+    // Parse the content
+    const tree = parser.parseString(null, content) catch {
+        return &[_][]const u8{};
+    };
+    defer tree.destroy();
+
+    // Extract all identifier names in order
+    var identifiers: std.ArrayList(IdentifierSpan) = .empty;
+    defer identifiers.deinit(allocator);
+
+    // Walk the tree to find identifiers
+    var cursor = treez.Tree.Cursor.create(tree.getRootNode());
+    defer cursor.destroy();
+
+    var reached_root = false;
+    while (!reached_root) {
+        const node = cursor.getCurrentNode();
+        const node_type = node.getType();
+
+        if (isIdentifierNodeType(node_type)) {
+            const start = node.getStartByte();
+            const end = node.getEndByte();
+            if (start < content.len and end <= content.len and end > start) {
+                try identifiers.append(allocator, .{
+                    .start = start,
+                    .end = end,
+                    .name = content[start..end],
+                });
+            }
+        }
+
+        if (cursor.gotoFirstChild()) continue;
+        if (cursor.gotoNextSibling()) continue;
+
+        var retrace = true;
+        while (retrace) {
+            if (!cursor.gotoParent()) {
+                reached_root = true;
+                retrace = false;
+            } else if (cursor.gotoNextSibling()) {
+                retrace = false;
+            }
+        }
+    }
+
+    // Sort by position
+    std.mem.sort(IdentifierSpan, identifiers.items, {}, struct {
+        fn lessThan(_: void, a: IdentifierSpan, b: IdentifierSpan) bool {
+            return a.start < b.start;
+        }
+    }.lessThan);
+
+    // Extract just the names in order
+    var result: std.ArrayList([]const u8) = .empty;
+    errdefer result.deinit(allocator);
+
+    for (identifiers.items) |ident| {
+        try result.append(allocator, ident.name);
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+/// Analyze a diff entry to determine if it's a rename
+/// Returns a CosmeticAnalysis with details about what was renamed
+pub fn analyzeLineForRename(
+    allocator: Allocator,
+    entry: difft.DiffEntry,
+    old_full_content: ?[]const u8,
+    new_full_content: ?[]const u8,
+    lang: highlight.Language,
+) !CosmeticAnalysis {
+    // Get the content from both sides
+    const lhs_content = getFullContentFromSide(entry.lhs);
+    const rhs_content = getFullContentFromSide(entry.rhs);
+
+    // Need both sides to detect a rename
+    if (lhs_content.len == 0 or rhs_content.len == 0) {
+        return CosmeticAnalysis.semantic();
+    }
+
+    // Use full content if available, otherwise use just the line content
+    const old_to_check = old_full_content orelse lhs_content;
+    const new_to_check = new_full_content orelse rhs_content;
+
+    // Check if it's a rename
+    if (try isRename(allocator, old_to_check, new_to_check, lang)) {
+        // Try to extract the first mapping to show what was renamed
+        const mappings = try extractIdentifierMappings(allocator, old_to_check, new_to_check, lang);
+        defer {
+            for (mappings) |m| {
+                allocator.free(m.old_name);
+                allocator.free(m.new_name);
+            }
+            allocator.free(mappings);
+        }
+
+        if (mappings.len > 0) {
+            return CosmeticAnalysis.renameChange(1.0, mappings[0].old_name, mappings[0].new_name);
+        }
+        return CosmeticAnalysis.renameChange(0.9, null, null);
+    }
+
+    return CosmeticAnalysis.semantic();
+}
+
+/// Free identifier mappings
+pub fn freeIdentifierMappings(allocator: Allocator, mappings: []IdentifierMapping) void {
+    for (mappings) |m| {
+        allocator.free(m.old_name);
+        allocator.free(m.new_name);
+    }
+    allocator.free(mappings);
 }
 
 /// Find moved constructs between old and new versions (stub - to be implemented in n5n5jkj2)
@@ -1255,4 +1662,176 @@ test "countLeadingWhitespace counts correctly" {
     try std.testing.expectEqual(@as(usize, 4), countLeadingWhitespace("    code"));
     try std.testing.expectEqual(@as(usize, 1), countLeadingWhitespace("\tcode"));
     try std.testing.expectEqual(@as(usize, 3), countLeadingWhitespace("   "));
+}
+
+// ============================================================================
+// Rename detection tests (task hi4eluj3)
+// ============================================================================
+
+test "isRename returns false for identical content" {
+    const allocator = std.testing.allocator;
+    const content = "const foo = 42;";
+    const result = try isRename(allocator, content, content, .zig);
+    try std.testing.expect(!result);
+}
+
+test "isRename returns false for whitespace-only changes" {
+    const allocator = std.testing.allocator;
+    const old = "const foo = 42;";
+    const new = "const  foo  =  42;";
+    const result = try isRename(allocator, old, new, .zig);
+    try std.testing.expect(!result);
+}
+
+test "isRename detects simple variable rename" {
+    const allocator = std.testing.allocator;
+    const old = "const foo = 42;";
+    const new = "const bar = 42;";
+    const result = try isRename(allocator, old, new, .zig);
+    try std.testing.expect(result);
+}
+
+test "isRename detects function parameter rename" {
+    const allocator = std.testing.allocator;
+    const old = "fn process(value: u32) void { _ = value; }";
+    const new = "fn process(count: u32) void { _ = count; }";
+    const result = try isRename(allocator, old, new, .zig);
+    try std.testing.expect(result);
+}
+
+test "isRename detects multiple renames in same code" {
+    const allocator = std.testing.allocator;
+    const old = "const foo = bar + baz;";
+    const new = "const x = y + z;";
+    const result = try isRename(allocator, old, new, .zig);
+    try std.testing.expect(result);
+}
+
+test "isRename returns false for logic change" {
+    const allocator = std.testing.allocator;
+    const old = "const foo = bar + baz;";
+    const new = "const foo = bar * baz;"; // Changed + to *
+    const result = try isRename(allocator, old, new, .zig);
+    try std.testing.expect(!result);
+}
+
+test "isRename returns false for added code" {
+    const allocator = std.testing.allocator;
+    const old = "const foo = 42;";
+    const new = "const foo = 42; const bar = 10;";
+    const result = try isRename(allocator, old, new, .zig);
+    try std.testing.expect(!result);
+}
+
+test "isRename returns false for unsupported language" {
+    const allocator = std.testing.allocator;
+    const old = "foo: bar";
+    const new = "baz: qux";
+    // YAML identifiers aren't parsed the same way
+    const result = try isRename(allocator, old, new, .yaml);
+    // Should return false gracefully for unsupported/unparseable content
+    try std.testing.expect(!result);
+}
+
+test "normalizeIdentifiers replaces identifiers with placeholders" {
+    const allocator = std.testing.allocator;
+    const source = "const foo = bar;";
+    const normalized = try normalizeIdentifiers(allocator, source, .zig);
+    defer allocator.free(normalized);
+
+    // foo should become _id0, bar should become _id1
+    // The exact output depends on tree-sitter parsing, but should contain _id
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "_id") != null);
+    // Original identifiers should not be present
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "foo") == null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "bar") == null);
+}
+
+test "normalizeIdentifiers handles empty content" {
+    const allocator = std.testing.allocator;
+    const normalized = try normalizeIdentifiers(allocator, "", .zig);
+    defer allocator.free(normalized);
+    try std.testing.expectEqualStrings("", normalized);
+}
+
+test "normalizeIdentifiers handles whitespace-only content" {
+    const allocator = std.testing.allocator;
+    const normalized = try normalizeIdentifiers(allocator, "   \n\t  ", .zig);
+    defer allocator.free(normalized);
+    try std.testing.expectEqualStrings("   \n\t  ", normalized);
+}
+
+test "normalizeIdentifiers produces consistent output for same identifier" {
+    const allocator = std.testing.allocator;
+    // Same identifier used multiple times should get same placeholder
+    const source = "const foo = foo + foo;";
+    const normalized = try normalizeIdentifiers(allocator, source, .zig);
+    defer allocator.free(normalized);
+
+    // Count occurrences of _id0
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOf(u8, normalized[i..], "_id0")) |pos| {
+        count += 1;
+        i = i + pos + 4;
+    }
+    // foo appears 3 times, so _id0 should appear 3 times
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
+
+test "extractIdentifierMappings finds renamed identifiers" {
+    const allocator = std.testing.allocator;
+    const old = "const foo = 42;";
+    const new = "const bar = 42;";
+
+    const mappings = try extractIdentifierMappings(allocator, old, new, .zig);
+    defer freeIdentifierMappings(allocator, mappings);
+
+    // Should find the foo -> bar mapping
+    try std.testing.expect(mappings.len >= 1);
+
+    var found_rename = false;
+    for (mappings) |m| {
+        if (std.mem.eql(u8, m.old_name, "foo") and std.mem.eql(u8, m.new_name, "bar")) {
+            found_rename = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_rename);
+}
+
+test "extractIdentifierMappings returns empty for different structure" {
+    const allocator = std.testing.allocator;
+    const old = "const foo = 42;";
+    const new = "const bar = baz + 42;"; // Different number of identifiers
+
+    const mappings = try extractIdentifierMappings(allocator, old, new, .zig);
+    defer freeIdentifierMappings(allocator, mappings);
+
+    // Should return empty since structure differs
+    try std.testing.expectEqual(@as(usize, 0), mappings.len);
+}
+
+test "isIdentifierNodeType recognizes common identifier types" {
+    try std.testing.expect(isIdentifierNodeType("identifier"));
+    try std.testing.expect(isIdentifierNodeType("field_identifier"));
+    try std.testing.expect(isIdentifierNodeType("type_identifier"));
+    try std.testing.expect(!isIdentifierNodeType("function_declaration"));
+    try std.testing.expect(!isIdentifierNodeType("string"));
+}
+
+test "isRename with function rename" {
+    const allocator = std.testing.allocator;
+    const old =
+        \\fn processData(input: []const u8) void {
+        \\    _ = input;
+        \\}
+    ;
+    const new =
+        \\fn handleData(input: []const u8) void {
+        \\    _ = input;
+        \\}
+    ;
+    const result = try isRename(allocator, old, new, .zig);
+    try std.testing.expect(result);
 }

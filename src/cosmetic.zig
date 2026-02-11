@@ -931,7 +931,11 @@ pub fn freeIdentifierMappings(allocator: Allocator, mappings: []IdentifierMappin
     allocator.free(mappings);
 }
 
-/// Find moved constructs between old and new versions (stub - to be implemented in n5n5jkj2)
+/// Find moved constructs between old and new versions
+/// A construct is "moved" if:
+/// 1. It appears as 'deleted' in old (exists in old but not in new at same location)
+/// 2. It appears as 'added' in new (exists in new but not in old at same location)
+/// 3. The function body content is identical or nearly identical
 pub fn findMovedConstructs(
     allocator: Allocator,
     old_regions: []const collapse.CollapsibleRegion,
@@ -939,21 +943,257 @@ pub fn findMovedConstructs(
     old_content: []const u8,
     new_content: []const u8,
 ) ![]MovedConstruct {
-    _ = allocator;
-    _ = old_regions;
-    _ = new_regions;
-    _ = old_content;
-    _ = new_content;
-    // TODO: Implement in task n5n5jkj2
-    return &[_]MovedConstruct{};
+    var moved_list: std.ArrayList(MovedConstruct) = .empty;
+    errdefer moved_list.deinit(allocator);
+
+    // Build a map of new regions by name for quick lookup
+    var new_by_name = std.StringHashMap(std.ArrayList(usize)).init(allocator);
+    defer {
+        var it = new_by_name.valueIterator();
+        while (it.next()) |list| {
+            list.deinit(allocator);
+        }
+        new_by_name.deinit();
+    }
+
+    for (new_regions, 0..) |region, idx| {
+        const gop = try new_by_name.getOrPut(region.name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = std.ArrayList(usize).empty;
+        }
+        try gop.value_ptr.append(allocator, idx);
+    }
+
+    // Track which new regions have been matched
+    var matched_new = std.AutoHashMap(usize, void).init(allocator);
+    defer matched_new.deinit();
+
+    // For each old region, look for a matching new region with similar body
+    for (old_regions) |old_region| {
+        // Skip if no new regions with same name
+        const new_indices = new_by_name.get(old_region.name) orelse continue;
+
+        // Extract old body
+        const old_body = extractRegionBody(old_region, old_content) orelse continue;
+
+        // Find best matching new region
+        var best_match: ?struct { idx: usize, similarity: f32 } = null;
+
+        for (new_indices.items) |new_idx| {
+            // Skip already matched regions
+            if (matched_new.contains(new_idx)) continue;
+
+            const new_region = new_regions[new_idx];
+
+            // Must be same type of construct
+            if (old_region.node_type != new_region.node_type) continue;
+
+            // Must be at different location to be "moved"
+            if (old_region.start_line == new_region.start_line and
+                old_region.end_line == new_region.end_line)
+            {
+                continue;
+            }
+
+            // Extract new body
+            const new_body = extractRegionBody(new_region, new_content) orelse continue;
+
+            // Compare bodies
+            const similarity = compareConstructBodies(old_body, new_body);
+
+            // Track best match above threshold
+            if (similarity >= 0.90) {
+                if (best_match == null or similarity > best_match.?.similarity) {
+                    best_match = .{ .idx = new_idx, .similarity = similarity };
+                }
+            }
+        }
+
+        // If we found a good match, record it as moved
+        if (best_match) |match| {
+            const new_region = new_regions[match.idx];
+            try matched_new.put(match.idx, {});
+
+            try moved_list.append(allocator, .{
+                .name = old_region.name,
+                .node_type = old_region.node_type,
+                .old_start_line = old_region.start_line,
+                .old_end_line = old_region.end_line,
+                .new_start_line = new_region.start_line,
+                .new_end_line = new_region.end_line,
+                .similarity = match.similarity,
+            });
+        }
+    }
+
+    return moved_list.toOwnedSlice(allocator);
 }
 
-/// Compare two construct bodies and return a similarity score (stub - to be implemented in n5n5jkj2)
+/// Extract the body content of a region from source
+fn extractRegionBody(region: collapse.CollapsibleRegion, content: []const u8) ?[]const u8 {
+    // Find start byte from header_end_line + 1
+    var line: u32 = 1;
+    var start_byte: usize = 0;
+
+    // Find start of body (line after header)
+    for (content, 0..) |c, i| {
+        if (line > region.header_end_line) {
+            start_byte = i;
+            break;
+        }
+        if (c == '\n') {
+            line += 1;
+        }
+    }
+
+    // Find end byte at end_line
+    var end_byte: usize = content.len;
+    line = 1;
+    for (content, 0..) |c, i| {
+        if (c == '\n') {
+            if (line == region.end_line) {
+                end_byte = i + 1;
+                break;
+            }
+            line += 1;
+        }
+    }
+
+    if (start_byte >= end_byte or start_byte >= content.len) {
+        return null;
+    }
+
+    return content[start_byte..@min(end_byte, content.len)];
+}
+
+/// Compare two construct bodies and return a similarity score
+/// Returns 1.0 for identical content, lower values for differences
+/// Uses Levenshtein-like comparison on normalized (whitespace-stripped) content
 pub fn compareConstructBodies(old_body: []const u8, new_body: []const u8) f32 {
-    _ = old_body;
-    _ = new_body;
-    // TODO: Implement in task n5n5jkj2
-    return 0.0;
+    // Quick check: if identical, return 1.0
+    if (std.mem.eql(u8, old_body, new_body)) {
+        return 1.0;
+    }
+
+    // Check if identical after stripping whitespace
+    if (contentEqualIgnoringWhitespace(old_body, new_body)) {
+        return 1.0;
+    }
+
+    // For longer content, compute token-based similarity
+    // Count matching tokens vs total tokens
+    const old_tokens = countNonWhitespaceTokens(old_body);
+    const new_tokens = countNonWhitespaceTokens(new_body);
+
+    if (old_tokens == 0 and new_tokens == 0) {
+        return 1.0;
+    }
+    if (old_tokens == 0 or new_tokens == 0) {
+        return 0.0;
+    }
+
+    // Use longest common subsequence approach on characters (ignoring whitespace)
+    const lcs_len = computeLCSLength(old_body, new_body);
+    const max_len = @max(old_tokens, new_tokens);
+
+    if (max_len == 0) return 1.0;
+
+    return @as(f32, @floatFromInt(lcs_len)) / @as(f32, @floatFromInt(max_len));
+}
+
+/// Count non-whitespace characters (tokens) in content
+fn countNonWhitespaceTokens(content: []const u8) usize {
+    var count: usize = 0;
+    for (content) |c| {
+        if (!std.ascii.isWhitespace(c)) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// Compute length of longest common subsequence (ignoring whitespace)
+/// Uses O(n) space dynamic programming approach
+fn computeLCSLength(a: []const u8, b: []const u8) usize {
+    // Strip whitespace first to get comparable sequences
+    var a_chars: [4096]u8 = undefined;
+    var b_chars: [4096]u8 = undefined;
+    var a_len: usize = 0;
+    var b_len: usize = 0;
+
+    for (a) |c| {
+        if (!std.ascii.isWhitespace(c) and a_len < a_chars.len) {
+            a_chars[a_len] = c;
+            a_len += 1;
+        }
+    }
+
+    for (b) |c| {
+        if (!std.ascii.isWhitespace(c) and b_len < b_chars.len) {
+            b_chars[b_len] = c;
+            b_len += 1;
+        }
+    }
+
+    if (a_len == 0 or b_len == 0) return 0;
+
+    // Use two-row DP approach
+    var prev_row: [4097]usize = undefined;
+    var curr_row: [4097]usize = undefined;
+
+    // Initialize first row
+    for (0..b_len + 1) |j| {
+        prev_row[j] = 0;
+    }
+
+    // Fill DP table
+    for (0..a_len) |i| {
+        curr_row[0] = 0;
+        for (0..b_len) |j| {
+            if (a_chars[i] == b_chars[j]) {
+                curr_row[j + 1] = prev_row[j] + 1;
+            } else {
+                curr_row[j + 1] = @max(curr_row[j], prev_row[j + 1]);
+            }
+        }
+        // Swap rows
+        const tmp = prev_row;
+        prev_row = curr_row;
+        curr_row = tmp;
+    }
+
+    return prev_row[b_len];
+}
+
+/// Check if a line range from old content was moved to a different location in new content
+pub fn isLineMoved(
+    line: u32,
+    moved_constructs: []const MovedConstruct,
+) ?*const MovedConstruct {
+    for (moved_constructs) |*mc| {
+        if (line >= mc.old_start_line and line <= mc.old_end_line) {
+            return mc;
+        }
+    }
+    return null;
+}
+
+/// Check if a line in the new content came from a moved construct
+pub fn isLineFromMoved(
+    line: u32,
+    moved_constructs: []const MovedConstruct,
+) ?*const MovedConstruct {
+    for (moved_constructs) |*mc| {
+        if (line >= mc.new_start_line and line <= mc.new_end_line) {
+            return mc;
+        }
+    }
+    return null;
+}
+
+/// Free a list of moved constructs (names are slices into original content, so no freeing needed)
+pub fn freeMovedConstructs(allocator: Allocator, constructs: []MovedConstruct) void {
+    allocator.free(constructs);
 }
 
 /// Strip all whitespace from content (allocates new string)
@@ -1834,4 +2074,384 @@ test "isRename with function rename" {
     ;
     const result = try isRename(allocator, old, new, .zig);
     try std.testing.expect(result);
+}
+
+// ============================================================================
+// Moved function detection tests (task n5n5jkj2)
+// ============================================================================
+
+test "compareConstructBodies returns 1.0 for identical content" {
+    const body = "    x += 1;\n    return x;\n";
+    const similarity = compareConstructBodies(body, body);
+    try std.testing.expectEqual(@as(f32, 1.0), similarity);
+}
+
+test "compareConstructBodies returns 1.0 for whitespace-only differences" {
+    const old = "x+=1;return x;";
+    const new = "x += 1;\n    return x;\n";
+    const similarity = compareConstructBodies(old, new);
+    try std.testing.expectEqual(@as(f32, 1.0), similarity);
+}
+
+test "compareConstructBodies returns high similarity for minor changes" {
+    const old = "x += 1;\nreturn x;";
+    const new = "x += 2;\nreturn x;";
+    const similarity = compareConstructBodies(old, new);
+    // Should be close to 1.0 but not exact (one character differs)
+    try std.testing.expect(similarity >= 0.9);
+    try std.testing.expect(similarity < 1.0);
+}
+
+test "compareConstructBodies returns low similarity for different content" {
+    const old = "completely different code here";
+    const new = "xyz abc 123 other stuff now";
+    const similarity = compareConstructBodies(old, new);
+    // Should be significantly different
+    try std.testing.expect(similarity < 0.5);
+}
+
+test "compareConstructBodies handles empty bodies" {
+    const similarity1 = compareConstructBodies("", "");
+    try std.testing.expectEqual(@as(f32, 1.0), similarity1);
+
+    const similarity2 = compareConstructBodies("code", "");
+    try std.testing.expectEqual(@as(f32, 0.0), similarity2);
+
+    const similarity3 = compareConstructBodies("", "code");
+    try std.testing.expectEqual(@as(f32, 0.0), similarity3);
+}
+
+test "countNonWhitespaceTokens counts correctly" {
+    try std.testing.expectEqual(@as(usize, 0), countNonWhitespaceTokens(""));
+    try std.testing.expectEqual(@as(usize, 0), countNonWhitespaceTokens("   \t\n"));
+    try std.testing.expectEqual(@as(usize, 3), countNonWhitespaceTokens("abc"));
+    try std.testing.expectEqual(@as(usize, 3), countNonWhitespaceTokens("a b c"));
+    try std.testing.expectEqual(@as(usize, 3), countNonWhitespaceTokens("  a  b  c  "));
+}
+
+test "computeLCSLength finds correct length" {
+    // Identical strings (ignoring whitespace)
+    const len1 = computeLCSLength("abc", "abc");
+    try std.testing.expectEqual(@as(usize, 3), len1);
+
+    // One empty
+    const len2 = computeLCSLength("abc", "");
+    try std.testing.expectEqual(@as(usize, 0), len2);
+
+    // Subsequence
+    const len3 = computeLCSLength("abcd", "axbxcxd");
+    try std.testing.expectEqual(@as(usize, 4), len3);
+
+    // No common subsequence
+    const len4 = computeLCSLength("abc", "xyz");
+    try std.testing.expectEqual(@as(usize, 0), len4);
+}
+
+test "findMovedConstructs detects function moved within file" {
+    const allocator = std.testing.allocator;
+
+    // Old content: helper at lines 1-3, main at lines 5-7
+    const old_content =
+        \\fn helper() void {
+        \\    doSomething();
+        \\}
+        \\
+        \\fn main() void {
+        \\    helper();
+        \\}
+    ;
+
+    // New content: main at lines 1-3, helper at lines 5-7 (swapped)
+    const new_content =
+        \\fn main() void {
+        \\    helper();
+        \\}
+        \\
+        \\fn helper() void {
+        \\    doSomething();
+        \\}
+    ;
+
+    // Create regions representing the functions
+    const old_regions = [_]collapse.CollapsibleRegion{
+        .{
+            .start_line = 1,
+            .end_line = 3,
+            .header_end_line = 1,
+            .node_type = .function,
+            .name = "helper",
+            .collapsed = false,
+            .level = 1,
+        },
+        .{
+            .start_line = 5,
+            .end_line = 7,
+            .header_end_line = 5,
+            .node_type = .function,
+            .name = "main",
+            .collapsed = false,
+            .level = 1,
+        },
+    };
+
+    const new_regions = [_]collapse.CollapsibleRegion{
+        .{
+            .start_line = 1,
+            .end_line = 3,
+            .header_end_line = 1,
+            .node_type = .function,
+            .name = "main",
+            .collapsed = false,
+            .level = 1,
+        },
+        .{
+            .start_line = 5,
+            .end_line = 7,
+            .header_end_line = 5,
+            .node_type = .function,
+            .name = "helper",
+            .collapsed = false,
+            .level = 1,
+        },
+    };
+
+    const moved = try findMovedConstructs(
+        allocator,
+        &old_regions,
+        &new_regions,
+        old_content,
+        new_content,
+    );
+    defer freeMovedConstructs(allocator, moved);
+
+    // Should detect both functions as moved
+    try std.testing.expectEqual(@as(usize, 2), moved.len);
+
+    // Verify one of the moved constructs is helper
+    var found_helper = false;
+    var found_main = false;
+    for (moved) |m| {
+        if (std.mem.eql(u8, m.name, "helper")) {
+            found_helper = true;
+            try std.testing.expectEqual(@as(u32, 1), m.old_start_line);
+            try std.testing.expectEqual(@as(u32, 5), m.new_start_line);
+            try std.testing.expect(m.similarity >= 0.9);
+        }
+        if (std.mem.eql(u8, m.name, "main")) {
+            found_main = true;
+            try std.testing.expectEqual(@as(u32, 5), m.old_start_line);
+            try std.testing.expectEqual(@as(u32, 1), m.new_start_line);
+        }
+    }
+    try std.testing.expect(found_helper);
+    try std.testing.expect(found_main);
+}
+
+test "findMovedConstructs ignores modified function" {
+    const allocator = std.testing.allocator;
+
+    // Old content
+    const old_content =
+        \\fn helper() void {
+        \\    doSomething();
+        \\}
+    ;
+
+    // New content: function body changed significantly
+    const new_content =
+        \\fn helper() void {
+        \\    doCompletelyDifferentThing();
+        \\    withExtraCode();
+        \\}
+    ;
+
+    const old_regions = [_]collapse.CollapsibleRegion{
+        .{
+            .start_line = 1,
+            .end_line = 3,
+            .header_end_line = 1,
+            .node_type = .function,
+            .name = "helper",
+            .collapsed = false,
+            .level = 1,
+        },
+    };
+
+    const new_regions = [_]collapse.CollapsibleRegion{
+        .{
+            .start_line = 1,
+            .end_line = 4,
+            .header_end_line = 1,
+            .node_type = .function,
+            .name = "helper",
+            .collapsed = false,
+            .level = 1,
+        },
+    };
+
+    const moved = try findMovedConstructs(
+        allocator,
+        &old_regions,
+        &new_regions,
+        old_content,
+        new_content,
+    );
+    defer freeMovedConstructs(allocator, moved);
+
+    // Should NOT detect as moved since body changed and location is same
+    try std.testing.expectEqual(@as(usize, 0), moved.len);
+}
+
+test "findMovedConstructs handles struct moved" {
+    const allocator = std.testing.allocator;
+
+    const old_content =
+        \\const Config = struct {
+        \\    value: u32,
+        \\};
+        \\
+        \\const State = struct {
+        \\    count: u32,
+        \\};
+    ;
+
+    const new_content =
+        \\const State = struct {
+        \\    count: u32,
+        \\};
+        \\
+        \\const Config = struct {
+        \\    value: u32,
+        \\};
+    ;
+
+    const old_regions = [_]collapse.CollapsibleRegion{
+        .{
+            .start_line = 1,
+            .end_line = 3,
+            .header_end_line = 1,
+            .node_type = .struct_,
+            .name = "Config",
+            .collapsed = false,
+            .level = 1,
+        },
+        .{
+            .start_line = 5,
+            .end_line = 7,
+            .header_end_line = 5,
+            .node_type = .struct_,
+            .name = "State",
+            .collapsed = false,
+            .level = 1,
+        },
+    };
+
+    const new_regions = [_]collapse.CollapsibleRegion{
+        .{
+            .start_line = 1,
+            .end_line = 3,
+            .header_end_line = 1,
+            .node_type = .struct_,
+            .name = "State",
+            .collapsed = false,
+            .level = 1,
+        },
+        .{
+            .start_line = 5,
+            .end_line = 7,
+            .header_end_line = 5,
+            .node_type = .struct_,
+            .name = "Config",
+            .collapsed = false,
+            .level = 1,
+        },
+    };
+
+    const moved = try findMovedConstructs(
+        allocator,
+        &old_regions,
+        &new_regions,
+        old_content,
+        new_content,
+    );
+    defer freeMovedConstructs(allocator, moved);
+
+    // Should detect both structs as moved
+    try std.testing.expectEqual(@as(usize, 2), moved.len);
+}
+
+test "isLineMoved finds line in moved construct" {
+    const moved = [_]MovedConstruct{
+        .{
+            .name = "helper",
+            .node_type = .function,
+            .old_start_line = 10,
+            .old_end_line = 20,
+            .new_start_line = 50,
+            .new_end_line = 60,
+            .similarity = 1.0,
+        },
+    };
+
+    // Line within old range
+    const result1 = isLineMoved(15, &moved);
+    try std.testing.expect(result1 != null);
+    try std.testing.expectEqualStrings("helper", result1.?.name);
+
+    // Line outside old range
+    const result2 = isLineMoved(5, &moved);
+    try std.testing.expect(result2 == null);
+
+    // Line at boundary
+    const result3 = isLineMoved(10, &moved);
+    try std.testing.expect(result3 != null);
+}
+
+test "isLineFromMoved finds line in new location" {
+    const moved = [_]MovedConstruct{
+        .{
+            .name = "helper",
+            .node_type = .function,
+            .old_start_line = 10,
+            .old_end_line = 20,
+            .new_start_line = 50,
+            .new_end_line = 60,
+            .similarity = 1.0,
+        },
+    };
+
+    // Line within new range
+    const result1 = isLineFromMoved(55, &moved);
+    try std.testing.expect(result1 != null);
+    try std.testing.expectEqualStrings("helper", result1.?.name);
+
+    // Line outside new range
+    const result2 = isLineFromMoved(15, &moved);
+    try std.testing.expect(result2 == null);
+}
+
+test "extractRegionBody extracts correct content" {
+    const content =
+        \\fn test() void {
+        \\    line1();
+        \\    line2();
+        \\}
+    ;
+
+    const region = collapse.CollapsibleRegion{
+        .start_line = 1,
+        .end_line = 4,
+        .header_end_line = 1,
+        .node_type = .function,
+        .name = "test",
+        .collapsed = false,
+        .level = 1,
+    };
+
+    const body = extractRegionBody(region, content);
+    try std.testing.expect(body != null);
+
+    // Body should start after the header (line 1) and include lines 2-4
+    try std.testing.expect(std.mem.indexOf(u8, body.?, "line1()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.?, "line2()") != null);
 }

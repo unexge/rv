@@ -1,27 +1,69 @@
 const std = @import("std");
+const treez = @import("treez");
+const rv = @import("rv");
 const Io = std.Io;
 
-const rv = @import("rv");
+pub fn main() !void {
+    const ziglang = try treez.Language.get("zig");
 
-pub fn main(init: std.process.Init) !void {
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+    var parser = try treez.Parser.create();
+    defer parser.destroy();
+    try parser.setLanguage(ziglang);
 
-    const arena: std.mem.Allocator = init.arena.allocator();
+    const allocator = std.heap.page_allocator;
 
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, "build.zig", allocator, .unlimited);
+    defer allocator.free(source);
+
+    const tree = try parser.parseString(null, source);
+    defer tree.destroy();
+
+    printTree(tree.getRootNode(), source, 0);
+}
+
+fn printTree(node: treez.Node, source: []const u8, depth: usize) void {
+    for (0..depth) |_| std.debug.print("  ", .{});
+    std.debug.print("{s} [{d}..{d}]", .{
+        node.getType(),
+        node.getStartByte(),
+        node.getEndByte(),
+    });
+
+    const n = node.getNamedChildCount();
+    if (n == 0) {
+        std.debug.print(" ", .{});
+        printLeafText(source[node.getStartByte()..node.getEndByte()]);
     }
+    std.debug.print("\n", .{});
 
-    const io = init.io;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) printTree(node.getNamedChild(i), source, depth + 1);
+}
 
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
-
-    try rv.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush();
+fn printLeafText(text: []const u8) void {
+    const max_len = 60;
+    std.debug.print("\"", .{});
+    var count: usize = 0;
+    for (text) |c| {
+        if (count >= max_len) {
+            std.debug.print("...", .{});
+            break;
+        }
+        switch (c) {
+            '\n' => std.debug.print("\\n", .{}),
+            '\r' => std.debug.print("\\r", .{}),
+            '\t' => std.debug.print("\\t", .{}),
+            '"' => std.debug.print("\\\"", .{}),
+            '\\' => std.debug.print("\\\\", .{}),
+            else => std.debug.print("{c}", .{c}),
+        }
+        count += 1;
+    }
+    std.debug.print("\"", .{});
 }
 
 test "simple test" {

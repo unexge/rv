@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0xe5b6dd82814cdf1c, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .tree_sitter = .{
+            .url = "https://github.com/neurocyte/tree-sitter/releases/download/master-260b35dbe31ac5a6efc364248939cb0a85ef66ee/source.tar.gz",
+            .hash = "tree_sitter-0.26.7-z0LhyHsnXjO6l86unw-63C06Mq3rVmVaWkJDQGMGaTY4",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

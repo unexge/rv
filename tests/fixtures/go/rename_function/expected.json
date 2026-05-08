@@ -1,0 +1,21 @@
+{
+  "entries": [
+    {
+      "kind": "added",
+      "name": "Foo2",
+      "ts_kind": "function_declaration"
+    },
+    {
+      "kind": "removed",
+      "name": "Foo",
+      "ts_kind": "function_declaration"
+    },
+    {
+      "kind": "unchanged",
+      "name": "Bar",
+      "ts_kind": "function_declaration",
+      "moved": null
+    }
+  ],
+  "parse_errors": []
+}

@@ -1,0 +1,27 @@
+{
+  "entries": [
+    {
+      "kind": "unchanged",
+      "name": "Foo",
+      "ts_kind": "function_declaration",
+      "moved": null
+    },
+    {
+      "kind": "changed",
+      "name": "Bar",
+      "ts_kind": "function_declaration",
+      "moved": null,
+      "body": {
+        "type": "leaf",
+        "edits_len": 7,
+        "comment_only": false
+      }
+    }
+  ],
+  "parse_errors": [
+    {
+      "side": "right",
+      "kind": "error_node"
+    }
+  ]
+}

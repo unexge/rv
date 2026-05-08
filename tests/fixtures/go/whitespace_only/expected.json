@@ -1,0 +1,17 @@
+{
+  "entries": [
+    {
+      "kind": "unchanged",
+      "name": "Add",
+      "ts_kind": "function_declaration",
+      "moved": null
+    },
+    {
+      "kind": "unchanged",
+      "name": "Mul",
+      "ts_kind": "function_declaration",
+      "moved": null
+    }
+  ],
+  "parse_errors": []
+}

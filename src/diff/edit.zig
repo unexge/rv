@@ -33,7 +33,17 @@ pub const EditScript = struct {
     /// `.comment`, and there is at least one such edit. Lets the renderer
     /// classify a `Changed` Decl as cosmetic.
     pub fn isCommentOnly(self: EditScript) bool {
-        _ = self;
-        @panic("TODO: scan edits for all-comment novel atoms");
+        var saw_any = false;
+        for (self.edits) |e| switch (e) {
+            .match => {},
+            .novel => |nv| switch (nv.node_ref.*) {
+                .atom => |a| {
+                    if (a.kind != .comment) return false;
+                    saw_any = true;
+                },
+                .list => return false,
+            },
+        };
+        return saw_any;
     }
 };

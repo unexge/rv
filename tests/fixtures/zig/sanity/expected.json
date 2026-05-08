@@ -1,0 +1,22 @@
+{
+  "entries": [
+    {
+      "kind": "unchanged",
+      "name": "std",
+      "ts_kind": "VarDecl",
+      "moved": null
+    },
+    {
+      "kind": "unchanged",
+      "name": "answer",
+      "ts_kind": "VarDecl",
+      "moved": null
+    },
+    {
+      "kind": "unchanged",
+      "name": "greet",
+      "ts_kind": "Decl",
+      "moved": null
+    }
+  ]
+}

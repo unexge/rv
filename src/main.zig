@@ -1,105 +1,99 @@
+//! Minimal demo of the rv diff engine.
+//!
+//! Usage: rv <before> <after>
+//!
+//! Language is inferred from the first path's extension. Prints a one-line
+//! header plus a tree view of the structured diff to stderr.
+//!
+//! All engine calls currently panic with TODO stubs; this file exists to
+//! show the shape of the public API. See `src/root.zig` for the full
+//! surface.
+
 const std = @import("std");
-const treez = @import("treez");
 const rv = @import("rv");
-const Io = std.Io;
 
-pub fn main() !void {
-    const ziglang = try treez.Language.get("zig");
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
-    var parser = try treez.Parser.create();
-    defer parser.destroy();
-    try parser.setLanguage(ziglang);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+    defer args.deinit();
+    _ = args.next(); // skip argv[0]
 
-    const allocator = std.heap.page_allocator;
+    const before_path = args.next() orelse return usage();
+    const after_path = args.next() orelse return usage();
 
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const source = try std.Io.Dir.cwd().readFileAlloc(io, "build.zig", allocator, .unlimited);
-    defer allocator.free(source);
-
-    const tree = try parser.parseString(null, source);
-    defer tree.destroy();
-
-    printTree(tree.getRootNode(), source, 0);
-}
-
-fn printTree(node: treez.Node, source: []const u8, depth: usize) void {
-    for (0..depth) |_| std.debug.print("  ", .{});
-    std.debug.print("{s} [{d}..{d}]", .{
-        node.getType(),
-        node.getStartByte(),
-        node.getEndByte(),
-    });
-
-    const n = node.getNamedChildCount();
-    if (n == 0) {
-        std.debug.print(" ", .{});
-        printLeafText(source[node.getStartByte()..node.getEndByte()]);
-    }
-    std.debug.print("\n", .{});
-
-    var i: u32 = 0;
-    while (i < n) : (i += 1) printTree(node.getNamedChild(i), source, depth + 1);
-}
-
-fn printLeafText(text: []const u8) void {
-    const max_len = 60;
-    std.debug.print("\"", .{});
-    var count: usize = 0;
-    for (text) |c| {
-        if (count >= max_len) {
-            std.debug.print("...", .{});
-            break;
-        }
-        switch (c) {
-            '\n' => std.debug.print("\\n", .{}),
-            '\r' => std.debug.print("\\r", .{}),
-            '\t' => std.debug.print("\\t", .{}),
-            '"' => std.debug.print("\\\"", .{}),
-            '\\' => std.debug.print("\\\\", .{}),
-            else => std.debug.print("{c}", .{c}),
-        }
-        count += 1;
-    }
-    std.debug.print("\"", .{});
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa);
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
-
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
+    const lang = rv.languageFromPath(before_path) orelse {
+        std.debug.print("rv: unknown language for path '{s}'\n", .{before_path});
+        return error.UnknownLanguage;
     };
+
+    const before = try std.Io.Dir.cwd().readFileAlloc(io, before_path, gpa, .unlimited);
+    defer gpa.free(before);
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, after_path, gpa, .unlimited);
+    defer gpa.free(after);
+
+    var diff = try rv.diffSources(gpa, lang, before, after);
+    defer diff.deinit();
+
+    printSummary(&diff);
+}
+
+fn usage() error{BadUsage} {
+    std.debug.print("usage: rv <before> <after>\n", .{});
+    return error.BadUsage;
+}
+
+fn printSummary(diff: *const rv.FileDiff) void {
+    std.debug.print("rv: {d} top-level entries, {d} parse errors\n", .{
+        diff.entries.len,
+        diff.parse_errors.len,
+    });
+    printEntries(diff.entries, 0);
+}
+
+fn printEntries(entries: []const rv.DeclDiff, depth: usize) void {
+    for (entries) |entry| {
+        indent(depth);
+        switch (entry) {
+            .unchanged => |u| {
+                if (u.moved) |m| {
+                    std.debug.print("= {s} (moved {d} -> {d})\n", .{
+                        u.decl.name orelse "<anon>",
+                        m.from_idx,
+                        m.to_idx,
+                    });
+                } else {
+                    std.debug.print("= {s}\n", .{u.decl.name orelse "<anon>"});
+                }
+            },
+            .added => |a| {
+                std.debug.print("+ {s}\n", .{a.decl.name orelse "<anon>"});
+            },
+            .removed => |r| {
+                std.debug.print("- {s}\n", .{r.decl.name orelse "<anon>"});
+            },
+            .changed => |c| {
+                const move_tag: []const u8 = if (c.moved != null) " (moved)" else "";
+                std.debug.print("~ {s}{s}\n", .{ c.new.name orelse "<anon>", move_tag });
+                switch (c.body) {
+                    .leaf => |script| {
+                        indent(depth + 1);
+                        if (script.isCommentOnly()) {
+                            std.debug.print("(comment-only, {d} edits, cost {d})\n", .{ script.edits.len, script.total_cost });
+                        } else {
+                            std.debug.print("({d} edits, cost {d})\n", .{ script.edits.len, script.total_cost });
+                        }
+                    },
+                    .container => |children| printEntries(children, depth + 1),
+                }
+            },
+        }
+    }
+}
+
+fn indent(depth: usize) void {
+    var i: usize = 0;
+    while (i < depth) : (i += 1) std.debug.print("  ", .{});
 }

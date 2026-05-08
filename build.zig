@@ -12,7 +12,16 @@ pub fn build(b: *std.Build) void {
     const mod = b.addModule("rv", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "treez", .module = tree_sitter.module("treez") },
+        },
     });
+
+    // Build-time configuration for the golden fixture harness. The absolute
+    // path lets `zig build test` run from any cwd.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "fixtures_path", b.pathFromRoot("tests/fixtures"));
+    mod.addOptions("build_options", build_options);
 
     const exe = b.addExecutable(.{
         .name = "rv",

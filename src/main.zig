@@ -3,11 +3,8 @@
 //! Usage: rv <before> <after>
 //!
 //! Language is inferred from the first path's extension. Prints a one-line
-//! header plus a tree view of the structured diff to stderr.
-//!
-//! All engine calls currently panic with TODO stubs; this file exists to
-//! show the shape of the public API. See `src/root.zig` for the full
-//! surface.
+//! header plus a tree view of the structured diff to stderr. See
+//! `src/root.zig` for the full public API surface.
 
 const std = @import("std");
 const rv = @import("rv");

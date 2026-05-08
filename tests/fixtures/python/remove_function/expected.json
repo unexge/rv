@@ -1,0 +1,25 @@
+{
+  "entries": [
+    {
+      "kind": "unchanged",
+      "name": "foo",
+      "ts_kind": "function_definition",
+      "moved": null
+    },
+    {
+      "kind": "removed",
+      "name": "bar",
+      "ts_kind": "function_definition"
+    },
+    {
+      "kind": "unchanged",
+      "name": "baz",
+      "ts_kind": "function_definition",
+      "moved": {
+        "from_idx": 2,
+        "to_idx": 1
+      }
+    }
+  ],
+  "parse_errors": []
+}

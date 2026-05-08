@@ -1,0 +1,21 @@
+{
+  "entries": [
+    {
+      "kind": "unchanged",
+      "name": "foo",
+      "ts_kind": "function_definition",
+      "moved": null
+    },
+    {
+      "kind": "removed",
+      "name": "bar",
+      "ts_kind": "function_definition"
+    }
+  ],
+  "parse_errors": [
+    {
+      "side": "right",
+      "kind": "error_node"
+    }
+  ]
+}

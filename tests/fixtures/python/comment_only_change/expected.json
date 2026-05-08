@@ -1,0 +1,16 @@
+{
+  "entries": [
+    {
+      "kind": "changed",
+      "name": "greet",
+      "ts_kind": "function_definition",
+      "moved": null,
+      "body": {
+        "type": "leaf",
+        "edits_len": 7,
+        "comment_only": true
+      }
+    }
+  ],
+  "parse_errors": []
+}

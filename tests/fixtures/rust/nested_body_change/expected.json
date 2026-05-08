@@ -1,0 +1,33 @@
+{
+  "entries": [
+    {
+      "kind": "changed",
+      "name": "Foo",
+      "ts_kind": "impl_item",
+      "moved": null,
+      "body": {
+        "type": "container",
+        "children": [
+          {
+            "kind": "unchanged",
+            "name": "one",
+            "ts_kind": "function_item",
+            "moved": null
+          },
+          {
+            "kind": "changed",
+            "name": "bar",
+            "ts_kind": "function_item",
+            "moved": null,
+            "body": {
+              "type": "leaf",
+              "edits_len": 8,
+              "comment_only": false
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "parse_errors": []
+}

@@ -1,0 +1,23 @@
+{
+  "entries": [
+    {
+      "kind": "unchanged",
+      "name": "std::fmt",
+      "ts_kind": "use_declaration",
+      "moved": null
+    },
+    {
+      "kind": "unchanged",
+      "name": "add",
+      "ts_kind": "function_item",
+      "moved": null
+    },
+    {
+      "kind": "unchanged",
+      "name": "mul",
+      "ts_kind": "function_item",
+      "moved": null
+    }
+  ],
+  "parse_errors": []
+}

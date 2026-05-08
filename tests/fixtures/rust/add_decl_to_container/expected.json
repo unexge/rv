@@ -1,0 +1,27 @@
+{
+  "entries": [
+    {
+      "kind": "changed",
+      "name": "Foo",
+      "ts_kind": "impl_item",
+      "moved": null,
+      "body": {
+        "type": "container",
+        "children": [
+          {
+            "kind": "unchanged",
+            "name": "one",
+            "ts_kind": "function_item",
+            "moved": null
+          },
+          {
+            "kind": "added",
+            "name": "two",
+            "ts_kind": "function_item"
+          }
+        ]
+      }
+    }
+  ],
+  "parse_errors": []
+}

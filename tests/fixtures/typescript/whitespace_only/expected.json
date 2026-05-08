@@ -1,0 +1,23 @@
+{
+  "entries": [
+    {
+      "kind": "unchanged",
+      "name": "\"./fmt\"",
+      "ts_kind": "import_statement",
+      "moved": null
+    },
+    {
+      "kind": "unchanged",
+      "name": "add",
+      "ts_kind": "export_statement",
+      "moved": null
+    },
+    {
+      "kind": "unchanged",
+      "name": "mul",
+      "ts_kind": "export_statement",
+      "moved": null
+    }
+  ],
+  "parse_errors": []
+}

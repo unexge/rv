@@ -7,10 +7,6 @@
 //!
 //! Language is inferred from the parent directory name (zig/rust/go/python/
 //! typescript), not from file extensions.
-//!
-//! Fixtures for which `diffSources` returns `error.NotImplemented` are
-//! skipped with a log message, so the harness is usable before the engine
-//! lands.
 
 const std = @import("std");
 const testing = std.testing;
@@ -72,7 +68,22 @@ fn writeFileDiff(ws: *std.json.Stringify, file_diff: rv.FileDiff) Writer.Error!v
     try ws.beginObject();
     try ws.objectField("entries");
     try writeEntries(ws, file_diff.entries);
+    try ws.objectField("parse_errors");
+    try writeParseErrors(ws, file_diff.parse_errors);
     try ws.endObject();
+}
+
+fn writeParseErrors(ws: *std.json.Stringify, errors: []const rv.ParseError) Writer.Error!void {
+    try ws.beginArray();
+    for (errors) |pe| {
+        try ws.beginObject();
+        try ws.objectField("side");
+        try ws.write(@tagName(pe.side));
+        try ws.objectField("kind");
+        try ws.write(@tagName(pe.kind));
+        try ws.endObject();
+    }
+    try ws.endArray();
 }
 
 fn writeEntries(ws: *std.json.Stringify, entries: []const rv.DeclDiff) Writer.Error!void {
@@ -244,13 +255,7 @@ fn runFixture(
     };
     defer gpa.free(after);
 
-    var file_diff = rv.diffSources(gpa, lang.id, before, after) catch |err| switch (err) {
-        error.NotImplemented => {
-            std.debug.print("golden: {s}/{s}: skipped (diffSources not implemented)\n", .{ lang_name, scenario });
-            return;
-        },
-        else => return err,
-    };
+    var file_diff = try rv.diffSources(gpa, lang.id, before, after);
     defer file_diff.deinit();
 
     // Serialise into an in-memory buffer.

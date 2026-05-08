@@ -50,4 +50,19 @@ pub const LangConfig = struct {
     /// Returns null for anonymous Decls (bare statements, comptime blocks).
     /// Used to build identity keys for alignment.
     extract_name: *const fn (list: *const node.List, source: []const u8) ?[]const u8,
+
+    /// Optional: dynamic container detection for Decls whose ts_kind alone
+    /// doesn't decide container-ness. Needed for Zig, where
+    /// `const X = struct { ... };` is a container but its outer ts_kind is
+    /// `variable_declaration` - identical to any non-container binding.
+    ///
+    /// When set and returns non-null, the returned List is the one whose
+    /// children are the inner Decls (for a Zig var whose RHS is a
+    /// struct/union/enum/opaque_declaration, that's the RHS list). Returns
+    /// null for Decls that aren't containers.
+    ///
+    /// Takes precedence over `container_ts_kinds` when non-null. Defaults
+    /// to null, in which case container detection falls back to
+    /// `container_ts_kinds`.
+    container_list_of: ?*const fn (list: *const node.List) ?*const node.List = null,
 };

@@ -8,13 +8,13 @@
     },
     {
       "kind": "unchanged",
-      "name": "answer",
-      "ts_kind": "variable_declaration",
+      "name": "add",
+      "ts_kind": "function_declaration",
       "moved": null
     },
     {
       "kind": "unchanged",
-      "name": "greet",
+      "name": "mul",
       "ts_kind": "function_declaration",
       "moved": null
     }

@@ -20,6 +20,7 @@ const std = @import("std");
 const node = @import("../sst/node.zig");
 const config_mod = @import("../lang/config.zig");
 const result = @import("../diff/result.zig");
+const edit = @import("edit.zig");
 const dijkstra = @import("dijkstra.zig");
 
 pub const AlignError = error{
@@ -126,17 +127,21 @@ pub fn alignDecls(
                     .moved = moved,
                 } });
             } else {
-                const body: result.DeclBody = if (contains(cfg.container_ts_kinds, ld.ts_kind))
-                    .{ .container = try alignDecls(
-                        arena,
-                        cfg,
-                        ld.list,
-                        rd.list,
-                        left_source,
-                        right_source,
-                    ) }
-                else
-                    .{ .leaf = try dijkstra.diffNodes(arena, ld.node_ptr, rd.node_ptr) };
+                const body: result.DeclBody = blk: {
+                    if (containerListOf(cfg, ld.list)) |ld_inner| {
+                        const rd_inner = containerListOf(cfg, rd.list) orelse break :blk
+                            try leafDiff(arena, ld, rd);
+                        break :blk .{ .container = try alignDecls(
+                            arena,
+                            cfg,
+                            ld_inner,
+                            rd_inner,
+                            left_source,
+                            right_source,
+                        ) };
+                    }
+                    break :blk try leafDiff(arena, ld, rd);
+                };
 
                 try out.append(arena, .{ .changed = .{
                     .old = makeDecl(ld),
@@ -253,6 +258,83 @@ fn contains(haystack: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, s, needle)) return true;
     }
     return false;
+}
+
+/// Resolve a Decl's container list, honouring `cfg.container_list_of` when
+/// present and falling back to the static `container_ts_kinds` table.
+/// Returns null when the given Decl is not a container.
+fn containerListOf(cfg: *const config_mod.LangConfig, list: *const node.List) ?*const node.List {
+    if (cfg.container_list_of) |fn_ptr| return fn_ptr(list);
+    if (contains(cfg.container_ts_kinds, list.ts_kind)) return list;
+    return null;
+}
+
+/// Leaf body diff for a Changed Decl: run Dijkstra over children and
+/// append novel edits for any leading/trailing trivia that differ between
+/// the two Decl Lists. Trivia atoms (comments attached to a Decl in
+/// `sst/convert.zig`) are invisible to Dijkstra because its virtual
+/// wrapper aliases the root Node and only its `children` slice - so
+/// comment-only edits on doc comments would otherwise leave the edit
+/// script empty and `isCommentOnly()` would return false.
+fn leafDiff(
+    arena: std.mem.Allocator,
+    ld: DeclInfo,
+    rd: DeclInfo,
+) AlignError!result.DeclBody {
+    const body = try dijkstra.diffNodes(arena, ld.node_ptr, rd.node_ptr);
+    const trivia = try triviaEdits(arena, ld.list, rd.list);
+    if (trivia.len == 0) return .{ .leaf = body };
+
+    const merged = try arena.alloc(edit.Edit, body.edits.len + trivia.len);
+    @memcpy(merged[0..body.edits.len], body.edits);
+    @memcpy(merged[body.edits.len..], trivia);
+    return .{ .leaf = .{ .edits = merged, .total_cost = body.total_cost } };
+}
+
+/// Pairwise-align two trivia streams (leading, then trailing). Equal
+/// hashes at the same index match silently; a difference at position `i`
+/// emits novel-left for the left atom and/or novel-right for the right
+/// atom depending on which side has an atom there. The synthesised Node
+/// wrappers live in `arena` and carry the original atom bytes.
+fn triviaEdits(
+    arena: std.mem.Allocator,
+    l: *const node.List,
+    r: *const node.List,
+) AlignError![]const edit.Edit {
+    var out: std.ArrayList(edit.Edit) = .empty;
+    errdefer out.deinit(arena);
+    try appendTriviaDiff(arena, &out, l.leading_trivia, r.leading_trivia);
+    try appendTriviaDiff(arena, &out, l.trailing_trivia, r.trailing_trivia);
+    return try out.toOwnedSlice(arena);
+}
+
+fn appendTriviaDiff(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(edit.Edit),
+    left: []const node.Atom,
+    right: []const node.Atom,
+) AlignError!void {
+    const max_len = @max(left.len, right.len);
+    var i: usize = 0;
+    while (i < max_len) : (i += 1) {
+        const have_l = i < left.len;
+        const have_r = i < right.len;
+        if (have_l and have_r and left[i].hash == right[i].hash) continue;
+        if (have_l) try out.append(arena, .{ .novel = .{
+            .side = .left,
+            .node_ref = try wrapAtom(arena, left[i]),
+        } });
+        if (have_r) try out.append(arena, .{ .novel = .{
+            .side = .right,
+            .node_ref = try wrapAtom(arena, right[i]),
+        } });
+    }
+}
+
+fn wrapAtom(arena: std.mem.Allocator, atom: node.Atom) AlignError!*const node.Node {
+    const wrapper = try arena.create(node.Node);
+    wrapper.* = .{ .atom = atom };
+    return wrapper;
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────

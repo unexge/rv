@@ -28,7 +28,6 @@ pub const ConvertError = error{
     /// loaded (missing, name mismatch, etc.). Distinct from parse errors,
     /// which are data (see `ParseError`), not control flow.
     GrammarLoadFailed,
-    NotImplemented,
 };
 
 pub const ConvertResult = struct {

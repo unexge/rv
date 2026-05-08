@@ -10,9 +10,29 @@ const result = @import("../diff/result.zig");
 
 pub const config: config_mod.LangConfig = .{
     .grammar_name = "zig",
-    .atom_ts_kinds = &.{}, // TODO
-    .delimiter_ts_kinds = &.{}, // TODO
-    .comment_ts_kinds = &.{}, // TODO: line_comment, doc_comment
+    // Flatten these TS node types into a single Atom even when the grammar
+    // splits them into sub-tokens (e.g. string → [", content, "]). Keeps
+    // leaf literals comparable as single bytes.
+    .atom_ts_kinds = &.{
+        "string",
+        "multiline_string",
+        "character",
+        "integer",
+        "float",
+        "identifier",
+        "builtin_identifier",
+        "builtin_type",
+        "escape_sequence",
+    },
+    // Anonymous punctuation tokens that delimit a List. The TS node type for
+    // an anonymous token equals its literal text, so matching on these
+    // strings is sound.
+    .delimiter_ts_kinds = &.{
+        "(", ")",
+        "{", "}",
+        "[", "]",
+    },
+    .comment_ts_kinds = &.{"comment"},
     .decl_ts_kinds = &.{}, // TODO: FnProto, VarDecl, TestDecl, ContainerField, ComptimeDecl
     .container_ts_kinds = &.{}, // TODO: struct/union/enum/opaque container values
     .classify = classify,

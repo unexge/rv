@@ -343,22 +343,75 @@ fn drawSplit(
 fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine) void {
     if (sl.marker == .blank and sl.kind == .blank) return;
 
-    const style = styleFor(sl);
+    const base_style = styleFor(sl);
 
     // Gutter: 1-char marker + space.
     _ = body.print(&.{.{
         .text = sl.marker.gutter(),
-        .style = style,
+        .style = base_style,
     }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
 
     // Indent columns (2 per level) start after the gutter + space.
     const indent_cols: u16 = @as(u16, @intCast(sl.indent)) * 2;
     const text_col: u16 = 2 + indent_cols;
 
-    _ = body.print(&.{.{
-        .text = sl.text,
-        .style = style,
-    }}, .{ .row_offset = row, .col_offset = text_col, .wrap = .none });
+    if (sl.novel_spans.len == 0) {
+        _ = body.print(&.{.{
+            .text = sl.text,
+            .style = base_style,
+        }}, .{ .row_offset = row, .col_offset = text_col, .wrap = .none });
+        return;
+    }
+
+    // Novel-range highlighting (Option C): walk the sorted non-overlapping
+    // spans and emit alternating base / novel segments. Column tracking is
+    // byte-count based, which matches the ASCII-cell assumption elsewhere
+    // in this renderer (tab expansion to spaces happens at build time).
+    const novel_style = novelStyleFor(base_style);
+    var cursor: usize = 0;
+    var col: u16 = text_col;
+    for (sl.novel_spans) |s| {
+        if (s.start > cursor) {
+            const seg = sl.text[cursor..s.start];
+            _ = body.print(&.{.{ .text = seg, .style = base_style }}, .{
+                .row_offset = row,
+                .col_offset = col,
+                .wrap = .none,
+            });
+            col += @intCast(seg.len);
+        }
+        if (s.end > s.start) {
+            const seg = sl.text[s.start..s.end];
+            _ = body.print(&.{.{ .text = seg, .style = novel_style }}, .{
+                .row_offset = row,
+                .col_offset = col,
+                .wrap = .none,
+            });
+            col += @intCast(seg.len);
+        }
+        cursor = s.end;
+    }
+    if (cursor < sl.text.len) {
+        const tail = sl.text[cursor..];
+        _ = body.print(&.{.{ .text = tail, .style = base_style }}, .{
+            .row_offset = row,
+            .col_offset = col,
+            .wrap = .none,
+        });
+    }
+}
+
+/// Stronger variant of `base` for atom-level novel ranges. Reverse video
+/// keeps the highlight legible regardless of the user's palette while
+/// preserving the +/-/~ colour as the background tint.
+fn novelStyleFor(base: vaxis.Style) vaxis.Style {
+    var s = base;
+    s.reverse = true;
+    // A dimmed base would cancel out under reverse (background dimming looks
+    // like a muddy block); force it off inside the novel range so the
+    // differing bytes pop even inside otherwise-dim unchanged context.
+    s.dim = false;
+    return s;
 }
 
 /// Colour choice: indexed ANSI so we inherit the user's terminal palette.

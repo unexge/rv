@@ -16,9 +16,15 @@
 //!     changed leaf body → `-` lines on the left paired 1:1 with `+` lines on the
 //!       right, padded with blanks on whichever side runs out first.
 //!
-//! Atom-level novel-range highlighting (Option C) is deferred; the returned
-//! `StyledLine.novel_spans` is always empty for now but kept in the shape so
-//! callers don't need a re-plumb later.
+//! Atom-level novel-range highlighting (Option C): for `changed` leaf bodies
+//! we walk the `EditScript` and populate `StyledLine.novel_spans` on the
+//! `-` / `+` source lines so the renderer can tint the exact bytes that
+//! differ. Spans are in *display* (post-tab-expansion) coordinates and are
+//! clipped to a single line (no span crosses `\n`). List-level novels are
+//! deferred to a future iteration; v1 handles atoms only. Trivia novels
+//! whose byte_ranges live outside the Decl's `list.byte_range` (see
+//! `diff/align.zig::triviaEdits`) fall outside every emitted line and so
+//! silently drop out of the clipping step.
 //!
 //! Tabs in source are expanded to 4 spaces at build-time so cell widths stay
 //! consistent without the renderer needing to know.
@@ -68,12 +74,19 @@ pub const StyledLine = struct {
     kind: LineKind,
     /// Owned by the slice returned from `build`; freed via `freeLines`.
     text: []const u8,
-    /// Byte ranges within `text` that a future atom-level highlighter should
-    /// tint (Option C). Always empty in v1.
+    /// Byte ranges within `text` to tint as atom-level novels (Option C).
+    /// Populated on `-` / `+` source lines of `changed` leaves only; empty
+    /// on decl headers, blanks, and pure add/remove dumps. Offsets are in
+    /// display (post-tab-expansion) coordinates, sorted by `start`, and
+    /// clipped so no span crosses a `\n`.
     novel_spans: []const ByteSpan = &.{},
 };
 
 pub const ByteSpan = struct { start: u32, end: u32 };
+
+/// Pre-collected novel byte ranges for one side of a `changed` leaf, used to
+/// paint `StyledLine.novel_spans`. An empty slice means no highlighting.
+const Novels = []const ByteSpan;
 
 /// A single row in split-view: one StyledLine per pane. Either side may be
 /// a blank filler (`marker == .blank`, `kind == .blank`, `text == ""`).
@@ -190,6 +203,7 @@ fn appendEntries(
                     a.decl.list.byte_range.end,
                     indent + 1,
                     .added,
+                    &.{},
                 );
             },
             .removed => |r| {
@@ -208,6 +222,7 @@ fn appendEntries(
                     r.decl.list.byte_range.end,
                     indent + 1,
                     .removed,
+                    &.{},
                 );
             },
             .changed => |c| {
@@ -220,7 +235,9 @@ fn appendEntries(
                 });
                 switch (c.body) {
                     .container => |children| try appendEntries(arena, out, stats, file_diff, children, indent + 1),
-                    .leaf => {
+                    .leaf => |script| {
+                        const left_novels = try collectAtomNovels(arena, script, .left);
+                        const right_novels = try collectAtomNovels(arena, script, .right);
                         try appendSourceLines(
                             arena,
                             out,
@@ -229,6 +246,7 @@ fn appendEntries(
                             c.old.list.byte_range.end,
                             indent + 1,
                             .removed,
+                            left_novels,
                         );
                         try appendSourceLines(
                             arena,
@@ -238,6 +256,7 @@ fn appendEntries(
                             c.new.list.byte_range.end,
                             indent + 1,
                             .added,
+                            right_novels,
                         );
                     },
                 }
@@ -284,6 +303,7 @@ fn appendEntriesSplit(
                     a.decl.list.byte_range.end,
                     indent + 1,
                     .added,
+                    &.{},
                 );
                 for (src_lines) |line_right| {
                     try out.append(arena, .{ .left = blankLine(indent + 1), .right = line_right });
@@ -305,6 +325,7 @@ fn appendEntriesSplit(
                     r.decl.list.byte_range.end,
                     indent + 1,
                     .removed,
+                    &.{},
                 );
                 for (src_lines) |line_left| {
                     try out.append(arena, .{ .left = line_left, .right = blankLine(indent + 1) });
@@ -328,7 +349,9 @@ fn appendEntriesSplit(
                         children,
                         indent + 1,
                     ),
-                    .leaf => {
+                    .leaf => |script| {
+                        const left_novels = try collectAtomNovels(arena, script, .left);
+                        const right_novels = try collectAtomNovels(arena, script, .right);
                         const left_lines = try sourceLinesSlice(
                             arena,
                             file_diff.left_source,
@@ -336,6 +359,7 @@ fn appendEntriesSplit(
                             c.old.list.byte_range.end,
                             indent + 1,
                             .removed,
+                            left_novels,
                         );
                         const right_lines = try sourceLinesSlice(
                             arena,
@@ -344,6 +368,7 @@ fn appendEntriesSplit(
                             c.new.list.byte_range.end,
                             indent + 1,
                             .added,
+                            right_novels,
                         );
                         const n = @max(left_lines.len, right_lines.len);
                         for (0..n) |i| {
@@ -389,7 +414,10 @@ fn declHeaderText(
 
 /// Split the given source slice by newlines and emit one StyledLine per line,
 /// expanding tabs to 4 spaces. Empty trailing line (from a trailing '\n') is
-/// omitted so we don't render a phantom row after each span.
+/// omitted so we don't render a phantom row after each span. `novels` is a
+/// (possibly empty) slice of absolute byte ranges that belong to this side;
+/// each range is clipped per-emitted-line and translated into
+/// display-coordinate `ByteSpan`s on `StyledLine.novel_spans`.
 fn appendSourceLines(
     arena: std.mem.Allocator,
     out: *std.ArrayList(StyledLine),
@@ -398,8 +426,9 @@ fn appendSourceLines(
     end: u32,
     indent: u8,
     marker: Marker,
+    novels: Novels,
 ) !void {
-    const lines = try sourceLinesSlice(arena, source, start, end, indent, marker);
+    const lines = try sourceLinesSlice(arena, source, start, end, indent, marker, novels);
     try out.appendSlice(arena, lines);
 }
 
@@ -410,25 +439,121 @@ fn sourceLinesSlice(
     end: u32,
     indent: u8,
     marker: Marker,
+    novels: Novels,
 ) ![]const StyledLine {
     var buf: std.ArrayList(StyledLine) = .empty;
     const slice = source[start..end];
-    var it = std.mem.splitScalar(u8, slice, '\n');
+
+    // Manual line iteration so we can track each raw line's absolute start
+    // offset in `source`; `splitScalar` would hide that.
+    var cursor: usize = 0;
+    var line_abs_start: u32 = start;
     var first = true;
-    while (it.next()) |line_raw| {
+    while (true) {
+        const rest = slice[cursor..];
+        const nl_rel = std.mem.indexOfScalar(u8, rest, '\n');
+        const raw_line = if (nl_rel) |p| rest[0..p] else rest;
+
         // Drop a final empty token that comes from a trailing '\n'.
-        if (line_raw.len == 0 and it.peek() == null and !first) break;
+        if (raw_line.len == 0 and nl_rel == null and !first) break;
         first = false;
 
-        const expanded = try expandTabs(arena, line_raw);
+        const expanded = try expandTabs(arena, raw_line);
+        const line_novels = try mapNovelsToLine(arena, raw_line, line_abs_start, novels);
+
         try buf.append(arena, .{
             .indent = indent,
             .marker = marker,
             .kind = .source,
             .text = expanded,
+            .novel_spans = line_novels,
         });
+
+        if (nl_rel) |p| {
+            cursor += p + 1;
+            line_abs_start = start + @as(u32, @intCast(cursor));
+        } else break;
     }
     return try buf.toOwnedSlice(arena);
+}
+
+/// Collect absolute byte ranges of all atom-level novels on `side`. List-
+/// level novels are intentionally skipped for v1 (they would require
+/// descending into children to pick out which atoms to tint); the list's
+/// full byte_range typically spans multiple lines and reverse-videoing it
+/// wholesale is louder than useful.
+fn collectAtomNovels(
+    arena: std.mem.Allocator,
+    script: rv.EditScript,
+    side: rv.Side,
+) ![]const ByteSpan {
+    var out: std.ArrayList(ByteSpan) = .empty;
+    for (script.edits) |e| switch (e) {
+        .match => {},
+        .novel => |nv| {
+            if (nv.side != side) continue;
+            switch (nv.node_ref.*) {
+                .atom => |a| try out.append(arena, .{
+                    .start = a.byte_range.start,
+                    .end = a.byte_range.end,
+                }),
+                .list => {}, // deferred for v1; see module doc.
+            }
+        },
+    };
+    return try out.toOwnedSlice(arena);
+}
+
+/// Translate absolute-source novel byte ranges into per-line display
+/// offsets for this raw (pre-tab-expansion) line. Spans outside the line
+/// are dropped; spans that straddle the line's end are clipped so no span
+/// ever crosses a newline. Output is sorted by `start`.
+fn mapNovelsToLine(
+    arena: std.mem.Allocator,
+    raw_line: []const u8,
+    line_abs_start: u32,
+    novels: Novels,
+) ![]const ByteSpan {
+    if (novels.len == 0) return &.{};
+
+    const line_abs_end: u32 = line_abs_start + @as(u32, @intCast(raw_line.len));
+
+    var out: std.ArrayList(ByteSpan) = .empty;
+    for (novels) |nv| {
+        if (nv.end <= line_abs_start) continue;
+        if (nv.start >= line_abs_end) continue;
+
+        const clip_start_abs = @max(nv.start, line_abs_start);
+        const clip_end_abs = @min(nv.end, line_abs_end);
+
+        const raw_start: usize = clip_start_abs - line_abs_start;
+        const raw_end: usize = clip_end_abs - line_abs_start;
+
+        const disp_start: u32 = @intCast(rawToDisplay(raw_line, raw_start));
+        const disp_end: u32 = @intCast(rawToDisplay(raw_line, raw_end));
+
+        if (disp_end > disp_start) {
+            try out.append(arena, .{ .start = disp_start, .end = disp_end });
+        }
+    }
+
+    std.mem.sort(ByteSpan, out.items, {}, byteSpanLessThan);
+    return try out.toOwnedSlice(arena);
+}
+
+fn byteSpanLessThan(_: void, a: ByteSpan, b: ByteSpan) bool {
+    return a.start < b.start;
+}
+
+/// Map a raw-line byte offset to its post-tab-expansion display column.
+/// Each `\t` counts as `tab_width` cells instead of one.
+fn rawToDisplay(raw_line: []const u8, raw_offset: usize) usize {
+    var tabs: usize = 0;
+    var i: usize = 0;
+    while (i < raw_offset) : (i += 1) {
+        if (raw_line[i] == '\t') tabs += 1;
+    }
+    return raw_offset + tabs * (tab_width - 1);
 }
 
 const tab_width: usize = 4;
@@ -789,4 +914,190 @@ test "build split: changed container → header shared, children recurse with in
         }
     }
     try testing.expect(saw_indented_child);
+}
+
+// ── novel-range highlighting (Option C) ─────────────────────────────────
+
+/// Helper: collect all novel spans from source lines matching `marker`,
+/// concatenated in source order. The concatenation is what the test cares
+/// about — exactly which atoms got split into separate novel edits is an
+/// implementation detail of Dijkstra.
+fn collectHighlightedText(
+    arena: std.mem.Allocator,
+    lines: []const StyledLine,
+    marker: Marker,
+) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    for (lines) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker != marker) continue;
+        for (ln.novel_spans) |s| {
+            try buf.appendSlice(arena, ln.text[s.start..s.end]);
+        }
+    }
+    return try buf.toOwnedSlice(arena);
+}
+
+test "build: changed leaf populates novel_spans covering exactly the differing atoms" {
+    const before = "pub fn greet() u32 { return 1; }\n";
+    const after = "pub fn greet() u32 { return 2; }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const removed_highlight = try collectHighlightedText(a, result.view.unified, .removed);
+    const added_highlight = try collectHighlightedText(a, result.view.unified, .added);
+
+    try testing.expectEqualStrings("1", removed_highlight);
+    try testing.expectEqualStrings("2", added_highlight);
+}
+
+test "build: body_change fixture (1 → 42) — novel_spans cover exactly the literals" {
+    // Mirrors tests/fixtures/zig/body_change. This is the acceptance case
+    // called out in the task: the `1` and `42` should be tinted, inclusive.
+    const before =
+        \\pub fn greet() u32 {
+        \\    return 1;
+        \\}
+    ;
+    const after =
+        \\pub fn greet() u32 {
+        \\    return 42;
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const removed_highlight = try collectHighlightedText(a, result.view.unified, .removed);
+    const added_highlight = try collectHighlightedText(a, result.view.unified, .added);
+
+    try testing.expectEqualStrings("1", removed_highlight);
+    try testing.expectEqualStrings("42", added_highlight);
+}
+
+test "build: novel_spans respect tab expansion (display offsets, not raw)" {
+    // Leading `\t` on the return line shifts every raw offset by
+    // `tab_width - 1`. The novel span must land on the expanded position.
+    const before = "pub fn greet() u32 {\n\treturn 1;\n}\n";
+    const after = "pub fn greet() u32 {\n\treturn 2;\n}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    // Locate the removed `return` line.
+    var hit: ?StyledLine = null;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker != .removed) continue;
+        if (std.mem.indexOf(u8, ln.text, "return") == null) continue;
+        hit = ln;
+        break;
+    }
+    try testing.expect(hit != null);
+    const ln = hit.?;
+
+    // After tab expansion, the line begins with 4 spaces. `return ` then
+    // ends at column 11, so `1` lives at columns [11, 12).
+    try testing.expect(ln.novel_spans.len >= 1);
+    const span = ln.novel_spans[0];
+    try testing.expectEqualStrings("1", ln.text[span.start..span.end]);
+    try testing.expectEqual(@as(u32, 11), span.start);
+    try testing.expectEqual(@as(u32, 12), span.end);
+    try testing.expect(std.mem.startsWith(u8, ln.text, "    return "));
+}
+
+test "build: unchanged/added/removed decls carry no novel_spans" {
+    // Pure add, pure remove, and pure unchanged should never produce novel
+    // spans — atom-level highlighting is a changed-leaf feature.
+    const before = "pub fn keep() void {}\npub fn gone() void { return; }\n";
+    const after = "pub fn keep() void {}\npub fn fresh() void { return; }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    for (result.view.unified) |ln| {
+        try testing.expectEqual(@as(usize, 0), ln.novel_spans.len);
+    }
+}
+
+test "build split: changed leaf populates novel_spans on both panes" {
+    const before = "pub fn greet() u32 { return 1; }\n";
+    const after = "pub fn greet() u32 { return 2; }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .split);
+    defer result.deinit();
+
+    var left_any = false;
+    var right_any = false;
+    for (result.view.split) |p| {
+        if (p.left.kind == .source and p.left.novel_spans.len > 0) {
+            const s = p.left.novel_spans[0];
+            try testing.expectEqualStrings("1", p.left.text[s.start..s.end]);
+            left_any = true;
+        }
+        if (p.right.kind == .source and p.right.novel_spans.len > 0) {
+            const s = p.right.novel_spans[0];
+            try testing.expectEqualStrings("2", p.right.text[s.start..s.end]);
+            right_any = true;
+        }
+    }
+    try testing.expect(left_any);
+    try testing.expect(right_any);
+}
+
+test "mapNovelsToLine: novel outside the emitted line is dropped" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // raw_line starts at absolute offset 100, length 10.
+    const raw = "abcdefghij";
+    const novels = [_]ByteSpan{
+        .{ .start = 50, .end = 60 }, // entirely before
+        .{ .start = 200, .end = 210 }, // entirely after
+        .{ .start = 102, .end = 105 }, // inside → [2, 5)
+    };
+    const got = try mapNovelsToLine(a, raw, 100, &novels);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(@as(u32, 2), got[0].start);
+    try testing.expectEqual(@as(u32, 5), got[0].end);
+}
+
+test "mapNovelsToLine: novel straddling line end is clipped, never crosses \\n" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const raw = "hello"; // 5 bytes, at abs [10, 15)
+    const novels = [_]ByteSpan{
+        .{ .start = 12, .end = 25 }, // extends beyond line end (15)
+    };
+    const got = try mapNovelsToLine(a, raw, 10, &novels);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqual(@as(u32, 2), got[0].start);
+    try testing.expectEqual(@as(u32, 5), got[0].end);
 }

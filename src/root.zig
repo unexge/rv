@@ -9,6 +9,10 @@ const std = @import("std");
 pub const LanguageId = @import("lang/registry.zig").LanguageId;
 pub const languageFromPath = @import("lang/registry.zig").languageFromPath;
 
+pub const AtomKind = @import("sst/node.zig").AtomKind;
+pub const List = @import("sst/node.zig").List;
+pub const Node = @import("sst/node.zig").Node;
+
 pub const DeclKind = @import("diff/result.zig").DeclKind;
 pub const Decl = @import("diff/result.zig").Decl;
 pub const MoveInfo = @import("diff/result.zig").MoveInfo;

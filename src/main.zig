@@ -10,6 +10,7 @@ const ui = @import("ui/app.zig");
 comptime {
     _ = @import("ui/line.zig");
     _ = @import("ui/state.zig");
+    _ = @import("ui/theme.zig");
 }
 
 pub fn main(init: std.process.Init) !void {

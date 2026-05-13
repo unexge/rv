@@ -33,10 +33,12 @@ const std = @import("std");
 
 const rv = @import("rv");
 const state_mod = @import("state.zig");
+const theme = @import("theme.zig");
 
 pub const AppState = state_mod.AppState;
 pub const DeclId = state_mod.DeclId;
 pub const declId = state_mod.declId;
+pub const TokenClass = theme.TokenClass;
 
 pub const Marker = enum(u8) {
     /// Unchanged header.
@@ -85,6 +87,12 @@ pub const StyledLine = struct {
     /// display (post-tab-expansion) coordinates, sorted by `start`, and
     /// clipped so no span crosses a `\n`.
     novel_spans: []const ByteSpan = &.{},
+    /// Syntax-highlight spans: per-atom `(start, end, class)` runs in
+    /// display coordinates, sorted by `start`, non-overlapping. Populated
+    /// on `source` lines only - decl headers and blanks leave this
+    /// empty. Gaps between spans (whitespace, unclassified punctuation)
+    /// inherit the line's base marker style.
+    highlights: []const HighlightSpan = &.{},
     /// Stable identity of the decl this line belongs to. Set on
     /// `decl_header` lines (used by `app.zig` to locate the focused decl
     /// for collapse/expand toggles); `null` on source, blank, and file-
@@ -94,9 +102,21 @@ pub const StyledLine = struct {
 
 pub const ByteSpan = struct { start: u32, end: u32 };
 
+pub const HighlightSpan = struct {
+    start: u32,
+    end: u32,
+    class: TokenClass,
+};
+
 /// Pre-collected novel byte ranges for one side of a `changed` leaf, used to
 /// paint `StyledLine.novel_spans`. An empty slice means no highlighting.
 const Novels = []const ByteSpan;
+
+/// Pre-collected absolute-byte token spans for a single decl's body,
+/// produced by walking the decl's SST `List` and classifying each atom.
+/// An empty slice means no syntax highlighting (e.g. nothing we could
+/// classify above `.ident` / `.punct`).
+const Highlights = []const HighlightSpan;
 
 /// A single row in split-view: one StyledLine per pane. Either side may be
 /// a blank filler (`marker == .blank`, `kind == .blank`, `text == ""`).
@@ -220,8 +240,8 @@ fn appendEntries(
                     arena,
                     out,
                     file_diff.right_source,
-                    a.decl.list.byte_range.start,
-                    a.decl.list.byte_range.end,
+                    a.decl.list,
+                    file_diff.language,
                     indent + 1,
                     .added,
                     &.{},
@@ -242,8 +262,8 @@ fn appendEntries(
                     arena,
                     out,
                     file_diff.left_source,
-                    r.decl.list.byte_range.start,
-                    r.decl.list.byte_range.end,
+                    r.decl.list,
+                    file_diff.language,
                     indent + 1,
                     .removed,
                     &.{},
@@ -270,8 +290,8 @@ fn appendEntries(
                             arena,
                             out,
                             file_diff.left_source,
-                            c.old.list.byte_range.start,
-                            c.old.list.byte_range.end,
+                            c.old.list,
+                            file_diff.language,
                             indent + 1,
                             .removed,
                             left_novels,
@@ -280,8 +300,8 @@ fn appendEntries(
                             arena,
                             out,
                             file_diff.right_source,
-                            c.new.list.byte_range.start,
-                            c.new.list.byte_range.end,
+                            c.new.list,
+                            file_diff.language,
                             indent + 1,
                             .added,
                             right_novels,
@@ -333,8 +353,8 @@ fn appendEntriesSplit(
                 const src_lines = try sourceLinesSlice(
                     arena,
                     file_diff.right_source,
-                    a.decl.list.byte_range.start,
-                    a.decl.list.byte_range.end,
+                    a.decl.list,
+                    file_diff.language,
                     indent + 1,
                     .added,
                     &.{},
@@ -359,8 +379,8 @@ fn appendEntriesSplit(
                 const src_lines = try sourceLinesSlice(
                     arena,
                     file_diff.left_source,
-                    r.decl.list.byte_range.start,
-                    r.decl.list.byte_range.end,
+                    r.decl.list,
+                    file_diff.language,
                     indent + 1,
                     .removed,
                     &.{},
@@ -398,8 +418,8 @@ fn appendEntriesSplit(
                         const left_lines = try sourceLinesSlice(
                             arena,
                             file_diff.left_source,
-                            c.old.list.byte_range.start,
-                            c.old.list.byte_range.end,
+                            c.old.list,
+                            file_diff.language,
                             indent + 1,
                             .removed,
                             left_novels,
@@ -407,8 +427,8 @@ fn appendEntriesSplit(
                         const right_lines = try sourceLinesSlice(
                             arena,
                             file_diff.right_source,
-                            c.new.list.byte_range.start,
-                            c.new.list.byte_range.end,
+                            c.new.list,
+                            file_diff.language,
                             indent + 1,
                             .added,
                             right_novels,
@@ -463,31 +483,42 @@ fn declHeaderText(
 /// (possibly empty) slice of absolute byte ranges that belong to this side;
 /// each range is clipped per-emitted-line and translated into
 /// display-coordinate `ByteSpan`s on `StyledLine.novel_spans`.
+///
+/// `decl_list` is the SST list for the decl being dumped; its atoms are
+/// walked and classified by `theme.classOf` to populate
+/// `StyledLine.highlights` (syntax colouring). Atoms outside the emitted
+/// lines' byte ranges simply get clipped away.
 fn appendSourceLines(
     arena: std.mem.Allocator,
     out: *std.ArrayList(StyledLine),
     source: []const u8,
-    start: u32,
-    end: u32,
+    decl_list: *const rv.List,
+    language: rv.LanguageId,
     indent: u8,
     marker: Marker,
     novels: Novels,
 ) !void {
-    const lines = try sourceLinesSlice(arena, source, start, end, indent, marker, novels);
+    const lines = try sourceLinesSlice(arena, source, decl_list, language, indent, marker, novels);
     try out.appendSlice(arena, lines);
 }
 
 fn sourceLinesSlice(
     arena: std.mem.Allocator,
     source: []const u8,
-    start: u32,
-    end: u32,
+    decl_list: *const rv.List,
+    language: rv.LanguageId,
     indent: u8,
     marker: Marker,
     novels: Novels,
 ) ![]const StyledLine {
     var buf: std.ArrayList(StyledLine) = .empty;
+    const start: u32 = decl_list.byte_range.start;
+    const end: u32 = decl_list.byte_range.end;
     const slice = source[start..end];
+
+    // Collect syntax highlights once for the whole decl; per-line mapping
+    // is a cheap clipping pass (same shape as `mapNovelsToLine`).
+    const highlights = try collectHighlights(arena, decl_list, language);
 
     // Manual line iteration so we can track each raw line's absolute start
     // offset in `source`; `splitScalar` would hide that.
@@ -505,6 +536,7 @@ fn sourceLinesSlice(
 
         const expanded = try expandTabs(arena, raw_line);
         const line_novels = try mapNovelsToLine(arena, raw_line, line_abs_start, novels);
+        const line_highlights = try mapHighlightsToLine(arena, raw_line, line_abs_start, highlights);
 
         try buf.append(arena, .{
             .indent = indent,
@@ -512,6 +544,7 @@ fn sourceLinesSlice(
             .kind = .source,
             .text = expanded,
             .novel_spans = line_novels,
+            .highlights = line_highlights,
         });
 
         if (nl_rel) |p| {
@@ -584,6 +617,94 @@ fn mapNovelsToLine(
 
     std.mem.sort(ByteSpan, out.items, {}, byteSpanLessThan);
     return try out.toOwnedSlice(arena);
+}
+
+/// Walk a decl's SST list and produce absolute-byte `HighlightSpan`s for
+/// every atom (including leading/trailing trivia comments). Output is in
+/// source order. Unclassifiable atoms still emit a span with `.other` so
+/// the theme's `.other` policy (= keep base style) runs uniformly.
+fn collectHighlights(
+    arena: std.mem.Allocator,
+    list: *const rv.List,
+    language: rv.LanguageId,
+) ![]const HighlightSpan {
+    var out: std.ArrayList(HighlightSpan) = .empty;
+    try walkAtomsForHighlights(arena, &out, .{ .list = list.* }, language);
+    return try out.toOwnedSlice(arena);
+}
+
+fn walkAtomsForHighlights(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(HighlightSpan),
+    n: rv.Node,
+    language: rv.LanguageId,
+) !void {
+    switch (n) {
+        .atom => |a| try appendAtomHighlight(arena, out, a, language),
+        .list => |l| {
+            for (l.leading_trivia) |t| try appendAtomHighlight(arena, out, t, language);
+            for (l.children) |c| try walkAtomsForHighlights(arena, out, c, language);
+            for (l.trailing_trivia) |t| try appendAtomHighlight(arena, out, t, language);
+        },
+    }
+}
+
+fn appendAtomHighlight(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(HighlightSpan),
+    atom: anytype,
+    language: rv.LanguageId,
+) !void {
+    try out.append(arena, .{
+        .start = atom.byte_range.start,
+        .end = atom.byte_range.end,
+        .class = theme.classOf(language, atom.kind, atom.bytes),
+    });
+}
+
+/// Per-line clipping for highlights. Mirrors `mapNovelsToLine`: drops
+/// spans outside the line, clips any that straddle the line end, and
+/// translates raw offsets into post-tab-expansion display offsets. Keeps
+/// the `class` unchanged.
+fn mapHighlightsToLine(
+    arena: std.mem.Allocator,
+    raw_line: []const u8,
+    line_abs_start: u32,
+    highlights: Highlights,
+) ![]const HighlightSpan {
+    if (highlights.len == 0) return &.{};
+
+    const line_abs_end: u32 = line_abs_start + @as(u32, @intCast(raw_line.len));
+
+    var out: std.ArrayList(HighlightSpan) = .empty;
+    for (highlights) |h| {
+        if (h.end <= line_abs_start) continue;
+        if (h.start >= line_abs_end) continue;
+
+        const clip_start_abs = @max(h.start, line_abs_start);
+        const clip_end_abs = @min(h.end, line_abs_end);
+
+        const raw_start: usize = clip_start_abs - line_abs_start;
+        const raw_end: usize = clip_end_abs - line_abs_start;
+
+        const disp_start: u32 = @intCast(rawToDisplay(raw_line, raw_start));
+        const disp_end: u32 = @intCast(rawToDisplay(raw_line, raw_end));
+
+        if (disp_end > disp_start) {
+            try out.append(arena, .{
+                .start = disp_start,
+                .end = disp_end,
+                .class = h.class,
+            });
+        }
+    }
+
+    std.mem.sort(HighlightSpan, out.items, {}, highlightLessThan);
+    return try out.toOwnedSlice(arena);
+}
+
+fn highlightLessThan(_: void, a: HighlightSpan, b: HighlightSpan) bool {
+    return a.start < b.start;
 }
 
 fn byteSpanLessThan(_: void, a: ByteSpan, b: ByteSpan) bool {
@@ -1311,4 +1432,220 @@ test "build: decl_header lines carry a decl_id; source/blank lines do not" {
         ),
     };
     try testing.expect(header_count >= 1);
+}
+
+// ── syntax highlighting (Option 1 — tree-sitter queries task) ───────────
+
+/// Collect the text of every highlighted token on `-` / `+` / ` ` source
+/// lines whose class is `want`. Return values are concatenated in source
+/// order. This is the most direct way to assert "keyword X shows up as a
+/// keyword" without coupling to exact byte offsets.
+fn collectHighlightedByClass(
+    arena: std.mem.Allocator,
+    lines: []const StyledLine,
+    want: TokenClass,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (lines) |ln| {
+        if (ln.kind != .source) continue;
+        for (ln.highlights) |h| {
+            if (h.class != want) continue;
+            try out.append(arena, ln.text[h.start..h.end]);
+        }
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+fn sliceContainsString(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |s| if (std.mem.eql(u8, s, needle)) return true;
+    return false;
+}
+
+test "highlights: Rust added fn — `fn`, `pub`, `let` classified as keywords; strings distinct" {
+    // Acceptance case from the task description.
+    const before = "pub fn keep() {}\n";
+    const after =
+        \\pub fn keep() {}
+        \\pub fn greet(name: &str) -> String {
+        \\    let prefix = "hello, ";
+        \\    let mut out = String::from(prefix);
+        \\    out.push_str(name);
+        \\    out
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const keywords = try collectHighlightedByClass(a, result.view.unified, .keyword);
+    try testing.expect(sliceContainsString(keywords, "fn"));
+    try testing.expect(sliceContainsString(keywords, "pub"));
+    try testing.expect(sliceContainsString(keywords, "let"));
+
+    const strings = try collectHighlightedByClass(a, result.view.unified, .string);
+    try testing.expect(sliceContainsString(strings, "\"hello, \""));
+
+    const types = try collectHighlightedByClass(a, result.view.unified, .type);
+    try testing.expect(sliceContainsString(types, "String"));
+    // `str` is a Rust primitive.
+    try testing.expect(sliceContainsString(types, "str"));
+}
+
+test "highlights: added decl body lines carry highlight spans" {
+    // Added decls emit source lines; verify their highlights populate.
+    // (Unchanged decls don't emit source lines today, so there's nothing
+    // to highlight on them.)
+    const before = "pub fn a() {}\n";
+    const after = "pub fn a() {}\npub fn b() -> u32 { 42 }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_number_highlight = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        for (ln.highlights) |h| {
+            if (h.class == .number and std.mem.eql(u8, ln.text[h.start..h.end], "42")) {
+                saw_number_highlight = true;
+            }
+        }
+    }
+    try testing.expect(saw_number_highlight);
+}
+
+test "highlights: decl headers and blanks carry no highlights" {
+    const before = "pub fn a() -> u32 { 1 }\n";
+    const after = "pub fn a() -> u32 { 2 }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    for (result.view.unified) |ln| switch (ln.kind) {
+        .decl_header, .blank, .file_header, .stats => try testing.expectEqual(@as(usize, 0), ln.highlights.len),
+        .source => {},
+    };
+}
+
+test "highlights: offsets are in display coordinates (tab expansion respected)" {
+    // Leading `\t` shifts raw offsets by `tab_width - 1`. Highlight offsets
+    // on the emitted line must land on the expanded positions so the
+    // renderer draws them at the right cells.
+    const before = "pub fn a() -> u32 { 1 }\n";
+    const after = "pub fn a() -> u32 {\n\tlet x = 99;\n\tx\n}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var hit: ?StyledLine = null;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (std.mem.indexOf(u8, ln.text, "let") == null) continue;
+        hit = ln;
+        break;
+    }
+    try testing.expect(hit != null);
+    const ln = hit.?;
+    try testing.expect(std.mem.startsWith(u8, ln.text, "    let "));
+
+    // `let` is the keyword we expect to tint, starting at column 4 (after
+    // the expanded tab).
+    var found_let_at_4 = false;
+    for (ln.highlights) |h| {
+        if (h.class != .keyword) continue;
+        if (!std.mem.eql(u8, ln.text[h.start..h.end], "let")) continue;
+        try testing.expectEqual(@as(u32, 4), h.start);
+        try testing.expectEqual(@as(u32, 7), h.end);
+        found_let_at_4 = true;
+    }
+    try testing.expect(found_let_at_4);
+}
+
+test "highlights: Zig changed leaf classifies `const` and `return` as keywords" {
+    const before = "pub fn greet() u32 { return 1; }\n";
+    const after = "pub fn greet() u32 {\n    const x: u32 = 2;\n    return x;\n}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const keywords = try collectHighlightedByClass(a, result.view.unified, .keyword);
+    try testing.expect(sliceContainsString(keywords, "const"));
+    try testing.expect(sliceContainsString(keywords, "return"));
+    try testing.expect(sliceContainsString(keywords, "pub"));
+    try testing.expect(sliceContainsString(keywords, "fn"));
+
+    const types = try collectHighlightedByClass(a, result.view.unified, .type);
+    try testing.expect(sliceContainsString(types, "u32"));
+}
+
+test "highlights: split mode populates highlights on both panes" {
+    const before = "pub fn greet() u32 { return 1; }\n";
+    const after = "pub fn greet() u32 { return 2; }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .split);
+    defer result.deinit();
+
+    var left_has_keyword = false;
+    var right_has_keyword = false;
+    for (result.view.split) |p| {
+        if (p.left.kind == .source) {
+            for (p.left.highlights) |h| if (h.class == .keyword) {
+                left_has_keyword = true;
+            };
+        }
+        if (p.right.kind == .source) {
+            for (p.right.highlights) |h| if (h.class == .keyword) {
+                right_has_keyword = true;
+            };
+        }
+    }
+    try testing.expect(left_has_keyword);
+    try testing.expect(right_has_keyword);
+}
+
+test "mapHighlightsToLine: drops spans outside the line, clips at line end" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const raw = "hello world"; // 11 bytes at abs [100, 111)
+    const highlights = [_]HighlightSpan{
+        .{ .start = 50, .end = 60, .class = .keyword }, // before
+        .{ .start = 102, .end = 107, .class = .ident }, // "llo w" inside
+        .{ .start = 108, .end = 200, .class = .number }, // clip at 111
+        .{ .start = 500, .end = 600, .class = .keyword }, // after
+    };
+    const got = try mapHighlightsToLine(a, raw, 100, &highlights);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(@as(u32, 2), got[0].start);
+    try testing.expectEqual(@as(u32, 7), got[0].end);
+    try testing.expectEqual(TokenClass.ident, got[0].class);
+    try testing.expectEqual(@as(u32, 8), got[1].start);
+    try testing.expectEqual(@as(u32, 11), got[1].end);
+    try testing.expectEqual(TokenClass.number, got[1].class);
 }

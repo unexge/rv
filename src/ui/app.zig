@@ -24,6 +24,7 @@ const vaxis = @import("vaxis");
 
 const rv = @import("rv");
 const line_mod = @import("line.zig");
+const theme = @import("theme.zig");
 
 const StyledLine = line_mod.StyledLine;
 const LinePair = line_mod.LinePair;
@@ -486,50 +487,97 @@ fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
     const indent_cols: u16 = @as(u16, @intCast(sl.indent)) * 2;
     const text_col: u16 = 2 + indent_cols;
 
-    if (sl.novel_spans.len == 0) {
-        _ = body.print(&.{.{
-            .text = sl.text,
-            .style = base_style,
-        }}, .{ .row_offset = row, .col_offset = text_col, .wrap = .none });
+    drawStyledText(body, row, text_col, sl, base_style);
+}
+
+/// Paint the text portion of a StyledLine, layering (in priority order):
+///
+///   1. Syntax-highlight spans from `sl.highlights` → per-token fg.
+///   2. Novel-range overlay from `sl.novel_spans` → reverse-video on top.
+///   3. Base marker style for any byte not covered by a highlight.
+///
+/// The rendering walks the line one display-byte at a time in O(n) with a
+/// two-cursor sweep over the (sorted, non-overlapping) highlight and
+/// novel-span arrays. Runs with the same effective style are coalesced so
+/// we emit one `print` call per visual segment.
+fn drawStyledText(
+    body: vaxis.Window,
+    row: u16,
+    text_col: u16,
+    sl: StyledLine,
+    base_style: vaxis.Style,
+) void {
+    if (sl.text.len == 0) return;
+
+    // Fast path: no decoration → single print.
+    if (sl.highlights.len == 0 and sl.novel_spans.len == 0) {
+        _ = body.print(&.{.{ .text = sl.text, .style = base_style }}, .{
+            .row_offset = row,
+            .col_offset = text_col,
+            .wrap = .none,
+        });
         return;
     }
 
-    // Novel-range highlighting (Option C): walk the sorted non-overlapping
-    // spans and emit alternating base / novel segments. Column tracking is
-    // byte-count based, which matches the ASCII-cell assumption elsewhere
-    // in this renderer (tab expansion to spaces happens at build time).
-    const novel_style = novelStyleFor(base_style);
-    var cursor_byte: usize = 0;
-    var col: u16 = text_col;
-    for (sl.novel_spans) |s| {
-        if (s.start > cursor_byte) {
-            const seg = sl.text[cursor_byte..s.start];
-            _ = body.print(&.{.{ .text = seg, .style = base_style }}, .{
+    var hl_i: usize = 0;
+    var nv_i: usize = 0;
+    var pos: usize = 0;
+    var run_start: usize = 0;
+    var run_style: vaxis.Style = effectiveStyle(sl, base_style, pos, &hl_i, &nv_i);
+
+    pos = 1;
+    while (pos < sl.text.len) : (pos += 1) {
+        const s = effectiveStyle(sl, base_style, pos, &hl_i, &nv_i);
+        if (!s.eql(run_style)) {
+            _ = body.print(&.{.{
+                .text = sl.text[run_start..pos],
+                .style = run_style,
+            }}, .{
                 .row_offset = row,
-                .col_offset = col,
+                .col_offset = text_col + @as(u16, @intCast(run_start)),
                 .wrap = .none,
             });
-            col += @intCast(seg.len);
+            run_start = pos;
+            run_style = s;
         }
-        if (s.end > s.start) {
-            const seg = sl.text[s.start..s.end];
-            _ = body.print(&.{.{ .text = seg, .style = novel_style }}, .{
-                .row_offset = row,
-                .col_offset = col,
-                .wrap = .none,
-            });
-            col += @intCast(seg.len);
+    }
+    _ = body.print(&.{.{
+        .text = sl.text[run_start..pos],
+        .style = run_style,
+    }}, .{
+        .row_offset = row,
+        .col_offset = text_col + @as(u16, @intCast(run_start)),
+        .wrap = .none,
+    });
+}
+
+/// Compute the per-byte effective style. `hl_i` / `nv_i` are monotonic
+/// cursors into the sorted span arrays and are advanced past spans that
+/// end at or before `pos`.
+fn effectiveStyle(
+    sl: StyledLine,
+    base_style: vaxis.Style,
+    pos: usize,
+    hl_i: *usize,
+    nv_i: *usize,
+) vaxis.Style {
+    while (hl_i.* < sl.highlights.len and sl.highlights[hl_i.*].end <= pos) hl_i.* += 1;
+    while (nv_i.* < sl.novel_spans.len and sl.novel_spans[nv_i.*].end <= pos) nv_i.* += 1;
+
+    var style = base_style;
+    if (hl_i.* < sl.highlights.len) {
+        const h = sl.highlights[hl_i.*];
+        if (pos >= h.start and pos < h.end) {
+            style = theme.style(h.class, base_style);
         }
-        cursor_byte = s.end;
     }
-    if (cursor_byte < sl.text.len) {
-        const tail = sl.text[cursor_byte..];
-        _ = body.print(&.{.{ .text = tail, .style = base_style }}, .{
-            .row_offset = row,
-            .col_offset = col,
-            .wrap = .none,
-        });
+    if (nv_i.* < sl.novel_spans.len) {
+        const n = sl.novel_spans[nv_i.*];
+        if (pos >= n.start and pos < n.end) {
+            style = novelStyleFor(style);
+        }
     }
+    return style;
 }
 
 /// Stronger variant of `base` for atom-level novel ranges. Reverse video

@@ -155,9 +155,26 @@ pub const View = union(Mode) {
     split: []const LinePair,
 };
 
+/// One entry per decl header in the current view, in row order. Lets
+/// `app.zig` jump to the next/previous decl without scanning the full
+/// line list on every keypress and supports the `N`/`P` "changed only"
+/// variant via the `changed` flag.
+pub const DeclIndexEntry = struct {
+    /// Absolute row in the current view; same units as `AppState.cursor_y`.
+    row: usize,
+    /// True when the decl's header marker is `added`, `removed`, or
+    /// `changed` - the set that `N`/`P` iterate. Unchanged headers have
+    /// this set to false.
+    changed: bool,
+};
+
 pub const BuildResult = struct {
     view: View,
     stats: Stats,
+    /// Row index of every decl header, in view order. Built as a side
+    /// table alongside the view so `n`/`p`/`N`/`P`/`g`/`G` navigation
+    /// doesn't have to rescan the whole line list per keypress.
+    decl_index: []const DeclIndexEntry,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *BuildResult) void {
@@ -204,11 +221,43 @@ pub fn build(
         },
     };
 
+    const decl_index = try collectDeclIndex(arena, view);
+
     return .{
         .view = view,
         .stats = stats,
+        .decl_index = decl_index,
         .arena = arena_state,
     };
+}
+
+/// Single post-pass over the built view, recording the row of every
+/// `decl_header` line plus whether it represents a changed decl. Split
+/// view: for mirrored (unchanged/changed) headers either side works;
+/// `headerSide` already picks a non-blank pane for added/removed.
+fn collectDeclIndex(arena: std.mem.Allocator, view: View) ![]const DeclIndexEntry {
+    var out: std.ArrayList(DeclIndexEntry) = .empty;
+    switch (view) {
+        .unified => |lines| for (lines, 0..) |ln, i| {
+            if (ln.kind != .decl_header) continue;
+            try out.append(arena, .{
+                .row = i,
+                .changed = isChangedMarker(ln.marker),
+            });
+        },
+        .split => |pairs| for (pairs, 0..) |p, i| {
+            const side = p.headerSide() orelse continue;
+            try out.append(arena, .{
+                .row = i,
+                .changed = isChangedMarker(side.marker),
+            });
+        },
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+fn isChangedMarker(m: Marker) bool {
+    return m == .added or m == .removed or m == .changed;
 }
 
 fn appendEntries(
@@ -1769,3 +1818,102 @@ test "mapHighlightsToLine: drops spans outside the line, clips at line end" {
     try testing.expectEqual(@as(u32, 11), got[1].end);
     try testing.expectEqual(TokenClass.number, got[1].class);
 }
+
+// ── decl_index ───────────────────────────────────────────────────────────────────
+
+test "build: decl_index lists every header row with a `changed` flag" {
+    const before =
+        \\pub fn keep() void {}
+        \\pub fn tweak() u32 { return 1; }
+    ;
+    const after =
+        \\pub fn keep() void {}
+        \\pub fn tweak() u32 { return 2; }
+        \\pub fn added() void {}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    // Three decl headers total: unchanged `keep`, changed `tweak`, added
+    // `added`.
+    try testing.expectEqual(@as(usize, 3), result.decl_index.len);
+
+    // Every index entry actually points at a decl_header row.
+    for (result.decl_index) |e| {
+        try testing.expectEqual(LineKind.decl_header, result.view.unified[e.row].kind);
+    }
+
+    // Changed flags line up with the header markers.
+    var changed_count: usize = 0;
+    var unchanged_count: usize = 0;
+    for (result.decl_index) |e| {
+        const marker = result.view.unified[e.row].marker;
+        if (e.changed) {
+            try testing.expect(marker == .added or marker == .removed or marker == .changed);
+            changed_count += 1;
+        } else {
+            try testing.expectEqual(Marker.unchanged, marker);
+            unchanged_count += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), changed_count); // tweak + added
+    try testing.expectEqual(@as(usize, 1), unchanged_count); // keep
+}
+
+test "build split: decl_index covers both mirrored and single-sided headers" {
+    const before = "pub fn a() void {}\npub fn gone() void { return; }\n";
+    const after = "pub fn a() void {}\npub fn fresh() void { return; }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .split);
+    defer result.deinit();
+
+    // Three decls (unchanged a, removed gone, added fresh) → three entries.
+    try testing.expectEqual(@as(usize, 3), result.decl_index.len);
+
+    // Each entry's row resolves to a pair with a decl_header on at least
+    // one side; `changed` matches whichever side holds the header.
+    for (result.decl_index) |e| {
+        const side = result.view.split[e.row].headerSide() orelse unreachable;
+        const expect_changed = side.marker == .added or
+            side.marker == .removed or
+            side.marker == .changed;
+        try testing.expectEqual(expect_changed, e.changed);
+    }
+}
+
+test "build: decl_index row order is strictly ascending" {
+    const before =
+        \\pub fn a() void {}
+        \\pub const Thing = struct {
+        \\    pub fn one() void {}
+        \\};
+    ;
+    const after =
+        \\pub fn a() u32 { return 1; }
+        \\pub const Thing = struct {
+        \\    pub fn one() u32 { return 1; }
+        \\    pub fn two() void {}
+        \\};
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    try testing.expect(result.decl_index.len > 1);
+    var prev: usize = 0;
+    for (result.decl_index, 0..) |e, i| {
+        if (i > 0) try testing.expect(e.row > prev);
+        prev = e.row;
+    }
+}
+

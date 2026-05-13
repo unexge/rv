@@ -8,7 +8,13 @@
 //! - Key handling: j/k/arrows move the cursor (scroll follows), PgUp/PgDn
 //!   page the cursor, Home/End jump to ends, space/enter toggles collapse
 //!   on the focused decl, `[` collapses every decl with a body, `]`
-//!   expands everything, `v` toggles split vs unified, q / Ctrl-C quit.
+//!   expands everything, `v` toggles split vs unified,
+//!   `n`/`p` jumps to the next/previous decl header (any kind),
+//!   `N`/`P` jumps between *changed* decls (skipping unchanged ones),
+//!   `g`/`G` jumps to the first/last decl, q / Ctrl-C quit.
+//!   `n`/`p`/`N`/`P` wrap around the file; all decl jumps center the
+//!   target in the top third of the viewport so the decl body stays
+//!   visible below.
 //! - Mouse handling: wheel scroll + click-to-focus. Terminals without
 //!   mouse support simply never deliver mouse events, so keyboard
 //!   navigation stays intact. Drag-select is deferred because our mouse
@@ -33,6 +39,7 @@ const LineKind = line_mod.LineKind;
 const Mode = line_mod.Mode;
 const View = line_mod.View;
 const BuildResult = line_mod.BuildResult;
+const DeclIndexEntry = line_mod.DeclIndexEntry;
 const AppState = line_mod.AppState;
 const DeclId = line_mod.DeclId;
 
@@ -77,7 +84,7 @@ pub fn run(
     // state or mode, so we format the legend exactly once.
     const stats_text = try std.fmt.allocPrint(
         la,
-        " +{d}  -{d}  ~{d}  ={d}    (j/k: move, space: fold, [: fold all, ]: unfold, v: split, q: quit)",
+        " +{d}  -{d}  ~{d}  ={d}    (j/k: move, n/p: decl, N/P: changed, g/G: first/last, space: fold, v: split, q: quit)",
         .{
             current.stats.added,
             current.stats.removed,
@@ -133,6 +140,18 @@ pub fn run(
                     state.expandAll();
                     try rebuild(gpa, &current, file_diff, mode, &state);
                     relocateCursor(&state, current.view, anchor, viewport);
+                } else if (key.matches('n', .{})) {
+                    jumpDecl(&state, current.decl_index, .forward, false, viewport, current.rowCount());
+                } else if (key.matches('p', .{})) {
+                    jumpDecl(&state, current.decl_index, .backward, false, viewport, current.rowCount());
+                } else if (key.matches('N', .{})) {
+                    jumpDecl(&state, current.decl_index, .forward, true, viewport, current.rowCount());
+                } else if (key.matches('P', .{})) {
+                    jumpDecl(&state, current.decl_index, .backward, true, viewport, current.rowCount());
+                } else if (key.matches('g', .{})) {
+                    jumpToEnd(&state, current.decl_index, .first, viewport, current.rowCount());
+                } else if (key.matches('G', .{})) {
+                    jumpToEnd(&state, current.decl_index, .last, viewport, current.rowCount());
                 } else {
                     applyNavigationKey(&state, key, viewport, current.rowCount());
                 }
@@ -349,6 +368,105 @@ fn relocateCursor(
 
     state.cursor_y = @min(state.cursor_y, total - 1);
     followCursor(state, viewport, total);
+}
+
+// ── jump-to-decl navigation ───────────────────────────────────────────────
+
+const Direction = enum { forward, backward };
+const Bound = enum { first, last };
+
+/// Jump the cursor to the next (or previous) decl header in the index.
+/// When `changed_only` is true, headers whose `changed` flag is false
+/// (i.e. `unchanged` decls) are skipped. The search wraps around the
+/// end of the file, so repeatedly pressing `N` on the last changed decl
+/// brings the cursor back to the first changed decl - documented in
+/// the module header.
+///
+/// Lands on the header row regardless of whether the target decl is
+/// collapsed; `centerOnRow` then biases `scroll_y` so the decl's body
+/// (if any) is visible in the rows below.
+fn jumpDecl(
+    state: *AppState,
+    decl_index: []const DeclIndexEntry,
+    dir: Direction,
+    changed_only: bool,
+    viewport: u16,
+    total: usize,
+) void {
+    const target = switch (dir) {
+        .forward => nextDeclRow(decl_index, state.cursor_y, changed_only),
+        .backward => prevDeclRow(decl_index, state.cursor_y, changed_only),
+    } orelse return;
+    centerOnRow(state, target, viewport, total);
+}
+
+/// Jump to the first or last decl in the index. No-op on an empty
+/// index. Useful to escape out of long leading/trailing blank regions
+/// without paging.
+fn jumpToEnd(
+    state: *AppState,
+    decl_index: []const DeclIndexEntry,
+    bound: Bound,
+    viewport: u16,
+    total: usize,
+) void {
+    if (decl_index.len == 0) return;
+    const target = switch (bound) {
+        .first => decl_index[0].row,
+        .last => decl_index[decl_index.len - 1].row,
+    };
+    centerOnRow(state, target, viewport, total);
+}
+
+/// Linear scan for the first index entry strictly after `cursor_row`,
+/// wrapping to the start of the list when none exists. Decl indexes
+/// are short (one entry per decl, not per line) so the scan is
+/// cheaper than the binary-search + wrap logic hinted at in the task.
+fn nextDeclRow(decl_index: []const DeclIndexEntry, cursor_row: usize, changed_only: bool) ?usize {
+    if (decl_index.len == 0) return null;
+    for (decl_index) |e| {
+        if (e.row <= cursor_row) continue;
+        if (changed_only and !e.changed) continue;
+        return e.row;
+    }
+    for (decl_index) |e| {
+        if (changed_only and !e.changed) continue;
+        return e.row;
+    }
+    return null;
+}
+
+fn prevDeclRow(decl_index: []const DeclIndexEntry, cursor_row: usize, changed_only: bool) ?usize {
+    if (decl_index.len == 0) return null;
+    var i: usize = decl_index.len;
+    while (i > 0) {
+        i -= 1;
+        const e = decl_index[i];
+        if (e.row >= cursor_row) continue;
+        if (changed_only and !e.changed) continue;
+        return e.row;
+    }
+    i = decl_index.len;
+    while (i > 0) {
+        i -= 1;
+        const e = decl_index[i];
+        if (changed_only and !e.changed) continue;
+        return e.row;
+    }
+    return null;
+}
+
+/// Place `target` roughly one-third of the way down the viewport so the
+/// decl body below the header stays visible. Clamped like `followCursor`
+/// so we never scroll past the end of the file. Safe when `viewport` is
+/// zero (e.g. during a resize): no divide-by-zero, and the cursor still
+/// lands on `target` so a subsequent resize restores a sensible view.
+fn centerOnRow(state: *AppState, target: usize, viewport: u16, total: usize) void {
+    state.cursor_y = target;
+    const bias: usize = viewport / 3;
+    state.scroll_y = if (target > bias) target - bias else 0;
+    const max_scroll = if (total > viewport) total - viewport else 0;
+    state.scroll_y = @min(state.scroll_y, max_scroll);
 }
 
 // ── draw: unified ──────────────────────────────────────────────────────────
@@ -907,4 +1025,215 @@ test "collapse integration: [ collapses all changed decls, ] expands" {
         saw_source = true;
     };
     try testing.expect(saw_source);
+}
+
+// ── jump-to-decl ─────────────────────────────────────────────────────────────────────
+
+test "nextDeclRow: walks forward, wraps to start at end of file" {
+    const idx = [_]DeclIndexEntry{
+        .{ .row = 0, .changed = false },
+        .{ .row = 5, .changed = true },
+        .{ .row = 12, .changed = false },
+        .{ .row = 20, .changed = true },
+    };
+    try testing.expectEqual(@as(?usize, 5), nextDeclRow(idx[0..], 0, false));
+    try testing.expectEqual(@as(?usize, 12), nextDeclRow(idx[0..], 5, false));
+    try testing.expectEqual(@as(?usize, 12), nextDeclRow(idx[0..], 8, false));
+    try testing.expectEqual(@as(?usize, 20), nextDeclRow(idx[0..], 15, false));
+    // Past the last row → wrap to first.
+    try testing.expectEqual(@as(?usize, 0), nextDeclRow(idx[0..], 20, false));
+    try testing.expectEqual(@as(?usize, 0), nextDeclRow(idx[0..], 999, false));
+}
+
+test "nextDeclRow: changed_only skips unchanged entries, wraps to first changed" {
+    const idx = [_]DeclIndexEntry{
+        .{ .row = 0, .changed = false },
+        .{ .row = 5, .changed = true },
+        .{ .row = 12, .changed = false },
+        .{ .row = 20, .changed = true },
+        .{ .row = 30, .changed = false },
+    };
+    // From row 0, first changed is at 5.
+    try testing.expectEqual(@as(?usize, 5), nextDeclRow(idx[0..], 0, true));
+    // From row 5, skip the row-12 unchanged and land on 20.
+    try testing.expectEqual(@as(?usize, 20), nextDeclRow(idx[0..], 5, true));
+    // From past-the-last, wrap back to the first *changed* row (5, not 0).
+    try testing.expectEqual(@as(?usize, 5), nextDeclRow(idx[0..], 999, true));
+}
+
+test "nextDeclRow: empty or all-unchanged with changed_only → null" {
+    try testing.expectEqual(@as(?usize, null), nextDeclRow(&.{}, 0, false));
+    const only_unchanged = [_]DeclIndexEntry{
+        .{ .row = 0, .changed = false },
+        .{ .row = 5, .changed = false },
+    };
+    try testing.expectEqual(@as(?usize, null), nextDeclRow(only_unchanged[0..], 0, true));
+    // changed_only=false still walks through unchanged entries.
+    try testing.expectEqual(@as(?usize, 5), nextDeclRow(only_unchanged[0..], 0, false));
+}
+
+test "prevDeclRow: walks backward, wraps to last at start of file" {
+    const idx = [_]DeclIndexEntry{
+        .{ .row = 0, .changed = false },
+        .{ .row = 5, .changed = true },
+        .{ .row = 12, .changed = false },
+        .{ .row = 20, .changed = true },
+    };
+    try testing.expectEqual(@as(?usize, 12), prevDeclRow(idx[0..], 20, false));
+    try testing.expectEqual(@as(?usize, 5), prevDeclRow(idx[0..], 10, false));
+    try testing.expectEqual(@as(?usize, 0), prevDeclRow(idx[0..], 5, false));
+    // Before the first row → wrap to last.
+    try testing.expectEqual(@as(?usize, 20), prevDeclRow(idx[0..], 0, false));
+}
+
+test "prevDeclRow: changed_only skips unchanged entries" {
+    const idx = [_]DeclIndexEntry{
+        .{ .row = 0, .changed = false },
+        .{ .row = 5, .changed = true },
+        .{ .row = 12, .changed = false },
+        .{ .row = 20, .changed = true },
+    };
+    // From row 20 (changed), previous changed is 5 (skip row 12 unchanged).
+    try testing.expectEqual(@as(?usize, 5), prevDeclRow(idx[0..], 20, true));
+    // Before any changed row → wrap to the last changed (20).
+    try testing.expectEqual(@as(?usize, 20), prevDeclRow(idx[0..], 0, true));
+}
+
+test "centerOnRow: places target in top third of viewport, clamps at zero" {
+    var state = makeState(0, 0);
+    defer state.deinit();
+    // viewport=30, bias=10 → scroll=target-10.
+    centerOnRow(&state, 50, 30, 200);
+    try testing.expectEqual(@as(usize, 50), state.cursor_y);
+    try testing.expectEqual(@as(usize, 40), state.scroll_y);
+
+    // Target inside the bias window → scroll clamps to 0.
+    centerOnRow(&state, 3, 30, 200);
+    try testing.expectEqual(@as(usize, 3), state.cursor_y);
+    try testing.expectEqual(@as(usize, 0), state.scroll_y);
+}
+
+test "centerOnRow: never scrolls past the end of the file" {
+    var state = makeState(0, 0);
+    defer state.deinit();
+    // Target near the end: raw scroll would be 195-10=185, but max_scroll=170.
+    centerOnRow(&state, 195, 30, 200);
+    try testing.expectEqual(@as(usize, 195), state.cursor_y);
+    try testing.expectEqual(@as(usize, 170), state.scroll_y);
+}
+
+test "jumpDecl: from unchanged cursor, N lands on first changed decl" {
+    // Simulate a file where decls sit at rows 0, 10, 20, 30 with only row
+    // 20 being changed. Pressing `N` from the top should jump straight to
+    // row 20, skipping row 10's unchanged header.
+    const idx = [_]DeclIndexEntry{
+        .{ .row = 0, .changed = false },
+        .{ .row = 10, .changed = false },
+        .{ .row = 20, .changed = true },
+        .{ .row = 30, .changed = false },
+    };
+    var state = makeState(0, 0);
+    defer state.deinit();
+    jumpDecl(&state, idx[0..], .forward, true, 20, 100);
+    try testing.expectEqual(@as(usize, 20), state.cursor_y);
+
+    // From row 20, N wraps back to row 20 itself (it's the only changed decl).
+    // Forward-strict semantics wrap to the first changed hit, which here is 20.
+    jumpDecl(&state, idx[0..], .forward, true, 20, 100);
+    try testing.expectEqual(@as(usize, 20), state.cursor_y);
+}
+
+test "jumpToEnd: first/last bounds land on boundary decls" {
+    const idx = [_]DeclIndexEntry{
+        .{ .row = 3, .changed = false },
+        .{ .row = 15, .changed = true },
+        .{ .row = 42, .changed = false },
+    };
+    var state = makeState(10, 20);
+    defer state.deinit();
+    jumpToEnd(&state, idx[0..], .first, 10, 100);
+    try testing.expectEqual(@as(usize, 3), state.cursor_y);
+
+    jumpToEnd(&state, idx[0..], .last, 10, 100);
+    try testing.expectEqual(@as(usize, 42), state.cursor_y);
+
+    // Empty index leaves state alone.
+    const empty: []const DeclIndexEntry = &.{};
+    state.cursor_y = 7;
+    state.scroll_y = 3;
+    jumpToEnd(&state, empty, .first, 10, 100);
+    try testing.expectEqual(@as(usize, 7), state.cursor_y);
+    try testing.expectEqual(@as(usize, 3), state.scroll_y);
+}
+
+// Integration test against a real FileDiff: decl_index is built correctly
+// and N skips unchanged decls to reach the first changed one. Mirrors the
+// acceptance criterion "Pressing N on a file with many decls but a few
+// changes jumps cleanly from one change to the next."
+test "jump-to-decl integration: N skips unchanged decls, lands on changed" {
+    const before =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub fn c() u32 { return 1; }
+        \\pub fn d() void {}
+    ;
+    const after =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub fn c() u32 { return 2; }
+        \\pub fn d() void {}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+
+    var current = try line_mod.build(testing.allocator, &fd, .unified, &state);
+    defer current.deinit();
+
+    // Index has exactly four entries, one per decl.
+    try testing.expectEqual(@as(usize, 4), current.decl_index.len);
+    // Only `c` is changed.
+    var changed_count: usize = 0;
+    for (current.decl_index) |e| if (e.changed) {
+        changed_count += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), changed_count);
+
+    // From cursor at top, N jumps to the changed row.
+    state.cursor_y = 0;
+    jumpDecl(&state, current.decl_index, .forward, true, 20, current.rowCount());
+    // Cursor now sits on a changed decl header.
+    const at_cursor = current.view.unified[state.cursor_y];
+    try testing.expectEqual(LineKind.decl_header, at_cursor.kind);
+    try testing.expectEqual(Marker.changed, at_cursor.marker);
+}
+
+test "jump-to-decl integration: jumping to a collapsed decl leaves it collapsed" {
+    const before = "pub fn a() u32 { return 1; }\npub fn b() u32 { return 1; }\n";
+    const after = "pub fn a() u32 { return 2; }\npub fn b() u32 { return 2; }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+
+    // Collapse everything up-front, then rebuild.
+    try state.collapseAll(&fd);
+    var current = try line_mod.build(testing.allocator, &fd, .unified, &state);
+    defer current.deinit();
+
+    // Body lines are hidden; only decl headers remain.
+    for (current.view.unified) |ln| try testing.expectEqual(LineKind.decl_header, ln.kind);
+
+    state.cursor_y = 0;
+    jumpDecl(&state, current.decl_index, .forward, false, 30, current.rowCount());
+
+    // Landed on the second decl header, still collapsed ("…" suffix).
+    const at = current.view.unified[state.cursor_y];
+    try testing.expectEqual(LineKind.decl_header, at.kind);
+    try testing.expect(std.mem.endsWith(u8, at.text, " [\u{2026}]"));
 }

@@ -80,15 +80,16 @@ pub const GitRepo = struct {
         self.* = undefined;
     }
 
-    /// Enumerate all files with HEAD-vs-worktree differences, in git's
-    /// natural (alphabetical) order. Returned slice is arena-owned.
+    /// Enumerate all files with index-vs-worktree differences (plain
+    /// `git diff` semantics), in git's natural (alphabetical) order.
+    /// Returned slice is arena-owned.
     pub fn listChanges(self: *GitRepo) ListError![]vcs.FileChange {
-        const name_status = self.runGitCollect(&.{ "diff", "HEAD", "--name-status", "-z" }) catch |err| return mapListRunError(err);
+        const name_status = self.runGitCollect(&.{ "diff", "--name-status", "-z" }) catch |err| return mapListRunError(err);
         defer self.gpa.free(name_status.stdout);
         defer self.gpa.free(name_status.stderr);
         if (!termOk(name_status.term)) return error.GitFailed;
 
-        const numstat = self.runGitCollect(&.{ "diff", "HEAD", "--numstat", "-z" }) catch |err| return mapListRunError(err);
+        const numstat = self.runGitCollect(&.{ "diff", "--numstat", "-z" }) catch |err| return mapListRunError(err);
         defer self.gpa.free(numstat.stdout);
         defer self.gpa.free(numstat.stderr);
         if (!termOk(numstat.term)) return error.GitFailed;
@@ -155,12 +156,12 @@ pub const GitRepo = struct {
         return try arena_alloc.dupe(vcs.FileChange, out.items);
     }
 
-    /// Read the pre-change bytes of `change` from `HEAD`
-    /// (`git show HEAD:<old_path>`). Caller owns the returned buffer.
+    /// Read the pre-change bytes of `change` from the index
+    /// (`git show :<old_path>`). Caller owns the returned buffer.
     pub fn loadOld(self: *GitRepo, gpa: Allocator, change: vcs.FileChange) LoadError![]u8 {
         const old = change.old_path orelse return error.NotFound;
 
-        const spec = try std.fmt.allocPrint(self.gpa, "HEAD:{s}", .{old});
+        const spec = try std.fmt.allocPrint(self.gpa, ":{s}", .{old});
         defer self.gpa.free(spec);
 
         const result = self.runGit(gpa, &.{ "show", spec }) catch |err| return mapLoadRunError(err);
@@ -503,32 +504,26 @@ test "listChanges: deleted file" {
     try testing.expectError(error.NotFound, repo.loadNew(gpa, c));
 }
 
-test "listChanges: renamed file" {
-    const gpa = testing.allocator;
-    var tr = try TestRepo.init(gpa);
-    defer tr.deinit(gpa);
+test "NameStatusIter: parses R (rename) entries with two paths" {
+    // Plain `git diff` (index vs worktree) can't actually produce R
+    // entries — the untracked "added" side is invisible to `git diff` —
+    // but the `.renamed` mapping is kept defensively in case git ever
+    // emits one (e.g. a future flag). Exercise the parser directly
+    // against synthetic `--name-status -z` bytes.
+    const data = "R100\x00old.zig\x00new.zig\x00M\x00a.zig\x00";
+    var it: NameStatusIter = .{ .data = data, .pos = 0 };
 
-    try tr.writeFile("old.zig", "pub fn f() void {}\n");
-    try tr.commitAll(gpa, "init");
-    try tr.runGit(gpa, &.{ "mv", "old.zig", "new.zig" });
+    const first = (try it.next()).?;
+    try testing.expectEqualStrings("R100", first.status);
+    try testing.expectEqualStrings("old.zig", first.p1);
+    try testing.expectEqualStrings("new.zig", first.p2.?);
 
-    var repo = try tr.discover(gpa);
-    defer repo.deinit();
+    const second = (try it.next()).?;
+    try testing.expectEqualStrings("M", second.status);
+    try testing.expectEqualStrings("a.zig", second.p1);
+    try testing.expect(second.p2 == null);
 
-    const changes = try repo.listChanges();
-    try testing.expectEqual(@as(usize, 1), changes.len);
-    const c = changes[0];
-    try testing.expectEqual(vcs.ChangeKind.renamed, c.kind);
-    try testing.expectEqualStrings("old.zig", c.old_path.?);
-    try testing.expectEqualStrings("new.zig", c.new_path.?);
-
-    const old_bytes = try repo.loadOld(gpa, c);
-    defer gpa.free(old_bytes);
-    try testing.expectEqualStrings("pub fn f() void {}\n", old_bytes);
-
-    const new_bytes = try repo.loadNew(gpa, c);
-    defer gpa.free(new_bytes);
-    try testing.expectEqualStrings("pub fn f() void {}\n", new_bytes);
+    try testing.expect((try it.next()) == null);
 }
 
 test "listChanges: binary file" {
@@ -601,4 +596,43 @@ test "listChanges: git iteration order preserved" {
     try testing.expectEqualStrings("a.zig", changes[0].new_path.?);
     try testing.expectEqualStrings("b.zig", changes[1].new_path.?);
     try testing.expectEqualStrings("c.zig", changes[2].new_path.?);
+}
+
+test "listChanges / loadOld: index-vs-worktree (not HEAD-vs-worktree)" {
+    // Regression: rv repo mode must use plain `git diff` semantics
+    // (index vs worktree), not `git diff HEAD`. We stage an intermediate
+    // version of a file into the index, then modify the worktree again.
+    // Under the correct semantics:
+    //   - listChanges reports worktree vs index (added=1, removed=1)
+    //   - loadOld returns the staged (index) bytes, not the HEAD bytes
+    const gpa = testing.allocator;
+    var tr = try TestRepo.init(gpa);
+    defer tr.deinit(gpa);
+
+    // HEAD: v1, index: v2, worktree: v3. `git diff HEAD` would report
+    // v1 -> v3 (2 lines changed); plain `git diff` reports v2 -> v3 (1).
+    try tr.writeFile("a.zig", "pub fn a() void {}\npub fn b() void {}\n");
+    try tr.commitAll(gpa, "init");
+    try tr.writeFile("a.zig", "pub fn a() void { return; }\npub fn b() void {}\n");
+    try tr.runGit(gpa, &.{ "add", "a.zig" });
+    try tr.writeFile("a.zig", "pub fn a() void { return; }\npub fn b() void { return; }\n");
+
+    var repo = try tr.discover(gpa);
+    defer repo.deinit();
+
+    const changes = try repo.listChanges();
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    const c = changes[0];
+    try testing.expectEqual(vcs.ChangeKind.modified, c.kind);
+    // Only the second line differs between index and worktree.
+    try testing.expectEqual(@as(u32, 1), c.line_stat.added);
+    try testing.expectEqual(@as(u32, 1), c.line_stat.removed);
+
+    const old_bytes = try repo.loadOld(gpa, c);
+    defer gpa.free(old_bytes);
+    // loadOld must return the staged (index) bytes, not HEAD's.
+    try testing.expectEqualStrings(
+        "pub fn a() void { return; }\npub fn b() void {}\n",
+        old_bytes,
+    );
 }

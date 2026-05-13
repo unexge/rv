@@ -122,7 +122,7 @@ pub const Session = struct {
         self.repo.deinit();
     }
 
-    /// Idempotent: load `HEAD` + worktree bytes for `idx`, diff them,
+    /// Idempotent: load index + worktree bytes for `idx`, diff them,
     /// and store the result on `states[idx]`. No-op once loaded, or for
     /// binary / unsupported entries.
     ///

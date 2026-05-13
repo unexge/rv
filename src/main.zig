@@ -8,6 +8,7 @@ const ui = @import("ui/app.zig");
 
 // Ensure the ui module's inline tests are visible to `zig build test`.
 comptime {
+    _ = @import("ui/hunk.zig");
     _ = @import("ui/line.zig");
     _ = @import("ui/state.zig");
     _ = @import("ui/theme.zig");

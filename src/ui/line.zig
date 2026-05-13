@@ -6,7 +6,9 @@
 //!     = name                (unchanged: dim, one line)
 //!     + name  (ts_kind)     (added: green header + verbatim right-source as + lines)
 //!     - name  (ts_kind)     (removed: red header + verbatim left-source as - lines)
-//!     ~ name  (ts_kind)     (changed leaf: yellow header + left-source as -, then right-source as +)
+//!     ~ name  (ts_kind)     (changed leaf: yellow header + git-style hunk of the body:
+//!                            ` context, - removed, + added lines produced by a linewise
+//!                            LCS in `hunk.zig`)
 //!     ~ name  (ts_kind)     (changed container: yellow header, then recurse with indent+1)
 //!
 //!   `.split` produces `[]LinePair` (left_line, right_line per row):
@@ -32,6 +34,7 @@
 const std = @import("std");
 
 const rv = @import("rv");
+const hunk_mod = @import("hunk.zig");
 const state_mod = @import("state.zig");
 const theme = @import("theme.zig");
 
@@ -53,6 +56,10 @@ pub const Marker = enum(u8) {
     header,
     /// Blank separator between entries.
     blank,
+    /// Unchanged context line inside a changed leaf's hunk - the LCS
+    /// anchors between `-` / `+` runs. Uses a blank ` ` gutter like git,
+    /// so it reads as structural filler rather than a decl-level state.
+    context,
 
     pub fn gutter(self: Marker) []const u8 {
         return switch (self) {
@@ -60,7 +67,7 @@ pub const Marker = enum(u8) {
             .added => "+",
             .removed => "-",
             .changed => "~",
-            .header, .blank => " ",
+            .header, .blank, .context => " ",
         };
     }
 };
@@ -244,7 +251,6 @@ fn appendEntries(
                     file_diff.language,
                     indent + 1,
                     .added,
-                    &.{},
                 );
             },
             .removed => |r| {
@@ -266,7 +272,6 @@ fn appendEntries(
                     file_diff.language,
                     indent + 1,
                     .removed,
-                    &.{},
                 );
             },
             .changed => |c| {
@@ -284,28 +289,8 @@ fn appendEntries(
                 switch (c.body) {
                     .container => |children| try appendEntries(arena, out, stats, state, file_diff, children, indent + 1),
                     .leaf => |script| {
-                        const left_novels = try collectAtomNovels(arena, script, .left);
-                        const right_novels = try collectAtomNovels(arena, script, .right);
-                        try appendSourceLines(
-                            arena,
-                            out,
-                            file_diff.left_source,
-                            c.old.list,
-                            file_diff.language,
-                            indent + 1,
-                            .removed,
-                            left_novels,
-                        );
-                        try appendSourceLines(
-                            arena,
-                            out,
-                            file_diff.right_source,
-                            c.new.list,
-                            file_diff.language,
-                            indent + 1,
-                            .added,
-                            right_novels,
-                        );
+                        const hunk_lines = try buildLeafHunk(arena, file_diff, script, c.old, c.new, indent + 1);
+                        try out.appendSlice(arena, hunk_lines);
                     },
                 }
             },
@@ -357,7 +342,6 @@ fn appendEntriesSplit(
                     file_diff.language,
                     indent + 1,
                     .added,
-                    &.{},
                 );
                 for (src_lines) |line_right| {
                     try out.append(arena, .{ .left = blankLine(indent + 1), .right = line_right });
@@ -383,7 +367,6 @@ fn appendEntriesSplit(
                     file_diff.language,
                     indent + 1,
                     .removed,
-                    &.{},
                 );
                 for (src_lines) |line_left| {
                     try out.append(arena, .{ .left = line_left, .right = blankLine(indent + 1) });
@@ -413,38 +396,8 @@ fn appendEntriesSplit(
                         indent + 1,
                     ),
                     .leaf => |script| {
-                        const left_novels = try collectAtomNovels(arena, script, .left);
-                        const right_novels = try collectAtomNovels(arena, script, .right);
-                        const left_lines = try sourceLinesSlice(
-                            arena,
-                            file_diff.left_source,
-                            c.old.list,
-                            file_diff.language,
-                            indent + 1,
-                            .removed,
-                            left_novels,
-                        );
-                        const right_lines = try sourceLinesSlice(
-                            arena,
-                            file_diff.right_source,
-                            c.new.list,
-                            file_diff.language,
-                            indent + 1,
-                            .added,
-                            right_novels,
-                        );
-                        const n = @max(left_lines.len, right_lines.len);
-                        for (0..n) |i| {
-                            const left_line = if (i < left_lines.len)
-                                left_lines[i]
-                            else
-                                blankLine(indent + 1);
-                            const right_line = if (i < right_lines.len)
-                                right_lines[i]
-                            else
-                                blankLine(indent + 1);
-                            try out.append(arena, .{ .left = left_line, .right = right_line });
-                        }
+                        const hunk_lines = try buildLeafHunk(arena, file_diff, script, c.old, c.new, indent + 1);
+                        try appendLeafHunkPairs(arena, out, hunk_lines, indent + 1);
                     },
                 }
             },
@@ -459,6 +412,130 @@ fn blankLine(indent: u8) StyledLine {
         .kind = .blank,
         .text = "",
     };
+}
+
+/// Render the body of a changed leaf as a git-style hunk. Runs a
+/// linewise LCS (`hunk.zig`) over the two leaf byte ranges and emits one
+/// `StyledLine` per `HunkLine`:
+///
+///   `.common` → `marker = .context`, no novel spans (the line is
+///               identical on both sides by definition).
+///   `.left`   → `marker = .removed` with left-side novel and highlight
+///               spans mapped in.
+///   `.right`  → `marker = .added` with right-side novel and highlight
+///               spans mapped in.
+///
+/// Returned lines are arena-owned and caller-owned; they go straight into
+/// the unified output or get re-paired for split mode (see
+/// `appendLeafHunkPairs`).
+fn buildLeafHunk(
+    arena: std.mem.Allocator,
+    file_diff: *const rv.FileDiff,
+    script: rv.EditScript,
+    old_decl: rv.Decl,
+    new_decl: rv.Decl,
+    indent: u8,
+) ![]const StyledLine {
+    const left_start = old_decl.list.byte_range.start;
+    const left_end = old_decl.list.byte_range.end;
+    const right_start = new_decl.list.byte_range.start;
+    const right_end = new_decl.list.byte_range.end;
+
+    const left_slice = file_diff.left_source[left_start..left_end];
+    const right_slice = file_diff.right_source[right_start..right_end];
+
+    const left_novels = try collectAtomNovels(arena, script, .left);
+    const right_novels = try collectAtomNovels(arena, script, .right);
+    const left_highlights = try collectHighlights(arena, old_decl.list, file_diff.language);
+    const right_highlights = try collectHighlights(arena, new_decl.list, file_diff.language);
+
+    const hunks = try hunk_mod.hunk(arena, left_slice, right_slice);
+
+    var out: std.ArrayList(StyledLine) = .empty;
+    for (hunks) |h| {
+        const marker: Marker = switch (h.side) {
+            .common => .context,
+            .left => .removed,
+            .right => .added,
+        };
+        // Common lines are taken from the left slice by convention; their
+        // highlights come from the left-side SST for the same reason.
+        // Because the line bytes are identical, choosing left vs right
+        // yields the same colouring in practice.
+        const abs_start: u32 = switch (h.side) {
+            .common, .left => left_start + h.offset,
+            .right => right_start + h.offset,
+        };
+        const line_highlights_src: Highlights = switch (h.side) {
+            .common, .left => left_highlights,
+            .right => right_highlights,
+        };
+        const line_novels: []const ByteSpan = switch (h.side) {
+            .left => try mapNovelsToLine(arena, h.text, abs_start, left_novels),
+            .right => try mapNovelsToLine(arena, h.text, abs_start, right_novels),
+            .common => &.{},
+        };
+        const line_highlights = try mapHighlightsToLine(
+            arena,
+            h.text,
+            abs_start,
+            line_highlights_src,
+        );
+        const expanded = try expandTabs(arena, h.text);
+
+        try out.append(arena, .{
+            .indent = indent,
+            .marker = marker,
+            .kind = .source,
+            .text = expanded,
+            .novel_spans = line_novels,
+            .highlights = line_highlights,
+        });
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+/// Convert the unified hunk-line sequence produced by `buildLeafHunk`
+/// into split-view `LinePair`s. `.context` lines mirror onto both panes;
+/// consecutive `-` / `+` runs are batched and paired 1:1 with blank
+/// filler on whichever side runs out first (so a common line always
+/// re-anchors both panes to the same row).
+fn appendLeafHunkPairs(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(LinePair),
+    lines: []const StyledLine,
+    indent: u8,
+) !void {
+    var pending_left: std.ArrayList(StyledLine) = .empty;
+    var pending_right: std.ArrayList(StyledLine) = .empty;
+
+    for (lines) |sl| switch (sl.marker) {
+        .removed => try pending_left.append(arena, sl),
+        .added => try pending_right.append(arena, sl),
+        .context => {
+            try flushPendingPairs(arena, out, &pending_left, &pending_right, indent);
+            try out.append(arena, .{ .left = sl, .right = sl });
+        },
+        else => unreachable,
+    };
+    try flushPendingPairs(arena, out, &pending_left, &pending_right, indent);
+}
+
+fn flushPendingPairs(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(LinePair),
+    left: *std.ArrayList(StyledLine),
+    right: *std.ArrayList(StyledLine),
+    indent: u8,
+) !void {
+    const n = @max(left.items.len, right.items.len);
+    for (0..n) |i| {
+        const l = if (i < left.items.len) left.items[i] else blankLine(indent);
+        const r = if (i < right.items.len) right.items[i] else blankLine(indent);
+        try out.append(arena, .{ .left = l, .right = r });
+    }
+    left.clearRetainingCapacity();
+    right.clearRetainingCapacity();
 }
 
 fn declHeaderText(
@@ -479,10 +556,7 @@ fn declHeaderText(
 
 /// Split the given source slice by newlines and emit one StyledLine per line,
 /// expanding tabs to 4 spaces. Empty trailing line (from a trailing '\n') is
-/// omitted so we don't render a phantom row after each span. `novels` is a
-/// (possibly empty) slice of absolute byte ranges that belong to this side;
-/// each range is clipped per-emitted-line and translated into
-/// display-coordinate `ByteSpan`s on `StyledLine.novel_spans`.
+/// omitted so we don't render a phantom row after each span.
 ///
 /// `decl_list` is the SST list for the decl being dumped; its atoms are
 /// walked and classified by `theme.classOf` to populate
@@ -496,9 +570,8 @@ fn appendSourceLines(
     language: rv.LanguageId,
     indent: u8,
     marker: Marker,
-    novels: Novels,
 ) !void {
-    const lines = try sourceLinesSlice(arena, source, decl_list, language, indent, marker, novels);
+    const lines = try sourceLinesSlice(arena, source, decl_list, language, indent, marker);
     try out.appendSlice(arena, lines);
 }
 
@@ -509,7 +582,6 @@ fn sourceLinesSlice(
     language: rv.LanguageId,
     indent: u8,
     marker: Marker,
-    novels: Novels,
 ) ![]const StyledLine {
     var buf: std.ArrayList(StyledLine) = .empty;
     const start: u32 = decl_list.byte_range.start;
@@ -535,7 +607,6 @@ fn sourceLinesSlice(
         first = false;
 
         const expanded = try expandTabs(arena, raw_line);
-        const line_novels = try mapNovelsToLine(arena, raw_line, line_abs_start, novels);
         const line_highlights = try mapHighlightsToLine(arena, raw_line, line_abs_start, highlights);
 
         try buf.append(arena, .{
@@ -543,7 +614,6 @@ fn sourceLinesSlice(
             .marker = marker,
             .kind = .source,
             .text = expanded,
-            .novel_spans = line_novels,
             .highlights = line_highlights,
         });
 
@@ -1167,6 +1237,56 @@ test "build: body_change fixture (1 → 42) — novel_spans cover exactly the li
 
     try testing.expectEqualStrings("1", removed_highlight);
     try testing.expectEqualStrings("42", added_highlight);
+}
+
+test "build: body_change fixture renders hunk with context lines shown once (Option B)" {
+    // Acceptance case for the linewise-LCS task: the surrounding lines
+    // (function signature and closing brace) show once as `.context`, only
+    // the differing middle line gets a `-` / `+` pair.
+    const before =
+        \\pub fn greet() u32 {
+        \\    return 1;
+        \\}
+    ;
+    const after =
+        \\pub fn greet() u32 {
+        \\    return 42;
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const lines = result.view.unified;
+    // Expected: changed header, context, removed, added, context.
+    try testing.expectEqual(@as(usize, 5), lines.len);
+
+    try testing.expectEqual(Marker.changed, lines[0].marker);
+    try testing.expectEqual(LineKind.decl_header, lines[0].kind);
+
+    try testing.expectEqual(Marker.context, lines[1].marker);
+    try testing.expectEqual(LineKind.source, lines[1].kind);
+    try testing.expect(std.mem.indexOf(u8, lines[1].text, "pub fn greet() u32 {") != null);
+
+    try testing.expectEqual(Marker.removed, lines[2].marker);
+    try testing.expect(std.mem.indexOf(u8, lines[2].text, "return 1;") != null);
+
+    try testing.expectEqual(Marker.added, lines[3].marker);
+    try testing.expect(std.mem.indexOf(u8, lines[3].text, "return 42;") != null);
+
+    try testing.expectEqual(Marker.context, lines[4].marker);
+    try testing.expect(std.mem.indexOf(u8, lines[4].text, "}") != null);
+
+    // Context lines carry no novel spans by construction.
+    try testing.expectEqual(@as(usize, 0), lines[1].novel_spans.len);
+    try testing.expectEqual(@as(usize, 0), lines[4].novel_spans.len);
+}
+
+test "build: context marker uses a blank gutter (git-style)" {
+    try testing.expectEqualStrings(" ", Marker.context.gutter());
 }
 
 test "build: novel_spans respect tab expansion (display offsets, not raw)" {

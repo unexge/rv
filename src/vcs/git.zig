@@ -64,7 +64,7 @@ pub const GitRepo = struct {
             else => return error.GitFailed,
         }
 
-        const trimmed = std.mem.trimRight(u8, result.stdout, "\n");
+        const trimmed = std.mem.trimEnd(u8, result.stdout, "\n");
         const root = try arena.allocator().dupe(u8, trimmed);
 
         return .{

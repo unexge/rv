@@ -6,13 +6,11 @@
 //!   `std.mem.indexOf`; no regex in v1) and returns a flat, row-sorted
 //!   slice of `Match`es. Matches never cross a line boundary because the
 //!   view is already line-based.
-//! - `matchesOnLine` is the per-line helper used by the render path: it
-//!   takes the line's (post-tab-expansion) display text and returns the
-//!   byte spans covered by the query, in display coordinates. Callers
-//!   layer these as an underline overlay on top of syntax / novel styles.
-//! - `nextMatchIndex` / `prevMatchIndex` implement `n` / `N` navigation
-//!   with wrap-around: they skip past any match whose row equals `cursor_y`
-//!   so repeated presses always move off the current row.
+//! - `matchesOnLine` is the per-line helper for the render path: it takes
+//!   the line's (post-tab-expansion) display text and returns the byte
+//!   spans covered by the query, in display coordinates.
+//! - `nextMatchIndex` / `prevMatchIndex` / `firstMatchAtOrAfter` implement
+//!   navigation over a materialised match list with wrap-around.
 //!
 //! Coordinate system: `Match.row` is the absolute view row (same units as
 //! `AppState.cursor_y`); `start` / `end` are byte offsets into the line's
@@ -20,10 +18,11 @@
 //! Callers that highlight matches at render time can treat the span as a
 //! direct slice into `StyledLine.text`.
 //!
-//! Collapse interaction is handled upstream: `app.zig` snapshots and
-//! clears `AppState.collapsed` on `/`, rebuilds the view, and restores
-//! the snapshot on Esc so matches inside collapsed decls are both visible
-//! and navigable during the search session.
+//! Status: these primitives are not yet consumed by `app.zig` - the `/`
+//! prompt, render-time overlay, and collapse snapshot/restore on
+//! `/`/Esc are not implemented. Wiring them up is the remaining work
+//! for the "Search within diff" subtask; this module ships the pure
+//! scanning primitives on their own.
 
 const std = @import("std");
 const line_mod = @import("line.zig");
@@ -62,9 +61,9 @@ pub fn findMatches(
     return try out.toOwnedSlice(arena);
 }
 
-/// Per-line match spans in display coordinates. Used on the render path so
-/// the search overlay doesn't need to carry a materialised global match
-/// list all the way down into the cell painter.
+/// Per-line match spans in display coordinates. Intended for the render
+/// path so a future overlay doesn't need to carry a materialised global
+/// match list all the way down into the cell painter.
 pub fn matchesOnLine(
     arena: std.mem.Allocator,
     text: []const u8,

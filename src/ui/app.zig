@@ -715,14 +715,12 @@ fn novelStyleFor(base: vaxis.Style) vaxis.Style {
 /// Decl headers are bold; source lines are regular weight with a tinted fg.
 fn styleFor(sl: StyledLine) vaxis.Style {
     const bold = sl.kind == .decl_header;
-    const dim = sl.marker == .unchanged or sl.marker == .context;
     return switch (sl.marker) {
         .added => .{ .fg = .{ .index = 2 }, .bold = bold },
         .removed => .{ .fg = .{ .index = 1 }, .bold = bold },
         .changed => .{ .fg = .{ .index = 3 }, .bold = bold },
-        .unchanged => .{ .dim = dim, .bold = bold },
-        .context => .{ .dim = dim },
-        .header => .{ .bold = true },
+        .unchanged => .{ .dim = true, .bold = bold },
+        .context => .{ .dim = true },
         .blank => .{},
     };
 }

@@ -52,8 +52,6 @@ pub const Marker = enum(u8) {
     removed,
     /// Changed decl header (leaf or container).
     changed,
-    /// File/stats header line.
-    header,
     /// Blank separator between entries.
     blank,
     /// Unchanged context line inside a changed leaf's hunk - the LCS
@@ -67,7 +65,7 @@ pub const Marker = enum(u8) {
             .added => "+",
             .removed => "-",
             .changed => "~",
-            .header, .blank, .context => " ",
+            .blank, .context => " ",
         };
     }
 };
@@ -75,8 +73,6 @@ pub const Marker = enum(u8) {
 /// Classification of a line for styling. `decl_header` lines get bold + color;
 /// `source` lines get a softer fg to keep the header scannable.
 pub const LineKind = enum {
-    file_header,
-    stats,
     decl_header,
     source,
     blank,
@@ -1595,7 +1591,7 @@ test "build: decl_header lines carry a decl_id; source/blank lines do not" {
             try testing.expect(ln.decl_id != null);
             header_count += 1;
         },
-        .source, .blank, .file_header, .stats => try testing.expectEqual(
+        .source, .blank => try testing.expectEqual(
             @as(?DeclId, null),
             ln.decl_id,
         ),
@@ -1703,7 +1699,7 @@ test "highlights: decl headers and blanks carry no highlights" {
     defer result.deinit();
 
     for (result.view.unified) |ln| switch (ln.kind) {
-        .decl_header, .blank, .file_header, .stats => try testing.expectEqual(@as(usize, 0), ln.highlights.len),
+        .decl_header, .blank => try testing.expectEqual(@as(usize, 0), ln.highlights.len),
         .source => {},
     };
 }

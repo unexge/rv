@@ -1,12 +1,20 @@
-//! FileDiff → []StyledLine. Pure, tty-free, unit-testable.
+//! FileDiff → view lines. Pure, tty-free, unit-testable.
 //!
-//! Produces the "structural unified" view described in the UI plan:
+//! Two rendering modes share this builder:
 //!
-//!   = name                (unchanged: dim, one line)
-//!   + name  (ts_kind)     (added: green header + verbatim right-source as + lines)
-//!   - name  (ts_kind)     (removed: red header + verbatim left-source as - lines)
-//!   ~ name  (ts_kind)     (changed leaf: yellow header + left-source as -, then right-source as +)
-//!   ~ name  (ts_kind)     (changed container: yellow header, then recurse with indent+1)
+//!   `.unified` produces a flat `[]StyledLine`:
+//!     = name                (unchanged: dim, one line)
+//!     + name  (ts_kind)     (added: green header + verbatim right-source as + lines)
+//!     - name  (ts_kind)     (removed: red header + verbatim left-source as - lines)
+//!     ~ name  (ts_kind)     (changed leaf: yellow header + left-source as -, then right-source as +)
+//!     ~ name  (ts_kind)     (changed container: yellow header, then recurse with indent+1)
+//!
+//!   `.split` produces `[]LinePair` (left_line, right_line per row):
+//!     unchanged / changed header / changed-container header → identical on both sides.
+//!     added → left blank, right has header + right-source `+` lines.
+//!     removed → left has header + left-source `-` lines, right blank.
+//!     changed leaf body → `-` lines on the left paired 1:1 with `+` lines on the
+//!       right, padded with blanks on whichever side runs out first.
 //!
 //! Atom-level novel-range highlighting (Option C) is deferred; the returned
 //! `StyledLine.novel_spans` is always empty for now but kept in the shape so
@@ -67,6 +75,24 @@ pub const StyledLine = struct {
 
 pub const ByteSpan = struct { start: u32, end: u32 };
 
+/// A single row in split-view: one StyledLine per pane. Either side may be
+/// a blank filler (`marker == .blank`, `kind == .blank`, `text == ""`).
+pub const LinePair = struct {
+    left: StyledLine,
+    right: StyledLine,
+
+    /// The decl-header side of this pair, if any. Unchanged/changed headers
+    /// are mirrored on both sides; added/removed headers live on whichever
+    /// side isn't the blank filler.
+    pub fn headerSide(self: LinePair) ?StyledLine {
+        if (self.right.kind == .decl_header) return self.right;
+        if (self.left.kind == .decl_header) return self.left;
+        return null;
+    }
+};
+
+pub const Mode = enum { unified, split };
+
 pub const Stats = struct {
     added: usize = 0,
     removed: usize = 0,
@@ -74,30 +100,56 @@ pub const Stats = struct {
     unchanged: usize = 0,
 };
 
+pub const View = union(Mode) {
+    unified: []const StyledLine,
+    split: []const LinePair,
+};
+
 pub const BuildResult = struct {
-    lines: []const StyledLine,
+    view: View,
     stats: Stats,
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *BuildResult) void {
         self.arena.deinit();
     }
+
+    /// Convenience: number of visible rows for the current view.
+    pub fn rowCount(self: BuildResult) usize {
+        return switch (self.view) {
+            .unified => |ls| ls.len,
+            .split => |ps| ps.len,
+        };
+    }
 };
 
-/// Walks the FileDiff and emits lines for the structural-unified view.
+/// Walks the FileDiff and emits view lines for the requested mode.
 /// All slices in `BuildResult` are arena-owned; `deinit` frees them.
-pub fn build(gpa: std.mem.Allocator, file_diff: *const rv.FileDiff) !BuildResult {
+pub fn build(
+    gpa: std.mem.Allocator,
+    file_diff: *const rv.FileDiff,
+    mode: Mode,
+) !BuildResult {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var out: std.ArrayList(StyledLine) = .empty;
     var stats: Stats = .{};
-
-    try appendEntries(arena, &out, &stats, file_diff, file_diff.entries, 0);
+    const view: View = switch (mode) {
+        .unified => blk: {
+            var out: std.ArrayList(StyledLine) = .empty;
+            try appendEntries(arena, &out, &stats, file_diff, file_diff.entries, 0);
+            break :blk .{ .unified = try out.toOwnedSlice(arena) };
+        },
+        .split => blk: {
+            var out: std.ArrayList(LinePair) = .empty;
+            try appendEntriesSplit(arena, &out, &stats, file_diff, file_diff.entries, 0);
+            break :blk .{ .split = try out.toOwnedSlice(arena) };
+        },
+    };
 
     return .{
-        .lines = try out.toOwnedSlice(arena),
+        .view = view,
         .stats = stats,
         .arena = arena_state,
     };
@@ -194,6 +246,133 @@ fn appendEntries(
     }
 }
 
+// ── split-mode traversal ───────────────────────────────────────────────────
+
+fn appendEntriesSplit(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(LinePair),
+    stats: *Stats,
+    file_diff: *const rv.FileDiff,
+    entries: []const rv.DeclDiff,
+    indent: u8,
+) !void {
+    for (entries) |entry| {
+        switch (entry) {
+            .unchanged => |u| {
+                stats.unchanged += 1;
+                const header: StyledLine = .{
+                    .indent = indent,
+                    .marker = .unchanged,
+                    .kind = .decl_header,
+                    .text = try declHeaderText(arena, u.decl, u.moved),
+                };
+                try out.append(arena, .{ .left = header, .right = header });
+            },
+            .added => |a| {
+                stats.added += 1;
+                const header: StyledLine = .{
+                    .indent = indent,
+                    .marker = .added,
+                    .kind = .decl_header,
+                    .text = try declHeaderText(arena, a.decl, null),
+                };
+                try out.append(arena, .{ .left = blankLine(indent), .right = header });
+                const src_lines = try sourceLinesSlice(
+                    arena,
+                    file_diff.right_source,
+                    a.decl.list.byte_range.start,
+                    a.decl.list.byte_range.end,
+                    indent + 1,
+                    .added,
+                );
+                for (src_lines) |line_right| {
+                    try out.append(arena, .{ .left = blankLine(indent + 1), .right = line_right });
+                }
+            },
+            .removed => |r| {
+                stats.removed += 1;
+                const header: StyledLine = .{
+                    .indent = indent,
+                    .marker = .removed,
+                    .kind = .decl_header,
+                    .text = try declHeaderText(arena, r.decl, null),
+                };
+                try out.append(arena, .{ .left = header, .right = blankLine(indent) });
+                const src_lines = try sourceLinesSlice(
+                    arena,
+                    file_diff.left_source,
+                    r.decl.list.byte_range.start,
+                    r.decl.list.byte_range.end,
+                    indent + 1,
+                    .removed,
+                );
+                for (src_lines) |line_left| {
+                    try out.append(arena, .{ .left = line_left, .right = blankLine(indent + 1) });
+                }
+            },
+            .changed => |c| {
+                stats.changed += 1;
+                const header: StyledLine = .{
+                    .indent = indent,
+                    .marker = .changed,
+                    .kind = .decl_header,
+                    .text = try declHeaderText(arena, c.new, c.moved),
+                };
+                try out.append(arena, .{ .left = header, .right = header });
+                switch (c.body) {
+                    .container => |children| try appendEntriesSplit(
+                        arena,
+                        out,
+                        stats,
+                        file_diff,
+                        children,
+                        indent + 1,
+                    ),
+                    .leaf => {
+                        const left_lines = try sourceLinesSlice(
+                            arena,
+                            file_diff.left_source,
+                            c.old.list.byte_range.start,
+                            c.old.list.byte_range.end,
+                            indent + 1,
+                            .removed,
+                        );
+                        const right_lines = try sourceLinesSlice(
+                            arena,
+                            file_diff.right_source,
+                            c.new.list.byte_range.start,
+                            c.new.list.byte_range.end,
+                            indent + 1,
+                            .added,
+                        );
+                        const n = @max(left_lines.len, right_lines.len);
+                        for (0..n) |i| {
+                            const left_line = if (i < left_lines.len)
+                                left_lines[i]
+                            else
+                                blankLine(indent + 1);
+                            const right_line = if (i < right_lines.len)
+                                right_lines[i]
+                            else
+                                blankLine(indent + 1);
+                            try out.append(arena, .{ .left = left_line, .right = right_line });
+                        }
+                    },
+                }
+            },
+        }
+    }
+}
+
+fn blankLine(indent: u8) StyledLine {
+    return .{
+        .indent = indent,
+        .marker = .blank,
+        .kind = .blank,
+        .text = "",
+    };
+}
+
 fn declHeaderText(
     arena: std.mem.Allocator,
     decl: rv.Decl,
@@ -220,6 +399,19 @@ fn appendSourceLines(
     indent: u8,
     marker: Marker,
 ) !void {
+    const lines = try sourceLinesSlice(arena, source, start, end, indent, marker);
+    try out.appendSlice(arena, lines);
+}
+
+fn sourceLinesSlice(
+    arena: std.mem.Allocator,
+    source: []const u8,
+    start: u32,
+    end: u32,
+    indent: u8,
+    marker: Marker,
+) ![]const StyledLine {
+    var buf: std.ArrayList(StyledLine) = .empty;
     const slice = source[start..end];
     var it = std.mem.splitScalar(u8, slice, '\n');
     var first = true;
@@ -229,13 +421,14 @@ fn appendSourceLines(
         first = false;
 
         const expanded = try expandTabs(arena, line_raw);
-        try out.append(arena, .{
+        try buf.append(arena, .{
             .indent = indent,
             .marker = marker,
             .kind = .source,
             .text = expanded,
         });
     }
+    return try buf.toOwnedSlice(arena);
 }
 
 const tab_width: usize = 4;
@@ -271,7 +464,7 @@ test "build: identical Zig sources → one unchanged header per decl, no source 
     var fd = try rv.diffSources(testing.allocator, .zig, src, src);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd);
+    var result = try build(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 2), result.stats.unchanged);
@@ -279,9 +472,10 @@ test "build: identical Zig sources → one unchanged header per decl, no source 
     try testing.expectEqual(@as(usize, 0), result.stats.removed);
     try testing.expectEqual(@as(usize, 0), result.stats.changed);
 
-    try testing.expectEqual(@as(usize, 2), result.lines.len);
-    try testing.expectEqual(Marker.unchanged, result.lines[0].marker);
-    try testing.expectEqual(LineKind.decl_header, result.lines[0].kind);
+    const lines = result.view.unified;
+    try testing.expectEqual(@as(usize, 2), lines.len);
+    try testing.expectEqual(Marker.unchanged, lines[0].marker);
+    try testing.expectEqual(LineKind.decl_header, lines[0].kind);
 }
 
 test "build: added Zig fn → header + all source lines marked added" {
@@ -291,14 +485,16 @@ test "build: added Zig fn → header + all source lines marked added" {
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd);
+    var result = try build(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 1), result.stats.added);
 
+    const lines = result.view.unified;
+
     // Find the added header.
     var header_idx: ?usize = null;
-    for (result.lines, 0..) |ln, i| {
+    for (lines, 0..) |ln, i| {
         if (ln.marker == .added and ln.kind == .decl_header) {
             header_idx = i;
             break;
@@ -308,9 +504,9 @@ test "build: added Zig fn → header + all source lines marked added" {
     const hi = header_idx.?;
 
     // Every line after the header that belongs to the added decl is marker=.added, kind=.source.
-    try testing.expect(hi + 1 < result.lines.len);
-    try testing.expectEqual(Marker.added, result.lines[hi + 1].marker);
-    try testing.expectEqual(LineKind.source, result.lines[hi + 1].kind);
+    try testing.expect(hi + 1 < lines.len);
+    try testing.expectEqual(Marker.added, lines[hi + 1].marker);
+    try testing.expectEqual(LineKind.source, lines[hi + 1].kind);
 }
 
 test "build: removed Zig fn → header + all source lines marked removed, from LEFT source" {
@@ -320,13 +516,13 @@ test "build: removed Zig fn → header + all source lines marked removed, from L
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd);
+    var result = try build(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 1), result.stats.removed);
 
     var saw_removed_source = false;
-    for (result.lines) |ln| {
+    for (result.view.unified) |ln| {
         if (ln.marker == .removed and ln.kind == .source) {
             // The removed line must be a real source line, not an empty string.
             try testing.expect(ln.text.len > 0);
@@ -343,18 +539,20 @@ test "build: changed leaf → - lines (left) then + lines (right)" {
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd);
+    var result = try build(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 1), result.stats.changed);
 
+    const lines = result.view.unified;
+
     // Expected order: changed header, then removed source lines, then added source lines.
-    try testing.expect(result.lines.len >= 3);
-    try testing.expectEqual(Marker.changed, result.lines[0].marker);
+    try testing.expect(lines.len >= 3);
+    try testing.expectEqual(Marker.changed, lines[0].marker);
 
     var seen_removed_before_added = false;
     var last_was_removed = false;
-    for (result.lines[1..]) |ln| {
+    for (lines[1..]) |ln| {
         if (ln.kind != .source) continue;
         if (ln.marker == .removed) last_was_removed = true;
         if (ln.marker == .added and last_was_removed) {
@@ -380,20 +578,22 @@ test "build: changed container → recurse with indent, no - / + dumps at contai
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd);
+    var result = try build(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 1), result.stats.changed);
     try testing.expectEqual(@as(usize, 1), result.stats.added);
     try testing.expectEqual(@as(usize, 1), result.stats.unchanged);
 
+    const lines = result.view.unified;
+
     // First line: container "Thing" header at indent 0.
-    try testing.expectEqual(Marker.changed, result.lines[0].marker);
-    try testing.expectEqual(@as(u8, 0), result.lines[0].indent);
+    try testing.expectEqual(Marker.changed, lines[0].marker);
+    try testing.expectEqual(@as(u8, 0), lines[0].indent);
 
     // Children are indented >= 1.
     var saw_indented_child = false;
-    for (result.lines[1..]) |ln| {
+    for (lines[1..]) |ln| {
         if (ln.kind == .decl_header and ln.indent >= 1) saw_indented_child = true;
     }
     try testing.expect(saw_indented_child);
@@ -404,10 +604,10 @@ test "build: unchanged decl does not dump its source lines" {
     var fd = try rv.diffSources(testing.allocator, .zig, src, src);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd);
+    var result = try build(testing.allocator, &fd, .unified);
     defer result.deinit();
 
-    for (result.lines) |ln| try testing.expect(ln.kind != .source);
+    for (result.view.unified) |ln| try testing.expect(ln.kind != .source);
 }
 
 test "build: decl header includes moved info when present" {
@@ -416,11 +616,11 @@ test "build: decl header includes moved info when present" {
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd);
+    var result = try build(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     var found_moved_in_text = false;
-    for (result.lines) |ln| {
+    for (result.view.unified) |ln| {
         if (std.mem.indexOf(u8, ln.text, "moved ") != null) found_moved_in_text = true;
     }
     try testing.expect(found_moved_in_text);
@@ -438,4 +638,155 @@ test "expandTabs: no tabs → identical content, separate allocation" {
     defer arena_state.deinit();
     const out = try expandTabs(arena_state.allocator(), "hello");
     try testing.expectEqualStrings("hello", out);
+}
+
+// ── split-mode tests ─────────────────────────────────────────────────────
+
+test "build split: identical sources → header pairs mirror both sides" {
+    const src = "pub fn a() void {}\npub fn b() void {}\n";
+    var fd = try rv.diffSources(testing.allocator, .zig, src, src);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .split);
+    defer result.deinit();
+
+    const pairs = result.view.split;
+    try testing.expectEqual(@as(usize, 2), pairs.len);
+    for (pairs) |p| {
+        try testing.expectEqual(Marker.unchanged, p.left.marker);
+        try testing.expectEqual(Marker.unchanged, p.right.marker);
+        try testing.expectEqualStrings(p.left.text, p.right.text);
+    }
+}
+
+test "build split: added decl → left pane blank, right pane has header + source" {
+    const before = "pub fn a() void {}\n";
+    const after = "pub fn a() void {}\npub fn b() void {\n    return;\n}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .split);
+    defer result.deinit();
+
+    // Find the added header pair.
+    var hi: ?usize = null;
+    for (result.view.split, 0..) |p, i| {
+        if (p.right.marker == .added and p.right.kind == .decl_header) {
+            hi = i;
+            break;
+        }
+    }
+    try testing.expect(hi != null);
+    const idx = hi.?;
+
+    // Header pair: left blank, right is the added header.
+    try testing.expectEqual(Marker.blank, result.view.split[idx].left.marker);
+    try testing.expectEqual(LineKind.blank, result.view.split[idx].left.kind);
+    try testing.expectEqualStrings("", result.view.split[idx].left.text);
+
+    // Following source-line pair: left still blank, right has code.
+    try testing.expect(idx + 1 < result.view.split.len);
+    const next = result.view.split[idx + 1];
+    try testing.expectEqual(Marker.blank, next.left.marker);
+    try testing.expectEqual(Marker.added, next.right.marker);
+    try testing.expectEqual(LineKind.source, next.right.kind);
+    try testing.expect(next.right.text.len > 0);
+}
+
+test "build split: removed decl → right pane blank, left pane has header + source" {
+    const before = "pub fn a() void {}\npub fn gone() void { return; }\n";
+    const after = "pub fn a() void {}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .split);
+    defer result.deinit();
+
+    var saw_removed_source_left = false;
+    for (result.view.split) |p| {
+        if (p.left.marker == .removed and p.left.kind == .source) {
+            try testing.expectEqual(Marker.blank, p.right.marker);
+            try testing.expect(p.left.text.len > 0);
+            saw_removed_source_left = true;
+        }
+    }
+    try testing.expect(saw_removed_source_left);
+}
+
+test "build split: changed leaf → left `-` paired with right `+`, padded to equal counts" {
+    // Old body: 1 line; new body: 3 lines, to force padding on the left.
+    const before = "pub fn greet() u32 { return 1; }\n";
+    const after = "pub fn greet() u32 {\n    const x: u32 = 42;\n    return x;\n}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .split);
+    defer result.deinit();
+
+    const pairs = result.view.split;
+    // First pair: the changed header, identical on both sides.
+    try testing.expectEqual(Marker.changed, pairs[0].left.marker);
+    try testing.expectEqual(Marker.changed, pairs[0].right.marker);
+    try testing.expectEqualStrings(pairs[0].left.text, pairs[0].right.text);
+
+    // Body pairs: every row has either a real `-` on the left or a blank, and
+    // either a real `+` on the right or a blank; never both sides blank.
+    var total_body: usize = 0;
+    var left_real: usize = 0;
+    var right_real: usize = 0;
+    for (pairs[1..]) |p| {
+        total_body += 1;
+        const left_blank = p.left.marker == .blank;
+        const right_blank = p.right.marker == .blank;
+        try testing.expect(!(left_blank and right_blank));
+        if (!left_blank) {
+            try testing.expectEqual(Marker.removed, p.left.marker);
+            left_real += 1;
+        }
+        if (!right_blank) {
+            try testing.expectEqual(Marker.added, p.right.marker);
+            right_real += 1;
+        }
+    }
+    try testing.expect(right_real > left_real);
+    try testing.expectEqual(@max(left_real, right_real), total_body);
+}
+
+test "build split: changed container → header shared, children recurse with indent" {
+    const before =
+        \\pub const Thing = struct {
+        \\    pub fn one() void {}
+        \\};
+    ;
+    const after =
+        \\pub const Thing = struct {
+        \\    pub fn one() void {}
+        \\    pub fn two() void {}
+        \\};
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try build(testing.allocator, &fd, .split);
+    defer result.deinit();
+
+    const pairs = result.view.split;
+
+    // Container header pair: identical on both sides at indent 0.
+    try testing.expectEqual(Marker.changed, pairs[0].left.marker);
+    try testing.expectEqual(Marker.changed, pairs[0].right.marker);
+    try testing.expectEqual(@as(u8, 0), pairs[0].left.indent);
+    try testing.expectEqualStrings(pairs[0].left.text, pairs[0].right.text);
+
+    // Somewhere among the children there is an indented decl_header.
+    var saw_indented_child = false;
+    for (pairs[1..]) |p| {
+        if (p.headerSide()) |side| {
+            if (side.indent >= 1) saw_indented_child = true;
+        }
+    }
+    try testing.expect(saw_indented_child);
 }

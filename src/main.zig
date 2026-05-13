@@ -6,13 +6,14 @@ const rv = @import("rv");
 
 const ui = @import("ui/app.zig");
 
-// Ensure the ui module's inline tests are visible to `zig build test`.
+// Ensure the ui + vcs modules' inline tests are visible to `zig build test`.
 comptime {
     _ = @import("ui/hunk.zig");
     _ = @import("ui/line.zig");
     _ = @import("ui/search.zig");
     _ = @import("ui/state.zig");
     _ = @import("ui/theme.zig");
+    _ = @import("vcs/mod.zig");
 }
 
 pub fn main(init: std.process.Init) !void {

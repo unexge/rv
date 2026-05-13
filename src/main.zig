@@ -10,6 +10,7 @@ const ui = @import("ui/app.zig");
 comptime {
     _ = @import("ui/hunk.zig");
     _ = @import("ui/line.zig");
+    _ = @import("ui/search.zig");
     _ = @import("ui/state.zig");
     _ = @import("ui/theme.zig");
 }

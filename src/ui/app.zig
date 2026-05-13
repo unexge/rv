@@ -32,6 +32,8 @@ const rv = @import("rv");
 const line_mod = @import("line.zig");
 const theme = @import("theme.zig");
 
+const Allocator = std.mem.Allocator;
+
 const StyledLine = line_mod.StyledLine;
 const LinePair = line_mod.LinePair;
 const Marker = line_mod.Marker;
@@ -47,6 +49,23 @@ const Event = union(enum) {
     key_press: vaxis.Key,
     mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
+};
+
+/// Rectangle inside the root window where `drawDiffPane` paints. Offsets
+/// are window-relative; width/height span the full pane including the
+/// `header_rows`-tall header strip reserved at the top.
+pub const PaneSize = struct {
+    x_off: u16,
+    y_off: u16,
+    width: u16,
+    height: u16,
+};
+
+/// Optional header to render in the top rows of the pane. Null means the
+/// caller owns the header area (e.g. the session draws its own).
+pub const DiffHeader = struct {
+    title: []const u8,
+    stats: []const u8,
 };
 
 /// Run the diff UI to completion. Returns when the user quits.
@@ -118,58 +137,146 @@ pub fn run(
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) break;
                 if (key.matches('q', .{})) break;
-
-                if (key.matches('v', .{})) {
-                    const anchor = focusedDeclId(current.view, state.cursor_y);
-                    mode = if (mode == .unified) .split else .unified;
-                    try rebuild(gpa, &current, file_diff, mode, &state);
-                    relocateCursor(&state, current.view, anchor, viewport);
-                } else if (key.matches(vaxis.Key.space, .{}) or key.matches(vaxis.Key.enter, .{})) {
-                    if (focusedDeclId(current.view, state.cursor_y)) |id| {
-                        _ = try state.toggle(id);
-                        try rebuild(gpa, &current, file_diff, mode, &state);
-                        relocateCursor(&state, current.view, id, viewport);
-                    }
-                } else if (key.matches('[', .{})) {
-                    const anchor = focusedDeclId(current.view, state.cursor_y);
-                    try state.collapseAll(file_diff);
-                    try rebuild(gpa, &current, file_diff, mode, &state);
-                    relocateCursor(&state, current.view, anchor, viewport);
-                } else if (key.matches(']', .{})) {
-                    const anchor = focusedDeclId(current.view, state.cursor_y);
-                    state.expandAll();
-                    try rebuild(gpa, &current, file_diff, mode, &state);
-                    relocateCursor(&state, current.view, anchor, viewport);
-                } else if (key.matches('n', .{})) {
-                    jumpDecl(&state, current.decl_index, .forward, false, viewport, current.rowCount());
-                } else if (key.matches('p', .{})) {
-                    jumpDecl(&state, current.decl_index, .backward, false, viewport, current.rowCount());
-                } else if (key.matches('N', .{})) {
-                    jumpDecl(&state, current.decl_index, .forward, true, viewport, current.rowCount());
-                } else if (key.matches('P', .{})) {
-                    jumpDecl(&state, current.decl_index, .backward, true, viewport, current.rowCount());
-                } else if (key.matches('g', .{})) {
-                    jumpToEnd(&state, current.decl_index, .first, viewport, current.rowCount());
-                } else if (key.matches('G', .{})) {
-                    jumpToEnd(&state, current.decl_index, .last, viewport, current.rowCount());
-                } else {
-                    applyNavigationKey(&state, key, viewport, current.rowCount());
-                }
+                try handleDiffPaneKey(gpa, key, &current, file_diff, &state, &mode, viewport);
             },
-            .mouse => |m| applyMouse(&state, m, viewport, current.rowCount()),
+            .mouse => |m| handleDiffPaneMouse(&state, m, viewport, current.rowCount()),
             .winsize => |ws| try vx.resize(gpa, tty.writer(), ws),
         }
 
         const win = vx.window();
         win.clear();
+        const pane: PaneSize = .{
+            .x_off = 0,
+            .y_off = 0,
+            .width = win.width,
+            .height = win.height,
+        };
         switch (mode) {
-            .unified => drawUnified(win, current, &state, title, stats_text),
-            .split => drawSplit(win, current, &state, before_path, after_path, stats_text),
+            .unified => drawDiffPane(
+                win,
+                pane,
+                current,
+                &state,
+                mode,
+                true,
+                .{ .title = title, .stats = stats_text },
+            ),
+            .split => {
+                // Split mode keeps the legacy two-pane header (`before_path`
+                // on the left, `after_path` on the right) because a single
+                // `DiffHeader.title` can't represent that layout. The session
+                // UI draws its own header either way, so `drawDiffPane`
+                // doesn't need to know about this case.
+                drawSplitLegacyHeader(win, pane, before_path, after_path, stats_text);
+                drawDiffPane(win, pane, current, &state, mode, true, null);
+            },
         }
 
         try vx.render(tty.writer());
         try tty.writer().flush();
     }
+}
+
+// ── extracted pane API ────────────────────────────────────────────────────
+
+/// Paint the diff pane (optional header + body) into a sub-rectangle of `win`.
+///
+/// `size` gives the pane rectangle including the `header_rows`-tall header
+/// strip at the top. When `header` is non-null `drawDiffPane` paints
+/// `title` / `stats` into those rows; when null the caller owns them
+/// (e.g. the repo session paints a per-file label there). Body rendering
+/// starts at `size.y_off + header_rows` either way, so split-mode's
+/// separator lines up across header and body.
+///
+/// `focused` toggles the cursor marker: when false the `>` highlight is
+/// suppressed so a background pane reads as non-interactive while another
+/// pane (e.g. the sidebar) holds focus.
+pub fn drawDiffPane(
+    win: vaxis.Window,
+    size: PaneSize,
+    built: BuildResult,
+    state: *const AppState,
+    mode: Mode,
+    focused: bool,
+    header: ?DiffHeader,
+) void {
+    const pane = win.child(.{
+        .x_off = size.x_off,
+        .y_off = size.y_off,
+        .width = size.width,
+        .height = size.height,
+    });
+    if (header) |h| drawHeader(pane, h.title, h.stats);
+    switch (mode) {
+        .unified => drawUnifiedBody(pane, built, state, focused),
+        .split => drawSplitBody(pane, built, state, focused),
+    }
+}
+
+/// Apply one keypress to the diff-pane state. Same key set as `run`'s
+/// original switch minus the quit keys (`q`, ctrl-c), which stay in the
+/// caller so the session can decide whether quit exits the app or just
+/// closes the pane.
+///
+/// On fold / mode / collapse-all / expand-all keys this rebuilds `built`
+/// in place and re-anchors the cursor against the new view.
+pub fn handleDiffPaneKey(
+    gpa: Allocator,
+    key: vaxis.Key,
+    built: *BuildResult,
+    file_diff: *const rv.FileDiff,
+    state: *AppState,
+    mode: *Mode,
+    viewport: u16,
+) !void {
+    if (key.matches('v', .{})) {
+        const anchor = focusedDeclId(built.view, state.cursor_y);
+        mode.* = if (mode.* == .unified) .split else .unified;
+        try rebuild(gpa, built, file_diff, mode.*, state);
+        relocateCursor(state, built.view, anchor, viewport);
+    } else if (key.matches(vaxis.Key.space, .{}) or key.matches(vaxis.Key.enter, .{})) {
+        if (focusedDeclId(built.view, state.cursor_y)) |id| {
+            _ = try state.toggle(id);
+            try rebuild(gpa, built, file_diff, mode.*, state);
+            relocateCursor(state, built.view, id, viewport);
+        }
+    } else if (key.matches('[', .{})) {
+        const anchor = focusedDeclId(built.view, state.cursor_y);
+        try state.collapseAll(file_diff);
+        try rebuild(gpa, built, file_diff, mode.*, state);
+        relocateCursor(state, built.view, anchor, viewport);
+    } else if (key.matches(']', .{})) {
+        const anchor = focusedDeclId(built.view, state.cursor_y);
+        state.expandAll();
+        try rebuild(gpa, built, file_diff, mode.*, state);
+        relocateCursor(state, built.view, anchor, viewport);
+    } else if (key.matches('n', .{})) {
+        jumpDecl(state, built.decl_index, .forward, false, viewport, built.rowCount());
+    } else if (key.matches('p', .{})) {
+        jumpDecl(state, built.decl_index, .backward, false, viewport, built.rowCount());
+    } else if (key.matches('N', .{})) {
+        jumpDecl(state, built.decl_index, .forward, true, viewport, built.rowCount());
+    } else if (key.matches('P', .{})) {
+        jumpDecl(state, built.decl_index, .backward, true, viewport, built.rowCount());
+    } else if (key.matches('g', .{})) {
+        jumpToEnd(state, built.decl_index, .first, viewport, built.rowCount());
+    } else if (key.matches('G', .{})) {
+        jumpToEnd(state, built.decl_index, .last, viewport, built.rowCount());
+    } else {
+        applyNavigationKey(state, key, viewport, built.rowCount());
+    }
+}
+
+/// Pure mouse handler for the diff pane. The caller is responsible for
+/// only passing mouse events whose `row` / `col` fall inside the pane
+/// rectangle; offsets are interpreted relative to the pane's header strip.
+pub fn handleDiffPaneMouse(
+    state: *AppState,
+    mouse: vaxis.Mouse,
+    viewport: u16,
+    total: usize,
+) void {
+    applyMouse(state, mouse, viewport, total);
 }
 
 fn rebuild(
@@ -193,7 +300,15 @@ fn rebuild(
 const header_rows: u16 = 2; // path line + stats line
 
 fn viewportHeight(win: vaxis.Window) u16 {
-    return if (win.height > header_rows) win.height - header_rows else 0;
+    return bodyHeight(win.height);
+}
+
+/// Body height for a pane whose total height is `pane_height`. The top
+/// `header_rows` rows are reserved for the header strip (whether or not
+/// the caller actually draws into them), so any pane shorter than that
+/// has zero body rows.
+fn bodyHeight(pane_height: u16) u16 {
+    return if (pane_height > header_rows) pane_height - header_rows else 0;
 }
 
 // ── cursor-driven navigation ──────────────────────────────────────────────
@@ -471,18 +586,17 @@ fn centerOnRow(state: *AppState, target: usize, viewport: u16, total: usize) voi
 
 // ── draw: unified ──────────────────────────────────────────────────────────
 
-fn drawUnified(
-    win: vaxis.Window,
+fn drawUnifiedBody(
+    pane: vaxis.Window,
     built: BuildResult,
     state: *const AppState,
-    title: []const u8,
-    stats_text: []const u8,
+    focused: bool,
 ) void {
-    drawHeader(win, title, stats_text);
-
-    const body = win.child(.{
+    const body = pane.child(.{
+        .x_off = 0,
         .y_off = header_rows,
-        .height = viewportHeight(win),
+        .width = pane.width,
+        .height = bodyHeight(pane.height),
     });
 
     const lines = built.view.unified;
@@ -490,7 +604,7 @@ fn drawUnified(
     var row: u16 = 0;
     var i: usize = state.scroll_y;
     while (i < end) : (i += 1) {
-        drawLine(body, row, lines[i], i == state.cursor_y);
+        drawLine(body, row, lines[i], focused and i == state.cursor_y);
         row += 1;
     }
 }
@@ -507,60 +621,87 @@ fn drawHeader(win: vaxis.Window, title: []const u8, stats_text: []const u8) void
     }}, .{ .row_offset = 1, .wrap = .none });
 }
 
+/// Legacy two-pane header used by `run` in split mode: the two file paths
+/// sit above their respective panes on row 0, and the stats line spans the
+/// full pane width on row 1. Kept private; `drawDiffPane` doesn't emit this
+/// shape because `DiffHeader` only carries a single title.
+fn drawSplitLegacyHeader(
+    win: vaxis.Window,
+    size: PaneSize,
+    before_path: []const u8,
+    after_path: []const u8,
+    stats_text: []const u8,
+) void {
+    const pane = win.child(.{
+        .x_off = size.x_off,
+        .y_off = size.y_off,
+        .width = size.width,
+        .height = size.height,
+    });
+    const layout = splitLayout(pane.width) orelse return;
+
+    const left_header = pane.child(.{ .x_off = 0, .y_off = 0, .width = layout.left_w, .height = 1 });
+    const right_header = pane.child(.{ .x_off = layout.sep_col + separator_cols, .y_off = 0, .width = layout.right_w, .height = 1 });
+
+    _ = left_header.print(&.{.{ .text = before_path, .style = .{ .bold = true } }}, .{ .wrap = .none });
+    _ = right_header.print(&.{.{ .text = after_path, .style = .{ .bold = true } }}, .{ .wrap = .none });
+
+    _ = pane.print(
+        &.{.{ .text = stats_text, .style = .{ .dim = true } }},
+        .{ .row_offset = 1, .wrap = .none },
+    );
+}
+
 // ── draw: split ────────────────────────────────────────────────────────────
 
 /// Column reserved for the vertical separator between panes.
 const separator_cols: u16 = 1;
 
-fn drawSplit(
-    win: vaxis.Window,
-    built: BuildResult,
-    state: *const AppState,
-    before_path: []const u8,
-    after_path: []const u8,
-    stats_text: []const u8,
-) void {
-    // Pane widths: integer split of the remaining columns after the separator.
-    const total_w = win.width;
-    if (total_w < 2) return;
+/// Split-mode pane geometry shared by the header and body renderers so the
+/// vertical separator lines up across both. Returns null when the pane is
+/// too narrow to fit two panes plus the separator; callers should skip
+/// rendering in that case.
+const SplitLayout = struct { left_w: u16, right_w: u16, sep_col: u16 };
+fn splitLayout(total_w: u16) ?SplitLayout {
+    if (total_w < 2) return null;
     const usable = total_w - separator_cols;
     const left_w: u16 = usable / 2;
-    const right_w: u16 = usable - left_w;
-    const sep_col: u16 = left_w;
+    return .{ .left_w = left_w, .right_w = usable - left_w, .sep_col = left_w };
+}
 
-    const left_pane_header = win.child(.{ .x_off = 0, .y_off = 0, .width = left_w, .height = 1 });
-    const right_pane_header = win.child(.{ .x_off = sep_col + separator_cols, .y_off = 0, .width = right_w, .height = 1 });
+fn drawSplitBody(
+    pane: vaxis.Window,
+    built: BuildResult,
+    state: *const AppState,
+    focused: bool,
+) void {
+    const layout = splitLayout(pane.width) orelse return;
 
-    _ = left_pane_header.print(&.{.{ .text = before_path, .style = .{ .bold = true } }}, .{ .wrap = .none });
-    _ = right_pane_header.print(&.{.{ .text = after_path, .style = .{ .bold = true } }}, .{ .wrap = .none });
-
-    _ = win.print(
-        &.{.{ .text = stats_text, .style = .{ .dim = true } }},
-        .{ .row_offset = 1, .wrap = .none },
-    );
-
-    const body_h = viewportHeight(win);
-    const left_body = win.child(.{
+    const body_h = bodyHeight(pane.height);
+    const left_body = pane.child(.{
         .x_off = 0,
         .y_off = header_rows,
-        .width = left_w,
+        .width = layout.left_w,
         .height = body_h,
     });
-    const right_body = win.child(.{
-        .x_off = sep_col + separator_cols,
+    const right_body = pane.child(.{
+        .x_off = layout.sep_col + separator_cols,
         .y_off = header_rows,
-        .width = right_w,
+        .width = layout.right_w,
         .height = body_h,
     });
 
-    // Vertical separator down the full window height.
+    // Vertical separator down the full pane height. Drawn after the header
+    // so the middle column of the header row reads as part of the separator
+    // (matches the pre-refactor look where the separator overdraws the
+    // stats-line character).
     const sep: vaxis.Cell = .{
         .char = .{ .grapheme = "│", .width = 1 },
         .style = .{ .dim = true },
     };
     var r: u16 = 0;
-    while (r < win.height) : (r += 1) {
-        win.writeCell(sep_col, r, sep);
+    while (r < pane.height) : (r += 1) {
+        pane.writeCell(layout.sep_col, r, sep);
     }
 
     const pairs = built.view.split;
@@ -568,7 +709,7 @@ fn drawSplit(
     var row: u16 = 0;
     var i: usize = state.scroll_y;
     while (i < end) : (i += 1) {
-        const is_cursor = i == state.cursor_y;
+        const is_cursor = focused and i == state.cursor_y;
         // Cursor marker is only drawn on the left pane so the right pane's
         // gutter stays readable.
         drawLine(left_body, row, pairs[i].left, is_cursor);
@@ -1234,4 +1375,137 @@ test "jump-to-decl integration: jumping to a collapsed decl leaves it collapsed"
     const at = current.view.unified[state.cursor_y];
     try testing.expectEqual(LineKind.decl_header, at.kind);
     try testing.expect(std.mem.endsWith(u8, at.text, " [\u{2026}]"));
+}
+
+// ── drawDiffPane offset math ─────────────────────────────────────────────────
+
+test "bodyHeight reserves header_rows at the top of the pane" {
+    // Pane too short to hold the header gets zero body rows.
+    try testing.expectEqual(@as(u16, 0), bodyHeight(0));
+    try testing.expectEqual(@as(u16, 0), bodyHeight(1));
+    try testing.expectEqual(@as(u16, 0), bodyHeight(2));
+    // Otherwise body gets everything past the 2-row header strip.
+    try testing.expectEqual(@as(u16, 1), bodyHeight(3));
+    try testing.expectEqual(@as(u16, 18), bodyHeight(20));
+}
+
+test "drawDiffPane: body lines land at PaneSize offset plus header_rows" {
+    // Build a throwaway screen so we can inspect absolute cell positions
+    // after a draw. The pane we draw into sits at (5, 3) with a 30×5 rect,
+    // so the header lands on absolute rows 3-4 and the body on rows 5-7.
+    var screen = try vaxis.Screen.init(testing.allocator, .{
+        .cols = 40,
+        .rows = 8,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 8,
+        .screen = &screen,
+    };
+    // Match what `run` does each frame: clear the window so cells outside
+    // the paint region carry `.default = true`, giving us a reliable
+    // "untouched" sentinel to assert against below.
+    win.clear();
+
+    // Minimal BuildResult: one unified line sitting at row 0 of the body.
+    // Arena setup lives in a block so the errdefer only fires on in-block
+    // errors; once ownership moves to `built`, `defer built.deinit()` below
+    // is the sole freer and there's no risk of double-free on assertion
+    // failures further down.
+    var built: BuildResult = blk: {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const lines = try a.alloc(StyledLine, 1);
+        lines[0] = .{ .indent = 0, .marker = .added, .kind = .source, .text = "hello" };
+        break :blk .{
+            .view = .{ .unified = lines },
+            .stats = .{},
+            .decl_index = &.{},
+            .arena = arena,
+        };
+    };
+    defer built.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+
+    const pane: PaneSize = .{ .x_off = 5, .y_off = 3, .width = 30, .height = 5 };
+    drawDiffPane(win, pane, built, &state, .unified, false, .{
+        .title = "T",
+        .stats = "S",
+    });
+
+    // Header row 0 of pane → absolute (5, 3). Header is bold.
+    const header_cell = screen.readCell(5, 3).?;
+    try testing.expectEqualStrings("T", header_cell.char.grapheme);
+    try testing.expect(header_cell.style.bold);
+
+    // Stats row 1 of pane → absolute (5, 4).
+    const stats_cell = screen.readCell(5, 4).?;
+    try testing.expectEqualStrings("S", stats_cell.char.grapheme);
+
+    // Body row 0 of pane → absolute (5, 3 + header_rows) = (5, 5). Gutter `+`.
+    const gutter = screen.readCell(5, 5).?;
+    try testing.expectEqualStrings("+", gutter.char.grapheme);
+
+    // Outside the pane (absolute row 2, above y_off=3) must stay pristine.
+    const outside = screen.readCell(5, 2).?;
+    try testing.expect(outside.default);
+}
+
+test "drawDiffPane: null header leaves the top header rows untouched" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{
+        .cols = 20,
+        .rows = 6,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 6,
+        .screen = &screen,
+    };
+    win.clear();
+
+    var built: BuildResult = blk: {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const lines = try a.alloc(StyledLine, 1);
+        lines[0] = .{ .indent = 0, .marker = .added, .kind = .source, .text = "x" };
+        break :blk .{
+            .view = .{ .unified = lines },
+            .stats = .{},
+            .decl_index = &.{},
+            .arena = arena,
+        };
+    };
+    defer built.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+
+    const pane: PaneSize = .{ .x_off = 0, .y_off = 0, .width = 20, .height = 6 };
+    drawDiffPane(win, pane, built, &state, .unified, false, null);
+
+    // Header rows stay the default (blank) cell.
+    try testing.expect(screen.readCell(0, 0).?.default);
+    try testing.expect(screen.readCell(0, 1).?.default);
+    // Body still paints at row header_rows = 2.
+    try testing.expectEqualStrings("+", screen.readCell(0, 2).?.char.grapheme);
 }

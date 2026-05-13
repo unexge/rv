@@ -9,6 +9,7 @@ const ui = @import("ui/app.zig");
 // Ensure the ui module's inline tests are visible to `zig build test`.
 comptime {
     _ = @import("ui/line.zig");
+    _ = @import("ui/state.zig");
 }
 
 pub fn main(init: std.process.Init) !void {

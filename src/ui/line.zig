@@ -32,6 +32,11 @@
 const std = @import("std");
 
 const rv = @import("rv");
+const state_mod = @import("state.zig");
+
+pub const AppState = state_mod.AppState;
+pub const DeclId = state_mod.DeclId;
+pub const declId = state_mod.declId;
 
 pub const Marker = enum(u8) {
     /// Unchanged header.
@@ -80,6 +85,11 @@ pub const StyledLine = struct {
     /// display (post-tab-expansion) coordinates, sorted by `start`, and
     /// clipped so no span crosses a `\n`.
     novel_spans: []const ByteSpan = &.{},
+    /// Stable identity of the decl this line belongs to. Set on
+    /// `decl_header` lines (used by `app.zig` to locate the focused decl
+    /// for collapse/expand toggles); `null` on source, blank, and file-
+    /// header lines.
+    decl_id: ?DeclId = null,
 };
 
 pub const ByteSpan = struct { start: u32, end: u32 };
@@ -138,10 +148,16 @@ pub const BuildResult = struct {
 
 /// Walks the FileDiff and emits view lines for the requested mode.
 /// All slices in `BuildResult` are arena-owned; `deinit` frees them.
+///
+/// `state.collapsed` is consulted per decl: collapsed added/removed/changed
+/// decls have their bodies suppressed and their headers suffixed with
+/// ` […]`. Everything else (scroll, cursor) is ignored here; those are
+/// view-only concerns for `app.zig`.
 pub fn build(
     gpa: std.mem.Allocator,
     file_diff: *const rv.FileDiff,
     mode: Mode,
+    state: *const AppState,
 ) !BuildResult {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
@@ -151,12 +167,12 @@ pub fn build(
     const view: View = switch (mode) {
         .unified => blk: {
             var out: std.ArrayList(StyledLine) = .empty;
-            try appendEntries(arena, &out, &stats, file_diff, file_diff.entries, 0);
+            try appendEntries(arena, &out, &stats, state, file_diff, file_diff.entries, 0);
             break :blk .{ .unified = try out.toOwnedSlice(arena) };
         },
         .split => blk: {
             var out: std.ArrayList(LinePair) = .empty;
-            try appendEntriesSplit(arena, &out, &stats, file_diff, file_diff.entries, 0);
+            try appendEntriesSplit(arena, &out, &stats, state, file_diff, file_diff.entries, 0);
             break :blk .{ .split = try out.toOwnedSlice(arena) };
         },
     };
@@ -172,6 +188,7 @@ fn appendEntries(
     arena: std.mem.Allocator,
     out: *std.ArrayList(StyledLine),
     stats: *Stats,
+    state: *const AppState,
     file_diff: *const rv.FileDiff,
     entries: []const rv.DeclDiff,
     indent: u8,
@@ -184,18 +201,22 @@ fn appendEntries(
                     .indent = indent,
                     .marker = .unchanged,
                     .kind = .decl_header,
-                    .text = try declHeaderText(arena, u.decl, u.moved),
+                    .text = try declHeaderText(arena, u.decl, u.moved, false),
+                    .decl_id = declId(u.decl),
                 });
             },
             .added => |a| {
                 stats.added += 1;
+                const id = declId(a.decl);
+                const collapsed = state.isCollapsed(id);
                 try out.append(arena, .{
                     .indent = indent,
                     .marker = .added,
                     .kind = .decl_header,
-                    .text = try declHeaderText(arena, a.decl, null),
+                    .text = try declHeaderText(arena, a.decl, null, collapsed),
+                    .decl_id = id,
                 });
-                try appendSourceLines(
+                if (!collapsed) try appendSourceLines(
                     arena,
                     out,
                     file_diff.right_source,
@@ -208,13 +229,16 @@ fn appendEntries(
             },
             .removed => |r| {
                 stats.removed += 1;
+                const id = declId(r.decl);
+                const collapsed = state.isCollapsed(id);
                 try out.append(arena, .{
                     .indent = indent,
                     .marker = .removed,
                     .kind = .decl_header,
-                    .text = try declHeaderText(arena, r.decl, null),
+                    .text = try declHeaderText(arena, r.decl, null, collapsed),
+                    .decl_id = id,
                 });
-                try appendSourceLines(
+                if (!collapsed) try appendSourceLines(
                     arena,
                     out,
                     file_diff.left_source,
@@ -227,14 +251,18 @@ fn appendEntries(
             },
             .changed => |c| {
                 stats.changed += 1;
+                const id = declId(c.new);
+                const collapsed = state.isCollapsed(id);
                 try out.append(arena, .{
                     .indent = indent,
                     .marker = .changed,
                     .kind = .decl_header,
-                    .text = try declHeaderText(arena, c.new, c.moved),
+                    .text = try declHeaderText(arena, c.new, c.moved, collapsed),
+                    .decl_id = id,
                 });
+                if (collapsed) continue;
                 switch (c.body) {
-                    .container => |children| try appendEntries(arena, out, stats, file_diff, children, indent + 1),
+                    .container => |children| try appendEntries(arena, out, stats, state, file_diff, children, indent + 1),
                     .leaf => |script| {
                         const left_novels = try collectAtomNovels(arena, script, .left);
                         const right_novels = try collectAtomNovels(arena, script, .right);
@@ -271,6 +299,7 @@ fn appendEntriesSplit(
     arena: std.mem.Allocator,
     out: *std.ArrayList(LinePair),
     stats: *Stats,
+    state: *const AppState,
     file_diff: *const rv.FileDiff,
     entries: []const rv.DeclDiff,
     indent: u8,
@@ -283,19 +312,24 @@ fn appendEntriesSplit(
                     .indent = indent,
                     .marker = .unchanged,
                     .kind = .decl_header,
-                    .text = try declHeaderText(arena, u.decl, u.moved),
+                    .text = try declHeaderText(arena, u.decl, u.moved, false),
+                    .decl_id = declId(u.decl),
                 };
                 try out.append(arena, .{ .left = header, .right = header });
             },
             .added => |a| {
                 stats.added += 1;
+                const id = declId(a.decl);
+                const collapsed = state.isCollapsed(id);
                 const header: StyledLine = .{
                     .indent = indent,
                     .marker = .added,
                     .kind = .decl_header,
-                    .text = try declHeaderText(arena, a.decl, null),
+                    .text = try declHeaderText(arena, a.decl, null, collapsed),
+                    .decl_id = id,
                 };
                 try out.append(arena, .{ .left = blankLine(indent), .right = header });
+                if (collapsed) continue;
                 const src_lines = try sourceLinesSlice(
                     arena,
                     file_diff.right_source,
@@ -311,13 +345,17 @@ fn appendEntriesSplit(
             },
             .removed => |r| {
                 stats.removed += 1;
+                const id = declId(r.decl);
+                const collapsed = state.isCollapsed(id);
                 const header: StyledLine = .{
                     .indent = indent,
                     .marker = .removed,
                     .kind = .decl_header,
-                    .text = try declHeaderText(arena, r.decl, null),
+                    .text = try declHeaderText(arena, r.decl, null, collapsed),
+                    .decl_id = id,
                 };
                 try out.append(arena, .{ .left = header, .right = blankLine(indent) });
+                if (collapsed) continue;
                 const src_lines = try sourceLinesSlice(
                     arena,
                     file_diff.left_source,
@@ -333,18 +371,23 @@ fn appendEntriesSplit(
             },
             .changed => |c| {
                 stats.changed += 1;
+                const id = declId(c.new);
+                const collapsed = state.isCollapsed(id);
                 const header: StyledLine = .{
                     .indent = indent,
                     .marker = .changed,
                     .kind = .decl_header,
-                    .text = try declHeaderText(arena, c.new, c.moved),
+                    .text = try declHeaderText(arena, c.new, c.moved, collapsed),
+                    .decl_id = id,
                 };
                 try out.append(arena, .{ .left = header, .right = header });
+                if (collapsed) continue;
                 switch (c.body) {
                     .container => |children| try appendEntriesSplit(
                         arena,
                         out,
                         stats,
+                        state,
                         file_diff,
                         children,
                         indent + 1,
@@ -402,14 +445,16 @@ fn declHeaderText(
     arena: std.mem.Allocator,
     decl: rv.Decl,
     moved: ?rv.MoveInfo,
+    collapsed: bool,
 ) ![]const u8 {
     const name = decl.name orelse "<anon>";
+    const suffix: []const u8 = if (collapsed) " […]" else "";
     if (moved) |m| {
-        return std.fmt.allocPrint(arena, "{s}  ({s}, moved {d} → {d})", .{
-            name, decl.ts_kind, m.from_idx, m.to_idx,
+        return std.fmt.allocPrint(arena, "{s}  ({s}, moved {d} → {d}){s}", .{
+            name, decl.ts_kind, m.from_idx, m.to_idx, suffix,
         });
     }
-    return std.fmt.allocPrint(arena, "{s}  ({s})", .{ name, decl.ts_kind });
+    return std.fmt.allocPrint(arena, "{s}  ({s}){s}", .{ name, decl.ts_kind, suffix });
 }
 
 /// Split the given source slice by newlines and emit one StyledLine per line,
@@ -581,6 +626,19 @@ fn expandTabs(arena: std.mem.Allocator, line: []const u8) ![]const u8 {
 
 const testing = std.testing;
 
+/// Most tests below don't care about collapse state; they want the fully-
+/// expanded view. This helper builds with an empty `AppState` and hides
+/// the plumbing from the test body.
+fn buildForTest(
+    gpa: std.mem.Allocator,
+    file_diff: *const rv.FileDiff,
+    mode: Mode,
+) !BuildResult {
+    var state = AppState.init(gpa);
+    defer state.deinit();
+    return build(gpa, file_diff, mode, &state);
+}
+
 test "build: identical Zig sources → one unchanged header per decl, no source lines" {
     const src =
         \\pub fn a() void {}
@@ -589,7 +647,7 @@ test "build: identical Zig sources → one unchanged header per decl, no source 
     var fd = try rv.diffSources(testing.allocator, .zig, src, src);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 2), result.stats.unchanged);
@@ -610,7 +668,7 @@ test "build: added Zig fn → header + all source lines marked added" {
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 1), result.stats.added);
@@ -641,7 +699,7 @@ test "build: removed Zig fn → header + all source lines marked removed, from L
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 1), result.stats.removed);
@@ -664,7 +722,7 @@ test "build: changed leaf → - lines (left) then + lines (right)" {
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 1), result.stats.changed);
@@ -703,7 +761,7 @@ test "build: changed container → recurse with indent, no - / + dumps at contai
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     try testing.expectEqual(@as(usize, 1), result.stats.changed);
@@ -729,7 +787,7 @@ test "build: unchanged decl does not dump its source lines" {
     var fd = try rv.diffSources(testing.allocator, .zig, src, src);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     for (result.view.unified) |ln| try testing.expect(ln.kind != .source);
@@ -741,7 +799,7 @@ test "build: decl header includes moved info when present" {
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     var found_moved_in_text = false;
@@ -772,7 +830,7 @@ test "build split: identical sources → header pairs mirror both sides" {
     var fd = try rv.diffSources(testing.allocator, .zig, src, src);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .split);
+    var result = try buildForTest(testing.allocator, &fd, .split);
     defer result.deinit();
 
     const pairs = result.view.split;
@@ -791,7 +849,7 @@ test "build split: added decl → left pane blank, right pane has header + sourc
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .split);
+    var result = try buildForTest(testing.allocator, &fd, .split);
     defer result.deinit();
 
     // Find the added header pair.
@@ -826,7 +884,7 @@ test "build split: removed decl → right pane blank, left pane has header + sou
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .split);
+    var result = try buildForTest(testing.allocator, &fd, .split);
     defer result.deinit();
 
     var saw_removed_source_left = false;
@@ -848,7 +906,7 @@ test "build split: changed leaf → left `-` paired with right `+`, padded to eq
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .split);
+    var result = try buildForTest(testing.allocator, &fd, .split);
     defer result.deinit();
 
     const pairs = result.view.split;
@@ -895,7 +953,7 @@ test "build split: changed container → header shared, children recurse with in
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .split);
+    var result = try buildForTest(testing.allocator, &fd, .split);
     defer result.deinit();
 
     const pairs = result.view.split;
@@ -945,7 +1003,7 @@ test "build: changed leaf populates novel_spans covering exactly the differing a
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -976,7 +1034,7 @@ test "build: body_change fixture (1 → 42) — novel_spans cover exactly the li
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -999,7 +1057,7 @@ test "build: novel_spans respect tab expansion (display offsets, not raw)" {
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     // Locate the removed `return` line.
@@ -1033,7 +1091,7 @@ test "build: unchanged/added/removed decls carry no novel_spans" {
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .unified);
+    var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
     for (result.view.unified) |ln| {
@@ -1048,7 +1106,7 @@ test "build split: changed leaf populates novel_spans on both panes" {
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
-    var result = try build(testing.allocator, &fd, .split);
+    var result = try buildForTest(testing.allocator, &fd, .split);
     defer result.deinit();
 
     var left_any = false;
@@ -1100,4 +1158,157 @@ test "mapNovelsToLine: novel straddling line end is clipped, never crosses \\n" 
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqual(@as(u32, 2), got[0].start);
     try testing.expectEqual(@as(u32, 5), got[0].end);
+}
+
+// ── collapse/expand ─────────────────────────────────────────────────────
+
+/// Find the first (and typically only) `.changed` entry at the top level.
+fn firstChanged(entries: []const rv.DeclDiff) rv.Decl {
+    for (entries) |e| if (e == .changed) return e.changed.new;
+    unreachable;
+}
+
+test "build: collapsed changed leaf hides body and appends '[…]' to header" {
+    const before = "pub fn greet() u32 { return 1; }\n";
+    const after = "pub fn greet() u32 { return 2; }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    _ = try state.toggle(declId(firstChanged(fd.entries)));
+
+    var result = try build(testing.allocator, &fd, .unified, &state);
+    defer result.deinit();
+
+    // No source lines — the leaf's body is suppressed.
+    for (result.view.unified) |ln| try testing.expect(ln.kind != .source);
+
+    // Header has the `[…]` suffix.
+    try testing.expectEqual(@as(usize, 1), result.view.unified.len);
+    try testing.expect(std.mem.endsWith(u8, result.view.unified[0].text, " [\u{2026}]"));
+}
+
+test "build: collapsed container hides children and appends '[…]' to header" {
+    const before =
+        \\pub const Thing = struct {
+        \\    pub fn one() void {}
+        \\};
+    ;
+    const after =
+        \\pub const Thing = struct {
+        \\    pub fn one() void {}
+        \\    pub fn two() void {}
+        \\};
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    _ = try state.toggle(declId(firstChanged(fd.entries)));
+
+    var result = try build(testing.allocator, &fd, .unified, &state);
+    defer result.deinit();
+
+    // Only the container header is emitted — children don't appear.
+    try testing.expectEqual(@as(usize, 1), result.view.unified.len);
+    try testing.expectEqual(LineKind.decl_header, result.view.unified[0].kind);
+    try testing.expect(std.mem.endsWith(u8, result.view.unified[0].text, " [\u{2026}]"));
+}
+
+test "build: collapsed added decl hides its source dump" {
+    const before = "pub fn a() void {}\n";
+    const after = "pub fn a() void {}\npub fn b() void {\n    return;\n}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    for (fd.entries) |e| if (e == .added) {
+        _ = try state.toggle(declId(e.added.decl));
+    };
+
+    var result = try build(testing.allocator, &fd, .unified, &state);
+    defer result.deinit();
+
+    var saw_added_header = false;
+    for (result.view.unified) |ln| {
+        try testing.expect(!(ln.marker == .added and ln.kind == .source));
+        if (ln.marker == .added and ln.kind == .decl_header) {
+            try testing.expect(std.mem.endsWith(u8, ln.text, " [\u{2026}]"));
+            saw_added_header = true;
+        }
+    }
+    try testing.expect(saw_added_header);
+}
+
+test "build: collapsed removed decl hides its source dump" {
+    const before = "pub fn a() void {}\npub fn gone() void { return; }\n";
+    const after = "pub fn a() void {}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    for (fd.entries) |e| if (e == .removed) {
+        _ = try state.toggle(declId(e.removed.decl));
+    };
+
+    var result = try build(testing.allocator, &fd, .unified, &state);
+    defer result.deinit();
+
+    for (result.view.unified) |ln| {
+        try testing.expect(!(ln.marker == .removed and ln.kind == .source));
+    }
+}
+
+test "build split: collapsed changed leaf hides body on both panes" {
+    const before = "pub fn greet() u32 { return 1; }\n";
+    const after = "pub fn greet() u32 { return 2; }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    _ = try state.toggle(declId(firstChanged(fd.entries)));
+
+    var result = try build(testing.allocator, &fd, .split, &state);
+    defer result.deinit();
+
+    // Only the changed header pair survives.
+    try testing.expectEqual(@as(usize, 1), result.view.split.len);
+    const pair = result.view.split[0];
+    try testing.expectEqual(LineKind.decl_header, pair.left.kind);
+    try testing.expectEqual(LineKind.decl_header, pair.right.kind);
+    try testing.expect(std.mem.endsWith(u8, pair.left.text, " [\u{2026}]"));
+    try testing.expect(std.mem.endsWith(u8, pair.right.text, " [\u{2026}]"));
+}
+
+test "build: decl_header lines carry a decl_id; source/blank lines do not" {
+    const before = "pub fn a() u32 { return 1; }\n";
+    const after = "pub fn a() u32 { return 2; }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var header_count: usize = 0;
+    for (result.view.unified) |ln| switch (ln.kind) {
+        .decl_header => {
+            try testing.expect(ln.decl_id != null);
+            header_count += 1;
+        },
+        .source, .blank, .file_header, .stats => try testing.expectEqual(
+            @as(?DeclId, null),
+            ln.decl_id,
+        ),
+    };
+    try testing.expect(header_count >= 1);
 }

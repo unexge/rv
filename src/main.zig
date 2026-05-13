@@ -8,6 +8,7 @@ const ui = @import("ui/app.zig");
 
 // Ensure the ui + vcs modules' inline tests are visible to `zig build test`.
 comptime {
+    _ = @import("ui/file_list.zig");
     _ = @import("ui/hunk.zig");
     _ = @import("ui/line.zig");
     _ = @import("ui/search.zig");

@@ -73,8 +73,9 @@ pub const Session = struct {
     focus: Focus,
     mode: line_mod.Mode,
     /// Scratch buffer for short-lived placeholder strings returned by
-    /// `currentView` (e.g. `"unsupported: .xyz"`). Overwritten on every
-    /// call; callers must not hold the slice across frames.
+    /// `currentView` (e.g. `"No language support for .xyz"`).
+    /// Overwritten on every call; callers must not hold the slice
+    /// across frames.
     scratch: [128]u8,
 
     /// Discover the enclosing git repo and enumerate its changed files.
@@ -128,6 +129,11 @@ pub const Session = struct {
     /// Also populates `entries[idx].summary` from the freshly-built
     /// `FileDiff` so the sidebar can show decl-level counts after the
     /// first visit.
+    ///
+    /// For `.added` / `.deleted` entries the per-file `AppState` is
+    /// pre-collapsed so the summary view opens with every decl folded
+    /// to a single header line; users can still expand individual decls
+    /// with space/enter afterwards.
     pub fn ensureLoaded(self: *Session, idx: usize) !void {
         if (idx >= self.entries.len) return;
         const entry = &self.entries[idx];
@@ -157,6 +163,11 @@ pub const Session = struct {
         var fd = try rv.diffSources(self.gpa, lang, old_bytes, new_bytes);
         errdefer fd.deinit();
 
+        switch (entry.change.kind) {
+            .added, .deleted => try state.app_state.collapseAll(&fd),
+            else => {},
+        }
+
         state.old_source = old_bytes;
         state.new_source = new_bytes;
         state.diff = fd;
@@ -178,7 +189,7 @@ pub const Session = struct {
         const state = &self.states[idx];
 
         return switch (entry.change.kind) {
-            .binary => .{ .placeholder = "binary file" },
+            .binary => .{ .placeholder = "Binary file, not shown" },
             .unsupported => .{ .placeholder = self.unsupportedMessage(entry.change) },
             .modified, .renamed => if (state.diff) |*d|
                 .{ .diff = d }
@@ -198,8 +209,8 @@ pub const Session = struct {
     fn unsupportedMessage(self: *Session, change: vcs.FileChange) []const u8 {
         const path = change.new_path orelse change.old_path orelse "";
         const ext = std.fs.path.extension(path);
-        const msg = std.fmt.bufPrint(&self.scratch, "unsupported: {s}", .{ext}) catch
-            return "unsupported";
+        const msg = std.fmt.bufPrint(&self.scratch, "No language support for {s}", .{ext}) catch
+            return "No language support";
         return msg;
     }
 };
@@ -297,15 +308,19 @@ pub fn run(
 
         const view = try session.currentView();
 
-        // `.summary` / `.placeholder` panes render a single line of
-        // static text, so there's nothing to build; skipping the build
-        // also means `handleDiffKey` short-circuits on those selections
-        // (see the `built.* == null` guard) and diff-pane keys can't
-        // mutate invisible cursor state behind a placeholder.
+        // `.placeholder` panes render a single line of static text, so
+        // there's nothing to build; skipping the build also means
+        // `handleDiffKey` short-circuits on those selections (see the
+        // `built.* == null` guard) and diff-pane keys can't mutate
+        // invisible cursor state behind a placeholder.
+        //
+        // `.summary` reuses the standard diff renderer (with every decl
+        // pre-collapsed in `ensureLoaded`), so it builds like `.diff`.
         if (built == null) {
             const fd: ?*const rv.FileDiff = switch (view) {
                 .diff => |d| d,
-                .summary, .placeholder => null,
+                .summary => |s| s.diff,
+                .placeholder => null,
             };
             if (fd) |d| built = try line_mod.build(
                 gpa,
@@ -479,7 +494,25 @@ fn drawRightPane(
                 header,
             );
         },
-        .summary => drawPlaceholderPane(win, pane_size, "summary view coming soon"),
+        .summary => |s| {
+            const b = built orelse return;
+            const idx = session.list.cursor;
+            const header = try summaryHeader(
+                frame_alloc,
+                session.entries[idx],
+                s.diff.entries,
+                s.direction,
+            );
+            app.drawDiffPane(
+                win,
+                pane_size,
+                b,
+                &session.states[idx].app_state,
+                session.mode,
+                session.focus == .diff,
+                header,
+            );
+        },
         .placeholder => |msg| drawPlaceholderPane(win, pane_size, msg),
     }
 }
@@ -491,9 +524,15 @@ fn drawPlaceholderPane(win: vaxis.Window, size: app.PaneSize, msg: []const u8) v
         .width = size.width,
         .height = size.height,
     });
+    // Centre the message both horizontally and vertically. Long messages
+    // that don't fit horizontally fall back to left-aligned; truncation
+    // is left to vaxis's `wrap = .none` clipping.
+    const msg_len: u16 = @intCast(@min(msg.len, std.math.maxInt(u16)));
+    const col: u16 = if (pane.width > msg_len) (pane.width - msg_len) / 2 else 0;
+    const row: u16 = pane.height / 2;
     _ = pane.print(
         &.{.{ .text = msg, .style = .{ .dim = true } }},
-        .{ .row_offset = 0, .col_offset = 0, .wrap = .none },
+        .{ .row_offset = row, .col_offset = col, .wrap = .none },
     );
 }
 
@@ -510,6 +549,92 @@ fn fileHeader(
         " +{d}  -{d}  ~{d}  ={d}    (Tab: focus, j/k: move, q: quit)",
         .{ built.stats.added, built.stats.removed, built.stats.changed, built.stats.unchanged },
     );
+    return .{ .title = title, .stats = stats };
+}
+
+// ── summary header ────────────────────────────────────────────────────────
+
+/// Counts of top-level `DeclDiff` entries grouped by `Decl.kind`.
+/// Only the three most common kinds get their own slot; everything else
+/// (imports, test cases, containers, language-specific `other`) is
+/// folded into `other`.
+const DeclKindCounts = struct {
+    function: u32 = 0,
+    binding: u32 = 0,
+    type_alias: u32 = 0,
+    other: u32 = 0,
+};
+
+/// Walk top-level `DeclDiff` entries and tally them by `Decl.kind`.
+/// Only entries matching `direction` contribute: `.added` counts
+/// `.added` variants, `.removed` counts `.removed` variants. Nested
+/// containers aren't recursed - the summary reflects the file-level
+/// change, not a full decl tree.
+fn countDeclKinds(
+    entries: []const rv.DeclDiff,
+    direction: SummaryDirection,
+) DeclKindCounts {
+    var c: DeclKindCounts = .{};
+    for (entries) |e| {
+        const decl: ?rv.Decl = switch (e) {
+            .added => |a| if (direction == .added) a.decl else null,
+            .removed => |r| if (direction == .removed) r.decl else null,
+            .unchanged, .changed => null,
+        };
+        const d = decl orelse continue;
+        switch (d.kind) {
+            .function => c.function += 1,
+            .binding => c.binding += 1,
+            .type_alias => c.type_alias += 1,
+            else => c.other += 1,
+        }
+    }
+    return c;
+}
+
+/// Format a count string like `"3 fns, 2 consts added"` or
+/// `"1 type removed"`. Zero-count categories are collapsed; if every
+/// category is zero (e.g. an added file with no recognised decls) the
+/// output falls back to just the direction word (`"added"`/`"removed"`).
+fn formatSummaryHeader(
+    arena: Allocator,
+    counts: DeclKindCounts,
+    direction: SummaryDirection,
+) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+
+    const entries = [_]struct { count: u32, singular: []const u8, plural: []const u8 }{
+        .{ .count = counts.function, .singular = "fn", .plural = "fns" },
+        .{ .count = counts.binding, .singular = "const", .plural = "consts" },
+        .{ .count = counts.type_alias, .singular = "type", .plural = "types" },
+        .{ .count = counts.other, .singular = "other", .plural = "others" },
+    };
+    for (entries) |e| {
+        if (e.count == 0) continue;
+        const word = if (e.count == 1) e.singular else e.plural;
+        try parts.append(arena, try std.fmt.allocPrint(arena, "{d} {s}", .{ e.count, word }));
+    }
+
+    const dir_word: []const u8 = switch (direction) {
+        .added => "added",
+        .removed => "removed",
+    };
+
+    if (parts.items.len == 0) return arena.dupe(u8, dir_word);
+
+    const joined = try std.mem.join(arena, ", ", parts.items);
+    return std.fmt.allocPrint(arena, "{s} {s}", .{ joined, dir_word });
+}
+
+fn summaryHeader(
+    arena: Allocator,
+    entry: file_list.Entry,
+    entries: []const rv.DeclDiff,
+    direction: SummaryDirection,
+) !app.DiffHeader {
+    const title = entry.change.new_path orelse entry.change.old_path orelse "<?>";
+    const counts = countDeclKinds(entries, direction);
+    const stats = try formatSummaryHeader(arena, counts, direction);
     return .{ .title = title, .stats = stats };
 }
 
@@ -722,7 +847,7 @@ test "classify: deleted → summary direction=removed" {
     try testing.expectEqual(SummaryDirection.removed, view.summary.direction);
 }
 
-test "classify: binary → placeholder 'binary file'" {
+test "classify: binary → placeholder 'Binary file, not shown'" {
     var session = try emptyStubSession(testing.allocator, &.{.{
         .kind = .binary,
         .old_path = "img.png",
@@ -733,7 +858,7 @@ test "classify: binary → placeholder 'binary file'" {
 
     const view = session.classify(0);
     try testing.expect(view == .placeholder);
-    try testing.expectEqualStrings("binary file", view.placeholder);
+    try testing.expectEqualStrings("Binary file, not shown", view.placeholder);
 }
 
 test "classify: unsupported → placeholder carries extension" {
@@ -747,7 +872,7 @@ test "classify: unsupported → placeholder carries extension" {
 
     const view = session.classify(0);
     try testing.expect(view == .placeholder);
-    try testing.expectEqualStrings("unsupported: .xyz", view.placeholder);
+    try testing.expectEqualStrings("No language support for .xyz", view.placeholder);
 }
 
 test "paneLayout: sidebar width capped at 40 and at (width * 3) / 10" {
@@ -763,3 +888,107 @@ test "paneLayout: sidebar width capped at 40 and at (width * 3) / 10" {
     try testing.expectEqual(@as(u16, 40), wide.sidebar_w);
     try testing.expectEqual(@as(u16, 159), wide.pane_w);
 }
+
+// ── summary header formatting ─────────────────────────────────────
+
+test "formatSummaryHeader: plural and singular words, comma separated" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings(
+        "3 fns, 2 consts added",
+        try formatSummaryHeader(a, .{ .function = 3, .binding = 2 }, .added),
+    );
+    try testing.expectEqualStrings(
+        "1 type removed",
+        try formatSummaryHeader(a, .{ .type_alias = 1 }, .removed),
+    );
+    try testing.expectEqualStrings(
+        "1 fn, 1 const, 1 type added",
+        try formatSummaryHeader(
+            a,
+            .{ .function = 1, .binding = 1, .type_alias = 1 },
+            .added,
+        ),
+    );
+}
+
+test "formatSummaryHeader: zero-count categories are omitted" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings(
+        "5 others added",
+        try formatSummaryHeader(a, .{ .other = 5 }, .added),
+    );
+    try testing.expectEqualStrings(
+        "added",
+        try formatSummaryHeader(a, .{}, .added),
+    );
+}
+
+test "countDeclKinds: groups added decls by kind, ignores unchanged/changed/removed" {
+    // An added `.zig` file with 2 fns and 1 const. `countDeclKinds` with
+    // direction=.added should report function=2 / binding=1. Zig has no
+    // native type_alias, so that slot stays zero.
+    const after =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub const C: u32 = 1;
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .zig, "", after);
+    defer fd.deinit();
+
+    const counts = countDeclKinds(fd.entries, .added);
+    try testing.expectEqual(@as(u32, 2), counts.function);
+    try testing.expectEqual(@as(u32, 1), counts.binding);
+    try testing.expectEqual(@as(u32, 0), counts.type_alias);
+    try testing.expectEqual(@as(u32, 0), counts.other);
+
+    // Same entries asked about `.removed` yields nothing, since every
+    // top-level DeclDiff here is `.added`.
+    const removed_counts = countDeclKinds(fd.entries, .removed);
+    try testing.expectEqual(@as(u32, 0), removed_counts.function);
+    try testing.expectEqual(@as(u32, 0), removed_counts.binding);
+}
+
+test "summary header: added file with 3 fns and 2 consts renders expected string" {
+    // End-to-end: diff an empty before against an added Zig file with
+    // 3 fns and 2 consts, then format through the same helper the UI
+    // calls, and check the full header string.
+    const after =
+        \\pub fn one() void {}
+        \\pub fn two() void {}
+        \\pub fn three() void {}
+        \\pub const X: u32 = 1;
+        \\pub const Y: u32 = 2;
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .zig, "", after);
+    defer fd.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const counts = countDeclKinds(fd.entries, .added);
+    const s = try formatSummaryHeader(arena.allocator(), counts, .added);
+    try testing.expectEqualStrings("3 fns, 2 consts added", s);
+}
+
+test "summary header: deleted file with 1 fn renders '1 fn removed'" {
+    const before = "pub fn gone() void {}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, "");
+    defer fd.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const counts = countDeclKinds(fd.entries, .removed);
+    const s = try formatSummaryHeader(arena.allocator(), counts, .removed);
+    try testing.expectEqualStrings("1 fn removed", s);
+}
+

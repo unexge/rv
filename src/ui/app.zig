@@ -7,6 +7,12 @@
 //! - Scroll state (single vertical offset shared across both panes in split
 //!   mode)
 //! - Key handling: arrows, PgUp/PgDn, Home/End, q, Ctrl-C, v (toggle view)
+//! - Mouse handling: wheel scroll + click-to-focus. Terminals without
+//!   mouse support simply never deliver mouse events, so keyboard
+//!   navigation stays intact. Drag-select is deferred because our mouse
+//!   handling conflicts with the terminal's own selection; users who
+//!   want to copy text can hold Shift while clicking/dragging to bypass
+//!   vaxis and use the terminal's native selection.
 //! - Drawing the header strip and visible lines each frame in either the
 //!   unified or side-by-side layout
 
@@ -24,6 +30,7 @@ const Mode = line_mod.Mode;
 
 const Event = union(enum) {
     key_press: vaxis.Key,
+    mouse: vaxis.Mouse,
     winsize: vaxis.Winsize,
 };
 
@@ -79,9 +86,16 @@ pub fn run(
 
     try vx.enterAltScreen(tty.writer());
     try vx.queryTerminal(tty.writer(), .fromSeconds(1));
+    // `setMouseMode` inspects `vx.caps.sgr_pixels` (populated by
+    // `queryTerminal`) and picks pixel-precision reporting when available,
+    // falling back to cell-precision otherwise.
+    try vx.setMouseMode(tty.writer(), true);
 
     var mode: Mode = .unified;
     var scroll_y: usize = 0;
+    // Focused row in the current view's absolute coordinates, or `null`
+    // if the user hasn't clicked anywhere yet. Tracked now; not rendered.
+    var cursor_y: ?usize = null;
 
     while (true) {
         const event = try loop.nextEvent();
@@ -91,6 +105,7 @@ pub fn run(
                 if (key.matches('q', .{})) break;
                 if (key.matches('v', .{})) {
                     scroll_y = switchMode(&mode, scroll_y, unified, split);
+                    cursor_y = null;
                 } else {
                     const total = switch (mode) {
                         .unified => unified.rowCount(),
@@ -98,6 +113,15 @@ pub fn run(
                     };
                     scroll_y = applyScroll(scroll_y, key, viewportHeight(vx.window()), total);
                 }
+            },
+            .mouse => |m| {
+                const total = switch (mode) {
+                    .unified => unified.rowCount(),
+                    .split => split.rowCount(),
+                };
+                const result = applyMouse(m, scroll_y, cursor_y, viewportHeight(vx.window()), total);
+                scroll_y = result.scroll_y;
+                cursor_y = result.cursor_y;
             },
             .winsize => |ws| try vx.resize(gpa, tty.writer(), ws),
         }
@@ -134,6 +158,58 @@ fn applyScroll(current: usize, key: vaxis.Key, viewport: u16, total: usize) usiz
     else if (key.matches(vaxis.Key.end, .{})) next = max_scroll;
 
     return @min(next, max_scroll);
+}
+
+// ── mouse ──────────────────────────────────────────────────────────────────
+
+/// Lines scrolled per wheel tick. Matches the typical terminal default and
+/// keeps wheel scrolling distinguishable from arrow-key scrolling.
+const wheel_step: usize = 3;
+
+const MouseResult = struct {
+    scroll_y: usize,
+    cursor_y: ?usize,
+};
+
+/// Pure mouse handler: wheel ticks move `scroll_y`, left-button presses set
+/// `cursor_y` to the absolute row under the pointer. Clicks inside the
+/// header strip, past the end of content, or outside the window are ignored
+/// so a stray click never places the cursor on an empty row. Split view is
+/// handled transparently: vertical offset is shared across panes, and the
+/// absolute row is the same whether the click landed left or right of the
+/// separator.
+fn applyMouse(
+    m: vaxis.Mouse,
+    scroll_y: usize,
+    cursor_y: ?usize,
+    viewport: u16,
+    total: usize,
+) MouseResult {
+    const max_scroll = if (total > viewport) total - viewport else 0;
+
+    var new_scroll = scroll_y;
+    var new_cursor = cursor_y;
+
+    if (m.type == .press) {
+        switch (m.button) {
+            .wheel_up => new_scroll -|= wheel_step,
+            .wheel_down => new_scroll +|= wheel_step,
+            .left => {
+                if (m.row >= 0) {
+                    const row_u: u16 = @intCast(m.row);
+                    if (row_u >= header_rows) {
+                        const in_body: usize = row_u - header_rows;
+                        const abs_row = scroll_y + in_body;
+                        if (abs_row < total) new_cursor = abs_row;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    new_scroll = @min(new_scroll, max_scroll);
+    return .{ .scroll_y = new_scroll, .cursor_y = new_cursor };
 }
 
 // ── view toggle (`v`) ──────────────────────────────────────────────────────
@@ -427,4 +503,86 @@ fn styleFor(sl: StyledLine) vaxis.Style {
         .header => .{ .bold = true },
         .blank => .{},
     };
+}
+
+// ── tests ──────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn mouseEvent(
+    button: vaxis.Mouse.Button,
+    kind: vaxis.Mouse.Type,
+    row: i16,
+    col: i16,
+) vaxis.Mouse {
+    return .{
+        .col = col,
+        .row = row,
+        .button = button,
+        .mods = .{},
+        .type = kind,
+    };
+}
+
+test "applyMouse: wheel_up scrolls by wheel_step, clamps at 0" {
+    const r1 = applyMouse(mouseEvent(.wheel_up, .press, 5, 0), 10, null, 20, 100);
+    try testing.expectEqual(@as(usize, 7), r1.scroll_y);
+    try testing.expectEqual(@as(?usize, null), r1.cursor_y);
+
+    const r2 = applyMouse(mouseEvent(.wheel_up, .press, 5, 0), 1, null, 20, 100);
+    try testing.expectEqual(@as(usize, 0), r2.scroll_y);
+}
+
+test "applyMouse: wheel_down scrolls by wheel_step, clamps at max_scroll" {
+    // total=100, viewport=20 → max_scroll=80.
+    const r1 = applyMouse(mouseEvent(.wheel_down, .press, 5, 0), 10, null, 20, 100);
+    try testing.expectEqual(@as(usize, 13), r1.scroll_y);
+
+    const r2 = applyMouse(mouseEvent(.wheel_down, .press, 5, 0), 79, null, 20, 100);
+    try testing.expectEqual(@as(usize, 80), r2.scroll_y);
+}
+
+test "applyMouse: wheel scroll does not touch cursor_y" {
+    const r = applyMouse(mouseEvent(.wheel_down, .press, 5, 0), 0, 42, 20, 100);
+    try testing.expectEqual(@as(?usize, 42), r.cursor_y);
+}
+
+test "applyMouse: left click in body sets cursor_y to absolute row" {
+    // header_rows = 2. Click on viewport row 5 with scroll_y=10 → abs 13.
+    const r = applyMouse(mouseEvent(.left, .press, 5, 0), 10, null, 20, 100);
+    try testing.expectEqual(@as(?usize, 13), r.cursor_y);
+    try testing.expectEqual(@as(usize, 10), r.scroll_y);
+}
+
+test "applyMouse: left click in header strip is ignored" {
+    const r = applyMouse(mouseEvent(.left, .press, 0, 0), 10, null, 20, 100);
+    try testing.expectEqual(@as(?usize, null), r.cursor_y);
+    const r2 = applyMouse(mouseEvent(.left, .press, 1, 0), 10, 7, 20, 100);
+    try testing.expectEqual(@as(?usize, 7), r2.cursor_y);
+}
+
+test "applyMouse: left click past end of content leaves cursor_y unchanged" {
+    // total=5, viewport=20, click viewport row 10 → abs 10, out of bounds.
+    const r = applyMouse(mouseEvent(.left, .press, 12, 0), 0, 3, 20, 5);
+    try testing.expectEqual(@as(?usize, 3), r.cursor_y);
+}
+
+test "applyMouse: non-press events do not mutate state" {
+    const r1 = applyMouse(mouseEvent(.left, .release, 5, 0), 10, null, 20, 100);
+    try testing.expectEqual(@as(usize, 10), r1.scroll_y);
+    try testing.expectEqual(@as(?usize, null), r1.cursor_y);
+
+    const r2 = applyMouse(mouseEvent(.none, .motion, 5, 0), 10, 7, 20, 100);
+    try testing.expectEqual(@as(usize, 10), r2.scroll_y);
+    try testing.expectEqual(@as(?usize, 7), r2.cursor_y);
+
+    const r3 = applyMouse(mouseEvent(.left, .drag, 5, 0), 10, 7, 20, 100);
+    try testing.expectEqual(@as(usize, 10), r3.scroll_y);
+    try testing.expectEqual(@as(?usize, 7), r3.cursor_y);
+}
+
+test "applyMouse: non-left, non-wheel buttons are ignored" {
+    const r = applyMouse(mouseEvent(.right, .press, 5, 0), 10, null, 20, 100);
+    try testing.expectEqual(@as(usize, 10), r.scroll_y);
+    try testing.expectEqual(@as(?usize, null), r.cursor_y);
 }

@@ -9,6 +9,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const vaxis = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("rv", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -32,6 +37,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "rv", .module = mod },
                 .{ .name = "treez", .module = tree_sitter.module("treez") },
+                .{ .name = "vaxis", .module = vaxis.module("vaxis") },
             },
         }),
     });

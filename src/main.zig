@@ -1,13 +1,15 @@
-//! Minimal demo of the rv diff engine.
-//!
-//! Usage: rv <before> <after>
-//!
-//! Language is inferred from the first path's extension. Prints a one-line
-//! header plus a tree view of the structured diff to stderr. See
-//! `src/root.zig` for the full public API surface.
+//! Entry point: parse two source files, run the diff engine, render the
+//! structured result in a libvaxis TUI. See `src/ui/app.zig` for rendering.
 
 const std = @import("std");
 const rv = @import("rv");
+
+const ui = @import("ui/app.zig");
+
+// Ensure the ui module's inline tests are visible to `zig build test`.
+comptime {
+    _ = @import("ui/line.zig");
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -34,63 +36,10 @@ pub fn main(init: std.process.Init) !void {
     var diff = try rv.diffSources(gpa, lang, before, after);
     defer diff.deinit();
 
-    printSummary(&diff);
+    try ui.run(gpa, io, init.environ_map, &diff, before_path, after_path);
 }
 
 fn usage() error{BadUsage} {
     std.debug.print("usage: rv <before> <after>\n", .{});
     return error.BadUsage;
-}
-
-fn printSummary(diff: *const rv.FileDiff) void {
-    std.debug.print("rv: {d} top-level entries, {d} parse errors\n", .{
-        diff.entries.len,
-        diff.parse_errors.len,
-    });
-    printEntries(diff.entries, 0);
-}
-
-fn printEntries(entries: []const rv.DeclDiff, depth: usize) void {
-    for (entries) |entry| {
-        indent(depth);
-        switch (entry) {
-            .unchanged => |u| {
-                if (u.moved) |m| {
-                    std.debug.print("= {s} (moved {d} -> {d})\n", .{
-                        u.decl.name orelse "<anon>",
-                        m.from_idx,
-                        m.to_idx,
-                    });
-                } else {
-                    std.debug.print("= {s}\n", .{u.decl.name orelse "<anon>"});
-                }
-            },
-            .added => |a| {
-                std.debug.print("+ {s}\n", .{a.decl.name orelse "<anon>"});
-            },
-            .removed => |r| {
-                std.debug.print("- {s}\n", .{r.decl.name orelse "<anon>"});
-            },
-            .changed => |c| {
-                const move_tag: []const u8 = if (c.moved != null) " (moved)" else "";
-                std.debug.print("~ {s}{s}\n", .{ c.new.name orelse "<anon>", move_tag });
-                switch (c.body) {
-                    .leaf => |script| {
-                        indent(depth + 1);
-                        if (script.isCommentOnly()) {
-                            std.debug.print("(comment-only, {d} edits, cost {d})\n", .{ script.edits.len, script.total_cost });
-                        } else {
-                            std.debug.print("({d} edits, cost {d})\n", .{ script.edits.len, script.total_cost });
-                        }
-                    },
-                    .container => |children| printEntries(children, depth + 1),
-                }
-            },
-        }
-    }
-}
-
-fn indent(depth: usize) void {
-    var i: usize = 0;
-    while (i < depth) : (i += 1) std.debug.print("  ", .{});
 }

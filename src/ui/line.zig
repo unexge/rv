@@ -500,7 +500,7 @@ fn blankLine(indent: u8) StyledLine {
 /// Returned lines are arena-owned and caller-owned; they go straight into
 /// the unified output or get re-paired for split mode (see
 /// `appendLeafHunkPairs`).
-fn buildLeafHunk(
+pub fn buildLeafHunk(
     arena: std.mem.Allocator,
     file_diff: *const rv.FileDiff,
     script: rv.EditScript,
@@ -593,7 +593,7 @@ fn appendLeafHunkPairs(
     try flushPendingPairs(arena, out, &pending_left, &pending_right, indent);
 }
 
-fn flushPendingPairs(
+pub fn flushPendingPairs(
     arena: std.mem.Allocator,
     out: *std.ArrayList(LinePair),
     left: *std.ArrayList(StyledLine),
@@ -610,7 +610,7 @@ fn flushPendingPairs(
     right.clearRetainingCapacity();
 }
 
-fn declHeaderText(
+pub fn declHeaderText(
     arena: std.mem.Allocator,
     decl: rv.Decl,
     moved: ?rv.MoveInfo,
@@ -765,7 +765,7 @@ fn mapNovelsToLine(
 /// every atom (including leading/trailing trivia comments). Output is in
 /// source order. Unclassifiable atoms still emit a span with `.other` so
 /// the theme's `.other` policy (= keep base style) runs uniformly.
-fn collectHighlights(
+pub fn collectHighlights(
     arena: std.mem.Allocator,
     list: *const rv.List,
     language: rv.LanguageId,
@@ -808,7 +808,7 @@ fn appendAtomHighlight(
 /// spans outside the line, clips any that straddle the line end, and
 /// translates raw offsets into post-tab-expansion display offsets. Keeps
 /// the `class` unchanged.
-fn mapHighlightsToLine(
+pub fn mapHighlightsToLine(
     arena: std.mem.Allocator,
     raw_line: []const u8,
     line_abs_start: u32,
@@ -866,7 +866,7 @@ fn rawToDisplay(raw_line: []const u8, raw_offset: usize) usize {
 
 const tab_width: usize = 4;
 
-fn expandTabs(arena: std.mem.Allocator, line: []const u8) ![]const u8 {
+pub fn expandTabs(arena: std.mem.Allocator, line: []const u8) ![]const u8 {
     const tab_count = std.mem.count(u8, line, "\t");
     if (tab_count == 0) return arena.dupe(u8, line);
 

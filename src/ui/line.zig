@@ -40,6 +40,7 @@ const theme = @import("theme.zig");
 
 pub const AppState = state_mod.AppState;
 pub const DeclId = state_mod.DeclId;
+pub const GapId = state_mod.GapId;
 pub const declId = state_mod.declId;
 pub const TokenClass = theme.TokenClass;
 
@@ -72,10 +73,23 @@ pub const Marker = enum(u8) {
 
 /// Classification of a line for styling. `decl_header` lines get bold + color;
 /// `source` lines get a softer fg to keep the header scannable.
+///
+/// `.decl_anchor` and `.elided` are emitted only by the file-wide builder
+/// (`file_view.zig`) and rendered through dedicated helpers, not via
+/// `Marker.gutter()` / `styleFor`. The decl-axis builder in this module
+/// never emits them.
 pub const LineKind = enum {
     decl_header,
     source,
     blank,
+    /// Thin landmark row above a decl's first source line in the file-
+    /// wide view. Carries the decl's name + `ts_kind` so existing
+    /// `n`/`p`/`N`/`P` jump navigation still has anchors to land on.
+    decl_anchor,
+    /// Collapsed run of unchanged lines in the file-wide view, rendered
+    /// as `… N unchanged lines …`. Carries `gap_id` so toggling can
+    /// flip the corresponding entry in `AppState.expanded_gaps`.
+    elided,
 };
 
 pub const StyledLine = struct {
@@ -101,6 +115,19 @@ pub const StyledLine = struct {
     /// for collapse/expand toggles); `null` on source, blank, and file-
     /// header lines.
     decl_id: ?DeclId = null,
+    /// 1-indexed left-side (pre-image) line number. Populated by the
+    /// file-wide builder on rows that exist in the left source: removed,
+    /// context, and the left side of a paired change. `null` on `.added`,
+    /// `.decl_anchor`, `.elided`, and `.blank` rows.
+    line_no_left: ?u32 = null,
+    /// 1-indexed right-side (post-image) line number. Populated by the
+    /// file-wide builder on rows that exist in the right source: added,
+    /// context, and the right side of a paired change. `null` on
+    /// `.removed`, `.decl_anchor`, `.elided`, and `.blank` rows.
+    line_no_right: ?u32 = null,
+    /// Stable identity of the elided gap this row represents. Set only
+    /// on `.elided` rows; `null` everywhere else.
+    gap_id: ?GapId = null,
 };
 
 pub const ByteSpan = struct { start: u32, end: u32 };
@@ -1595,6 +1622,9 @@ test "build: decl_header lines carry a decl_id; source/blank lines do not" {
             @as(?DeclId, null),
             ln.decl_id,
         ),
+        // Decl-axis builder never emits these; they are exclusive to
+        // `file_view.zig`.
+        .decl_anchor, .elided => unreachable,
     };
     try testing.expect(header_count >= 1);
 }
@@ -1701,6 +1731,9 @@ test "highlights: decl headers and blanks carry no highlights" {
     for (result.view.unified) |ln| switch (ln.kind) {
         .decl_header, .blank => try testing.expectEqual(@as(usize, 0), ln.highlights.len),
         .source => {},
+        // Decl-axis builder never emits these; they are exclusive to
+        // `file_view.zig`.
+        .decl_anchor, .elided => unreachable,
     };
 }
 

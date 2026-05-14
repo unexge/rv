@@ -12,6 +12,12 @@ const rv = @import("rv");
 /// `FileDiff` and unique across both the left and right SSTs.
 pub const DeclId = u64;
 
+/// Stable identity for an elided gap (a collapsed run of unchanged
+/// lines) in the file-wide view. Built by `elide.zig` from the byte
+/// offsets of the gap's first line so it survives rebuilds as long as
+/// the surrounding source doesn't shift.
+pub const GapId = u64;
+
 /// Derive the `DeclId` for a decl. For `.changed` entries the caller
 /// should pass `new`; for `.unchanged` / `.added` / `.removed` the unique
 /// `decl` field.
@@ -30,13 +36,22 @@ pub const AppState = struct {
     /// not emitted in the first place, so collapsing them would add a
     /// misleading `[…]` suffix with no visible effect).
     collapsed: std.AutoHashMap(DeclId, void),
+    /// Set of expanded gap ids. Membership = expanded (show the run);
+    /// absence = collapsed (show the `… N unchanged lines …` row).
+    /// Default is collapsed because the file-wide builder always emits
+    /// gaps in their collapsed form first.
+    expanded_gaps: std.AutoHashMap(GapId, void),
 
     pub fn init(gpa: std.mem.Allocator) AppState {
-        return .{ .collapsed = .init(gpa) };
+        return .{
+            .collapsed = .init(gpa),
+            .expanded_gaps = .init(gpa),
+        };
     }
 
     pub fn deinit(self: *AppState) void {
         self.collapsed.deinit();
+        self.expanded_gaps.deinit();
     }
 
     pub fn isCollapsed(self: *const AppState, id: DeclId) bool {
@@ -62,6 +77,48 @@ pub const AppState = struct {
     /// `[…]` suffix.
     pub fn collapseAll(self: *AppState, file_diff: *const rv.FileDiff) !void {
         try collapseEntries(self, file_diff.entries);
+    }
+
+    pub fn isGapExpanded(self: *const AppState, id: GapId) bool {
+        return self.expanded_gaps.contains(id);
+    }
+
+    /// Flip the expansion state for gap `id`. Returns the new state
+    /// (true = expanded, false = collapsed).
+    pub fn toggleGap(self: *AppState, id: GapId) !bool {
+        const gop = try self.expanded_gaps.getOrPut(id);
+        if (gop.found_existing) {
+            _ = self.expanded_gaps.remove(id);
+            return false;
+        }
+        return true;
+    }
+
+    /// Drop every expanded-gap id, returning the file view to its
+    /// fully-collapsed (default) state.
+    pub fn collapseAllGaps(self: *AppState) void {
+        self.expanded_gaps.clearRetainingCapacity();
+    }
+
+    /// Walk the given view and mark every `.elided` row's `gap_id` as
+    /// expanded. `view` is the `line.View` union; it's taken as `anytype`
+    /// to avoid an import cycle (line.zig already imports state.zig).
+    pub fn expandAllGaps(self: *AppState, view: anytype) !void {
+        switch (view) {
+            .unified => |lines| for (lines) |ln| {
+                if (ln.kind == .elided) {
+                    if (ln.gap_id) |id| try self.expanded_gaps.put(id, {});
+                }
+            },
+            .split => |pairs| for (pairs) |p| {
+                if (p.left.kind == .elided) {
+                    if (p.left.gap_id) |id| try self.expanded_gaps.put(id, {});
+                }
+                if (p.right.kind == .elided) {
+                    if (p.right.gap_id) |id| try self.expanded_gaps.put(id, {});
+                }
+            },
+        }
     }
 };
 
@@ -103,6 +160,28 @@ test "AppState.expandAll: clears all collapsed ids" {
     state.expandAll();
     try testing.expect(!state.isCollapsed(1));
     try testing.expect(!state.isCollapsed(2));
+}
+
+test "AppState.toggleGap: flips membership and reports new state" {
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+
+    try testing.expect(!state.isGapExpanded(7));
+    try testing.expectEqual(true, try state.toggleGap(7));
+    try testing.expect(state.isGapExpanded(7));
+    try testing.expectEqual(false, try state.toggleGap(7));
+    try testing.expect(!state.isGapExpanded(7));
+}
+
+test "AppState.collapseAllGaps: clears all expanded gap ids" {
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+
+    _ = try state.toggleGap(1);
+    _ = try state.toggleGap(2);
+    state.collapseAllGaps();
+    try testing.expect(!state.isGapExpanded(1));
+    try testing.expect(!state.isGapExpanded(2));
 }
 
 test "AppState.collapseAll: walks added/removed/changed, skips unchanged" {

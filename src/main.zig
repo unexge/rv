@@ -12,7 +12,9 @@ const session_mod = @import("ui/session.zig");
 // Ensure the ui + vcs modules' inline tests are visible to `zig build test`.
 comptime {
     _ = @import("ui/app.zig");
+    _ = @import("ui/elide.zig");
     _ = @import("ui/file_list.zig");
+    _ = @import("ui/file_view.zig");
     _ = @import("ui/hunk.zig");
     _ = @import("ui/line.zig");
     _ = @import("ui/search.zig");

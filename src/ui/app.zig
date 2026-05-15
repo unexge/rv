@@ -29,6 +29,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 
 const rv = @import("rv");
+const file_view_mod = @import("file_view.zig");
 const line_mod = @import("line.zig");
 const theme = @import("theme.zig");
 
@@ -44,6 +45,7 @@ const BuildResult = line_mod.BuildResult;
 const DeclIndexEntry = line_mod.DeclIndexEntry;
 const AppState = line_mod.AppState;
 const DeclId = line_mod.DeclId;
+const GapId = line_mod.GapId;
 
 const Event = union(enum) {
     key_press: vaxis.Key,
@@ -235,7 +237,11 @@ pub fn handleDiffPaneKey(
         try rebuild(gpa, built, file_diff, mode.*, state);
         relocateCursor(state, built.view, anchor, viewport);
     } else if (key.matches(vaxis.Key.space, .{}) or key.matches(vaxis.Key.enter, .{})) {
-        if (focusedDeclId(built.view, state.cursor_y)) |id| {
+        // Elided rows expand/collapse via the gap-id channel; everything
+        // else falls through to the existing decl collapse-toggle path.
+        if (focusedRowKind(built.view, state.cursor_y) == .elided) {
+            try toggleFocusedGap(gpa, built, file_diff, state, mode.*, viewport);
+        } else if (focusedDeclId(built.view, state.cursor_y)) |id| {
             _ = try state.toggle(id);
             try rebuild(gpa, built, file_diff, mode.*, state);
             relocateCursor(state, built.view, id, viewport);
@@ -243,11 +249,13 @@ pub fn handleDiffPaneKey(
     } else if (key.matches('[', .{})) {
         const anchor = focusedDeclId(built.view, state.cursor_y);
         try state.collapseAll(file_diff);
+        state.collapseAllGaps();
         try rebuild(gpa, built, file_diff, mode.*, state);
         relocateCursor(state, built.view, anchor, viewport);
     } else if (key.matches(']', .{})) {
         const anchor = focusedDeclId(built.view, state.cursor_y);
         state.expandAll();
+        try state.expandAllGaps(built.view);
         try rebuild(gpa, built, file_diff, mode.*, state);
         relocateCursor(state, built.view, anchor, viewport);
     } else if (key.matches('n', .{})) {
@@ -415,7 +423,7 @@ fn focusedDeclIdLines(lines: []const StyledLine, cursor_y: usize) ?DeclId {
     var i: usize = @min(cursor_y, lines.len - 1) + 1;
     while (i > 0) {
         i -= 1;
-        if (lines[i].kind == .decl_header) {
+        if (isAnchorOrHeaderKind(lines[i].kind)) {
             if (lines[i].decl_id) |id| return id;
         }
     }
@@ -427,8 +435,24 @@ fn focusedDeclIdPairs(pairs: []const LinePair, cursor_y: usize) ?DeclId {
     var i: usize = @min(cursor_y, pairs.len - 1) + 1;
     while (i > 0) {
         i -= 1;
-        if (pairs[i].headerSide()) |side| if (side.decl_id) |id| return id;
+        if (anchorOrHeaderSide(pairs[i])) |side| if (side.decl_id) |id| return id;
     }
+    return null;
+}
+
+/// Decl-axis builder emits `.decl_header`; file-wide builder emits
+/// `.decl_anchor`. Both kinds carry a `decl_id` and serve as the
+/// "enclosing decl" landmark when walking back from a source row.
+fn isAnchorOrHeaderKind(kind: LineKind) bool {
+    return kind == .decl_header or kind == .decl_anchor;
+}
+
+/// Split-mode counterpart of `LinePair.headerSide` that also matches
+/// `.decl_anchor`. Picks the right side first so mirrored anchors
+/// (changed/unchanged) keep their existing right-side preference.
+fn anchorOrHeaderSide(p: LinePair) ?StyledLine {
+    if (isAnchorOrHeaderKind(p.right.kind)) return p.right;
+    if (isAnchorOrHeaderKind(p.left.kind)) return p.left;
     return null;
 }
 
@@ -436,19 +460,106 @@ fn findDeclRow(view: View, id: DeclId) ?usize {
     return switch (view) {
         .unified => |lines| blk: {
             for (lines, 0..) |ln, i| {
-                if (ln.kind != .decl_header) continue;
+                if (!isAnchorOrHeaderKind(ln.kind)) continue;
                 if (ln.decl_id) |did| if (did == id) break :blk i;
             }
             break :blk null;
         },
         .split => |pairs| blk: {
             for (pairs, 0..) |p, i| {
-                const side = p.headerSide() orelse continue;
+                const side = anchorOrHeaderSide(p) orelse continue;
                 if (side.decl_id) |did| if (did == id) break :blk i;
             }
             break :blk null;
         },
     };
+}
+
+/// `LineKind` of the row currently under the cursor, or `null` when the
+/// view is empty / the cursor sits past the end. In split mode an active
+/// non-blank side wins so an `.added` anchor on the right still reads as
+/// `.decl_anchor` even though its left filler has `.kind = .blank`.
+fn focusedRowKind(view: View, cursor_y: usize) ?LineKind {
+    return switch (view) {
+        .unified => |lines| if (cursor_y < lines.len) lines[cursor_y].kind else null,
+        .split => |pairs| if (cursor_y < pairs.len) blk: {
+            const p = pairs[cursor_y];
+            if (p.right.kind != .blank) break :blk p.right.kind;
+            break :blk p.left.kind;
+        } else null,
+    };
+}
+
+/// `gap_id` of the row under the cursor when it is an `.elided` row, else
+/// `null`. Split mode mirrors `.elided` rows on both sides; either side's
+/// id is fine, but we prefer the right (post-image) for symmetry with
+/// `focusedRowKind`.
+fn focusedGapId(view: View, cursor_y: usize) ?GapId {
+    return switch (view) {
+        .unified => |lines| if (cursor_y < lines.len) lines[cursor_y].gap_id else null,
+        .split => |pairs| if (cursor_y < pairs.len) blk: {
+            const p = pairs[cursor_y];
+            if (p.right.kind == .elided) break :blk p.right.gap_id;
+            if (p.left.kind == .elided) break :blk p.left.gap_id;
+            break :blk null;
+        } else null,
+    };
+}
+
+/// Find the row of the `.elided` row whose `gap_id` matches `id`, or
+/// `null` if the gap is no longer collapsed (was just expanded).
+fn findGapRow(view: View, id: GapId) ?usize {
+    return switch (view) {
+        .unified => |lines| blk: {
+            for (lines, 0..) |ln, i| {
+                if (ln.kind != .elided) continue;
+                if (ln.gap_id) |gid| if (gid == id) break :blk i;
+            }
+            break :blk null;
+        },
+        .split => |pairs| blk: {
+            for (pairs, 0..) |p, i| {
+                if (p.right.kind == .elided) {
+                    if (p.right.gap_id) |gid| if (gid == id) break :blk i;
+                }
+                if (p.left.kind == .elided) {
+                    if (p.left.gap_id) |gid| if (gid == id) break :blk i;
+                }
+            }
+            break :blk null;
+        },
+    };
+}
+
+/// Flip the focused gap's expansion state, rebuild the view, and snap the
+/// cursor onto the row that the toggled gap now occupies. When the gap is
+/// expanded the synthetic `.elided` row vanishes; the cursor stays at the
+/// same row index (which is now the first revealed source line). When the
+/// gap is re-collapsed the cursor lands back on the new `.elided` row.
+fn toggleFocusedGap(
+    gpa: Allocator,
+    built: *BuildResult,
+    file_diff: *const rv.FileDiff,
+    state: *AppState,
+    mode: Mode,
+    viewport: u16,
+) !void {
+    const gap_id = focusedGapId(built.view, state.cursor_y) orelse return;
+    _ = try state.toggleGap(gap_id);
+    try rebuild(gpa, built, file_diff, mode, state);
+
+    const total = rowCountOfView(built.view);
+    if (total == 0) {
+        state.cursor_y = 0;
+        state.scroll_y = 0;
+        return;
+    }
+    if (findGapRow(built.view, gap_id)) |row| {
+        state.cursor_y = row;
+    } else {
+        state.cursor_y = @min(state.cursor_y, total - 1);
+    }
+    followCursor(state, viewport, total);
 }
 
 fn rowCountOfView(view: View) usize {
@@ -721,6 +832,14 @@ fn drawSplitBody(
 // ── draw: shared ───────────────────────────────────────────────────────────
 
 fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
+    if (sl.kind == .elided) {
+        drawElidedLine(body, row, sl, cursor);
+        return;
+    }
+    if (sl.kind == .decl_anchor) {
+        drawDeclAnchor(body, row, sl, cursor);
+        return;
+    }
     if (sl.marker == .blank and sl.kind == .blank) {
         if (cursor) {
             _ = body.print(&.{.{
@@ -747,6 +866,62 @@ fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
     const text_col: u16 = 2 + indent_cols;
 
     drawStyledText(body, row, text_col, sl, base_style);
+}
+
+/// Render a `… N unchanged lines …` row. Centred dim italic text with a
+/// `⋯` gutter to read as a structural break rather than a source line.
+/// When focused, the gutter swaps to `>` and the body text loses the dim
+/// bit so it reads as "press space to expand".
+fn drawElidedLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
+    const gutter_char: []const u8 = if (cursor) ">" else "\u{22EF}";
+    const gutter_style: vaxis.Style = if (cursor)
+        .{ .bold = true }
+    else
+        .{ .dim = true };
+    _ = body.print(&.{.{
+        .text = gutter_char,
+        .style = gutter_style,
+    }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
+
+    const text_style: vaxis.Style = if (cursor)
+        .{ .italic = true, .bold = true }
+    else
+        .{ .dim = true, .italic = true };
+
+    // Centre `sl.text` inside the body width past the gutter+space prefix.
+    // Use vaxis's grapheme-width function so the multi-byte ellipsis
+    // (`\u{2026}`) counts as one column rather than three (its UTF-8 byte
+    // length); without this the text would drift right of centre.
+    const prefix_cols: u16 = 2;
+    const avail: u16 = if (body.width > prefix_cols) body.width - prefix_cols else 0;
+    const text_cols: u16 = @min(avail, vaxis.gwidth.gwidth(sl.text, .unicode));
+    const pad: u16 = if (avail > text_cols) (avail - text_cols) / 2 else 0;
+    const text_col: u16 = prefix_cols + pad;
+    _ = body.print(&.{.{
+        .text = sl.text,
+        .style = text_style,
+    }}, .{ .row_offset = row, .col_offset = text_col, .wrap = .none });
+}
+
+/// Render a `.decl_anchor` landmark row above a decl's first source line.
+/// Dim italic so it reads as annotation, not a source line. Marker colour
+/// (added/removed/changed) tints the gutter and text. The fixed `\u{25B8}`
+/// gutter (right-pointing triangle) keeps it visually distinct from
+/// `.decl_header`'s `=`/`+`/`-`/`~` gutter.
+fn drawDeclAnchor(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
+    const base_style = styleFor(sl);
+    const gutter_char: []const u8 = if (cursor) ">" else "\u{25B8}";
+    _ = body.print(&.{.{
+        .text = gutter_char,
+        .style = base_style,
+    }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
+
+    const indent_cols: u16 = @as(u16, @intCast(sl.indent)) * 2;
+    const text_col: u16 = 2 + indent_cols;
+    _ = body.print(&.{.{
+        .text = sl.text,
+        .style = base_style,
+    }}, .{ .row_offset = row, .col_offset = text_col, .wrap = .none });
 }
 
 /// Paint the text portion of a StyledLine, layering (in priority order):
@@ -854,7 +1029,21 @@ fn novelStyleFor(base: vaxis.Style) vaxis.Style {
 
 /// Colour choice: indexed ANSI so we inherit the user's terminal palette.
 /// Decl headers are bold; source lines are regular weight with a tinted fg.
+/// Decl anchors and elided rows are explicit arms - they read as
+/// annotations rather than source/headers, so they get dim italic with
+/// just enough marker colour to identify added/removed/changed anchors.
 fn styleFor(sl: StyledLine) vaxis.Style {
+    if (sl.kind == .elided) {
+        return .{ .dim = true, .italic = true };
+    }
+    if (sl.kind == .decl_anchor) {
+        return switch (sl.marker) {
+            .added => .{ .fg = .{ .index = 2 }, .dim = true, .italic = true },
+            .removed => .{ .fg = .{ .index = 1 }, .dim = true, .italic = true },
+            .changed => .{ .fg = .{ .index = 3 }, .dim = true, .italic = true },
+            .unchanged, .context, .blank => .{ .dim = true, .italic = true },
+        };
+    }
     const bold = sl.kind == .decl_header;
     return switch (sl.marker) {
         .added => .{ .fg = .{ .index = 2 }, .bold = bold },
@@ -1042,6 +1231,57 @@ test "focusedDeclId: returns id of nearest decl_header at or above cursor" {
 test "focusedDeclId: empty view → null" {
     const view: View = .{ .unified = &.{} };
     try testing.expectEqual(@as(?DeclId, null), focusedDeclId(view, 0));
+}
+
+test "focusedDeclId: returns the anchor's decl_id when cursor is on a decl_anchor or a source row beneath it" {
+    // File-wide builder emits `.decl_anchor` instead of `.decl_header`.
+    // Walking back from a source row must treat anchors as the enclosing
+    // decl landmark.
+    const id_a: DeclId = 0xA1;
+    const id_b: DeclId = 0xB2;
+    const lines = [_]StyledLine{
+        .{ .indent = 0, .marker = .changed, .kind = .decl_anchor, .text = "fn:a", .decl_id = id_a },
+        .{ .indent = 1, .marker = .unchanged, .kind = .source, .text = "  body", .decl_id = id_a },
+        .{ .indent = 1, .marker = .removed, .kind = .source, .text = "  old", .decl_id = id_a },
+        .{ .indent = 0, .marker = .added, .kind = .decl_anchor, .text = "fn:b", .decl_id = id_b },
+        .{ .indent = 1, .marker = .added, .kind = .source, .text = "  body", .decl_id = id_b },
+    };
+    const view: View = .{ .unified = lines[0..] };
+
+    // Cursor directly on the anchor row.
+    try testing.expectEqual(@as(?DeclId, id_a), focusedDeclId(view, 0));
+    // Cursor on a source row beneath the anchor.
+    try testing.expectEqual(@as(?DeclId, id_a), focusedDeclId(view, 1));
+    try testing.expectEqual(@as(?DeclId, id_a), focusedDeclId(view, 2));
+    // Cursor on the next anchor.
+    try testing.expectEqual(@as(?DeclId, id_b), focusedDeclId(view, 3));
+    try testing.expectEqual(@as(?DeclId, id_b), focusedDeclId(view, 4));
+}
+
+test "focusedDeclId split: anchors on either side resolve like headers" {
+    // `.added` anchor sits on the right with a blank on the left;
+    // mirrored anchors sit on both sides.
+    const id_add: DeclId = 0xAD;
+    const id_x: DeclId = 0xC1;
+    const blank: StyledLine = .{ .indent = 0, .marker = .blank, .kind = .blank, .text = "" };
+    const pairs = [_]LinePair{
+        .{
+            .left = blank,
+            .right = .{ .indent = 0, .marker = .added, .kind = .decl_anchor, .text = "fn:add", .decl_id = id_add },
+        },
+        .{
+            .left = .{ .indent = 1, .marker = .added, .kind = .source, .text = "", .decl_id = id_add },
+            .right = .{ .indent = 1, .marker = .added, .kind = .source, .text = "  body", .decl_id = id_add },
+        },
+        .{
+            .left = .{ .indent = 0, .marker = .changed, .kind = .decl_anchor, .text = "fn:x", .decl_id = id_x },
+            .right = .{ .indent = 0, .marker = .changed, .kind = .decl_anchor, .text = "fn:x", .decl_id = id_x },
+        },
+    };
+    const view: View = .{ .split = pairs[0..] };
+    try testing.expectEqual(@as(?DeclId, id_add), focusedDeclId(view, 0));
+    try testing.expectEqual(@as(?DeclId, id_add), focusedDeclId(view, 1));
+    try testing.expectEqual(@as(?DeclId, id_x), focusedDeclId(view, 2));
 }
 
 test "relocateCursor: anchor still in view → cursor snaps onto new row" {
@@ -1508,4 +1748,212 @@ test "drawDiffPane: null header leaves the top header rows untouched" {
     try testing.expect(screen.readCell(0, 1).?.default);
     // Body still paints at row header_rows = 2.
     try testing.expectEqualStrings("+", screen.readCell(0, 2).?.char.grapheme);
+}
+
+// ── decl_anchor / elided integration ────────────────────────────────────
+
+/// Build a real file-wide BuildResult from two source strings so the tests
+/// below exercise the same code paths the runtime uses (anchors emitted
+/// by `file_view.zig`, gaps emitted by `elide.zig`).
+fn buildFileViewForTest(
+    fd: *const rv.FileDiff,
+    state: *const AppState,
+) !BuildResult {
+    return file_view_mod.build(testing.allocator, fd, .unified, state);
+}
+
+/// Index of the first `.elided` row in a unified view, or null when the
+/// view contains no elided rows (e.g. a tiny file with no gaps).
+fn firstElidedRow(lines: []const StyledLine) ?usize {
+    for (lines, 0..) |ln, i| if (ln.kind == .elided) return i;
+    return null;
+}
+
+test "nextDeclRow / prevDeclRow: jump across decl_anchor rows in file-wide view" {
+    // file_view.zig populates `decl_index` from `.decl_anchor` rows, so
+    // the existing forward/backward walk should land on anchor rows just
+    // like it does on `.decl_header` rows in the decl-axis view.
+    const before =
+        \\pub fn a() void {}
+        \\pub fn b() u32 { return 1; }
+        \\pub fn c() void {}
+    ;
+    const after =
+        \\pub fn a() void {}
+        \\pub fn b() u32 { return 2; }
+        \\pub fn c() void {}
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    var built = try buildFileViewForTest(&fd, &state);
+    defer built.deinit();
+
+    // Three decls → three anchor rows in the index.
+    try testing.expectEqual(@as(usize, 3), built.decl_index.len);
+    for (built.decl_index) |e| {
+        try testing.expectEqual(LineKind.decl_anchor, built.view.unified[e.row].kind);
+    }
+
+    // Forward walk visits each anchor in row order and wraps to the first.
+    const r0 = built.decl_index[0].row;
+    const r1 = built.decl_index[1].row;
+    const r2 = built.decl_index[2].row;
+    try testing.expectEqual(@as(?usize, r1), nextDeclRow(built.decl_index, r0, false));
+    try testing.expectEqual(@as(?usize, r2), nextDeclRow(built.decl_index, r1, false));
+    try testing.expectEqual(@as(?usize, r0), nextDeclRow(built.decl_index, r2, false));
+
+    // Backward walk mirrors the forward case.
+    try testing.expectEqual(@as(?usize, r1), prevDeclRow(built.decl_index, r2, false));
+    try testing.expectEqual(@as(?usize, r0), prevDeclRow(built.decl_index, r1, false));
+    try testing.expectEqual(@as(?usize, r2), prevDeclRow(built.decl_index, r0, false));
+}
+
+test "handleDiffPaneKey: space on `.elided` row toggles state.expanded_gaps" {
+    // Long file with one tiny change in the middle so `elide.zig` emits
+    // both leading and trailing `.elided` rows.
+    const before =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub fn c() void {}
+        \\pub fn d() void {}
+        \\pub fn e() u32 { return 1; }
+        \\pub fn f() void {}
+        \\pub fn g() void {}
+        \\pub fn h() void {}
+        \\pub fn i() void {}
+    ;
+    const after =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub fn c() void {}
+        \\pub fn d() void {}
+        \\pub fn e() u32 { return 2; }
+        \\pub fn f() void {}
+        \\pub fn g() void {}
+        \\pub fn h() void {}
+        \\pub fn i() void {}
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    var built = try buildFileViewForTest(&fd, &state);
+    defer built.deinit();
+
+    const elided_row = firstElidedRow(built.view.unified) orelse return error.MissingElided;
+    const elided_gap = built.view.unified[elided_row].gap_id orelse return error.MissingGapId;
+    state.cursor_y = elided_row;
+
+    // Pre-condition: gap is collapsed (default state).
+    try testing.expect(!state.isGapExpanded(elided_gap));
+
+    var mode: Mode = .unified;
+    try handleDiffPaneKey(testing.allocator, keyCp(vaxis.Key.space), &built, &fd, &state, &mode, 30);
+
+    // Post-condition: gap is now expanded.
+    try testing.expect(state.isGapExpanded(elided_gap));
+}
+
+test "handleDiffPaneKey: `[` clears state.expanded_gaps in addition to collapsing decls" {
+    const before = "pub fn a() void {}\npub fn b() u32 { return 1; }\n";
+    const after = "pub fn a() void {}\npub fn b() u32 { return 2; }\n";
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+
+    // Pre-populate `expanded_gaps` with two arbitrary ids so we can verify
+    // `[` empties the set even when the current view has no `.elided` rows
+    // (decl-axis view via line_mod.build's rebuild, or any other reason).
+    _ = try state.toggleGap(0xAA);
+    _ = try state.toggleGap(0xBB);
+    try testing.expectEqual(@as(usize, 2), state.expanded_gaps.count());
+
+    var built = try buildFileViewForTest(&fd, &state);
+    defer built.deinit();
+
+    var mode: Mode = .unified;
+    try handleDiffPaneKey(testing.allocator, keyCp('['), &built, &fd, &state, &mode, 30);
+
+    // `expanded_gaps` is now empty and the changed decl is collapsed.
+    try testing.expectEqual(@as(usize, 0), state.expanded_gaps.count());
+    var any_collapsed = false;
+    for (fd.entries) |e| if (e == .changed) {
+        if (state.isCollapsed(line_mod.declId(e.changed.new))) any_collapsed = true;
+    };
+    try testing.expect(any_collapsed);
+}
+
+test "handleDiffPaneKey: `]` expands every gap currently in the view" {
+    const before =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub fn c() void {}
+        \\pub fn d() void {}
+        \\pub fn e() u32 { return 1; }
+        \\pub fn f() void {}
+        \\pub fn g() void {}
+        \\pub fn h() void {}
+        \\pub fn i() void {}
+    ;
+    const after =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub fn c() void {}
+        \\pub fn d() void {}
+        \\pub fn e() u32 { return 2; }
+        \\pub fn f() void {}
+        \\pub fn g() void {}
+        \\pub fn h() void {}
+        \\pub fn i() void {}
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    var built = try buildFileViewForTest(&fd, &state);
+    defer built.deinit();
+
+    // Collect every gap_id currently in the (collapsed) view.
+    var gap_ids: std.ArrayList(GapId) = .empty;
+    defer gap_ids.deinit(testing.allocator);
+    for (built.view.unified) |ln| if (ln.kind == .elided) {
+        if (ln.gap_id) |id| try gap_ids.append(testing.allocator, id);
+    };
+    try testing.expect(gap_ids.items.len >= 1);
+
+    var mode: Mode = .unified;
+    try handleDiffPaneKey(testing.allocator, keyCp(']'), &built, &fd, &state, &mode, 30);
+
+    // Every gap that was in the original view is now flagged expanded.
+    for (gap_ids.items) |id| try testing.expect(state.isGapExpanded(id));
+}
+
+test "toggleFocusedGap: cursor on non-elided row is a no-op" {
+    // Cursor not on an elided row → `focusedGapId` returns null and the
+    // helper short-circuits without touching state. Belt-and-suspenders
+    // check so handleDiffPaneKey's dispatch can rely on the early exit.
+    const before = "pub fn a() void {}\n";
+    const after = "pub fn a() u32 { return 1; }\n";
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    var built = try buildFileViewForTest(&fd, &state);
+    defer built.deinit();
+
+    // Park the cursor on the changed `.decl_anchor` row, which is the
+    // first row in this short file.
+    state.cursor_y = 0;
+    try testing.expectEqual(LineKind.decl_anchor, built.view.unified[0].kind);
+
+    try toggleFocusedGap(testing.allocator, &built, &fd, &state, .unified, 30);
+    try testing.expectEqual(@as(usize, 0), state.expanded_gaps.count());
 }

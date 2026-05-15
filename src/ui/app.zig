@@ -31,6 +31,7 @@ const vaxis = @import("vaxis");
 const rv = @import("rv");
 const file_view_mod = @import("file_view.zig");
 const line_mod = @import("line.zig");
+const summary = @import("summary.zig");
 const theme = @import("theme.zig");
 
 const Allocator = std.mem.Allocator;
@@ -70,6 +71,17 @@ pub const DiffHeader = struct {
     stats: []const u8,
 };
 
+/// Pluggable line builder. Both `line.build` and `file_view.build`
+/// satisfy this signature, so callers (path mode in `app.run`, repo
+/// mode in `session.zig`) can pick the right axis without `app.zig`
+/// taking a dependency on the higher-level pane classification.
+pub const BuildFn = *const fn (
+    gpa: Allocator,
+    file_diff: *const rv.FileDiff,
+    mode: line_mod.Mode,
+    state: *const AppState,
+) anyerror!BuildResult;
+
 /// Run the diff UI to completion. Returns when the user quits.
 ///
 /// `before_path` and `after_path` are shown in the header; they are not
@@ -98,21 +110,16 @@ pub fn run(
     });
 
     var mode: Mode = .unified;
-    var current = try line_mod.build(gpa, file_diff, mode, &state);
+    // Path mode always treats the two arbitrary files as a single
+    // "modified" comparison, so we use the file-wide builder unconditionally.
+    // The same builder is reused on every rebuild via `handleDiffPaneKey`.
+    const build_fn: BuildFn = &file_view_mod.build;
+    var current = try build_fn(gpa, file_diff, mode, &state);
     defer current.deinit();
 
     // Stats are a property of the underlying FileDiff, not of the collapse
     // state or mode, so we format the legend exactly once.
-    const stats_text = try std.fmt.allocPrint(
-        la,
-        " +{d}  -{d}  ~{d}  ={d}    (j/k: move, n/p: decl, N/P: changed, g/G: first/last, space: fold, v: split, q: quit)",
-        .{
-            current.stats.added,
-            current.stats.removed,
-            current.stats.changed,
-            current.stats.unchanged,
-        },
-    );
+    const stats_text = try summary.formatModifiedHeader(la, file_diff.entries);
 
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -139,7 +146,7 @@ pub fn run(
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) break;
                 if (key.matches('q', .{})) break;
-                try handleDiffPaneKey(gpa, key, &current, file_diff, &state, &mode, viewport);
+                try handleDiffPaneKey(gpa, key, &current, file_diff, &state, &mode, viewport, build_fn);
             },
             .mouse => |m| handleDiffPaneMouse(&state, m, viewport, current.rowCount()),
             .winsize => |ws| try vx.resize(gpa, tty.writer(), ws),
@@ -230,33 +237,34 @@ pub fn handleDiffPaneKey(
     state: *AppState,
     mode: *Mode,
     viewport: u16,
+    build_fn: BuildFn,
 ) !void {
     if (key.matches('v', .{})) {
         const anchor = focusedDeclId(built.view, state.cursor_y);
         mode.* = if (mode.* == .unified) .split else .unified;
-        try rebuild(gpa, built, file_diff, mode.*, state);
+        try rebuild(gpa, built, file_diff, mode.*, state, build_fn);
         relocateCursor(state, built.view, anchor, viewport);
     } else if (key.matches(vaxis.Key.space, .{}) or key.matches(vaxis.Key.enter, .{})) {
         // Elided rows expand/collapse via the gap-id channel; everything
         // else falls through to the existing decl collapse-toggle path.
         if (focusedRowKind(built.view, state.cursor_y) == .elided) {
-            try toggleFocusedGap(gpa, built, file_diff, state, mode.*, viewport);
+            try toggleFocusedGap(gpa, built, file_diff, state, mode.*, viewport, build_fn);
         } else if (focusedDeclId(built.view, state.cursor_y)) |id| {
             _ = try state.toggle(id);
-            try rebuild(gpa, built, file_diff, mode.*, state);
+            try rebuild(gpa, built, file_diff, mode.*, state, build_fn);
             relocateCursor(state, built.view, id, viewport);
         }
     } else if (key.matches('[', .{})) {
         const anchor = focusedDeclId(built.view, state.cursor_y);
         try state.collapseAll(file_diff);
         state.collapseAllGaps();
-        try rebuild(gpa, built, file_diff, mode.*, state);
+        try rebuild(gpa, built, file_diff, mode.*, state, build_fn);
         relocateCursor(state, built.view, anchor, viewport);
     } else if (key.matches(']', .{})) {
         const anchor = focusedDeclId(built.view, state.cursor_y);
         state.expandAll();
         try state.expandAllGaps(built.view);
-        try rebuild(gpa, built, file_diff, mode.*, state);
+        try rebuild(gpa, built, file_diff, mode.*, state, build_fn);
         relocateCursor(state, built.view, anchor, viewport);
     } else if (key.matches('n', .{})) {
         jumpDecl(state, built.decl_index, .forward, false, viewport, built.rowCount());
@@ -293,11 +301,12 @@ fn rebuild(
     file_diff: *const rv.FileDiff,
     mode: Mode,
     state: *const AppState,
+    build_fn: BuildFn,
 ) !void {
     // Build the replacement *before* freeing the old one so a mid-build
     // failure leaves `current` intact and the `defer current.deinit()` in
     // `run` still frees something valid.
-    var next = try line_mod.build(gpa, file_diff, mode, state);
+    var next = try build_fn(gpa, file_diff, mode, state);
     current.deinit();
     current.* = next;
     next = undefined;
@@ -543,10 +552,11 @@ fn toggleFocusedGap(
     state: *AppState,
     mode: Mode,
     viewport: u16,
+    build_fn: BuildFn,
 ) !void {
     const gap_id = focusedGapId(built.view, state.cursor_y) orelse return;
     _ = try state.toggleGap(gap_id);
-    try rebuild(gpa, built, file_diff, mode, state);
+    try rebuild(gpa, built, file_diff, mode, state, build_fn);
 
     const total = rowCountOfView(built.view);
     if (total == 0) {
@@ -1355,7 +1365,7 @@ test "collapse integration: rebuild preserves focus, scroll counts visible lines
 
     // Toggle it collapsed and rebuild.
     _ = try state.toggle(focused);
-    try rebuild(testing.allocator, &current, &fd, .unified, &state);
+    try rebuild(testing.allocator, &current, &fd, .unified, &state, &line_mod.build);
     relocateCursor(&state, current.view, focused, 20);
 
     // Row count dropped (body lines hidden) and cursor still points at
@@ -1372,7 +1382,7 @@ test "collapse integration: rebuild preserves focus, scroll counts visible lines
 
     // Expand-all restores full row count.
     state.expandAll();
-    try rebuild(testing.allocator, &current, &fd, .unified, &state);
+    try rebuild(testing.allocator, &current, &fd, .unified, &state, &line_mod.build);
     try testing.expectEqual(expanded_rows, current.rowCount());
 }
 
@@ -1390,14 +1400,14 @@ test "collapse integration: [ collapses all changed decls, ] expands" {
     defer current.deinit();
 
     try state.collapseAll(&fd);
-    try rebuild(testing.allocator, &current, &fd, .unified, &state);
+    try rebuild(testing.allocator, &current, &fd, .unified, &state, &line_mod.build);
 
     // Only headers remain.
     for (current.view.unified) |ln| try testing.expectEqual(LineKind.decl_header, ln.kind);
     try testing.expect(current.view.unified.len >= 2);
 
     state.expandAll();
-    try rebuild(testing.allocator, &current, &fd, .unified, &state);
+    try rebuild(testing.allocator, &current, &fd, .unified, &state, &line_mod.build);
 
     var saw_source = false;
     for (current.view.unified) |ln| if (ln.kind == .source) {
@@ -1852,7 +1862,7 @@ test "handleDiffPaneKey: space on `.elided` row toggles state.expanded_gaps" {
     try testing.expect(!state.isGapExpanded(elided_gap));
 
     var mode: Mode = .unified;
-    try handleDiffPaneKey(testing.allocator, keyCp(vaxis.Key.space), &built, &fd, &state, &mode, 30);
+    try handleDiffPaneKey(testing.allocator, keyCp(vaxis.Key.space), &built, &fd, &state, &mode, 30, &file_view_mod.build);
 
     // Post-condition: gap is now expanded.
     try testing.expect(state.isGapExpanded(elided_gap));
@@ -1878,7 +1888,7 @@ test "handleDiffPaneKey: `[` clears state.expanded_gaps in addition to collapsin
     defer built.deinit();
 
     var mode: Mode = .unified;
-    try handleDiffPaneKey(testing.allocator, keyCp('['), &built, &fd, &state, &mode, 30);
+    try handleDiffPaneKey(testing.allocator, keyCp('['), &built, &fd, &state, &mode, 30, &file_view_mod.build);
 
     // `expanded_gaps` is now empty and the changed decl is collapsed.
     try testing.expectEqual(@as(usize, 0), state.expanded_gaps.count());
@@ -1929,7 +1939,7 @@ test "handleDiffPaneKey: `]` expands every gap currently in the view" {
     try testing.expect(gap_ids.items.len >= 1);
 
     var mode: Mode = .unified;
-    try handleDiffPaneKey(testing.allocator, keyCp(']'), &built, &fd, &state, &mode, 30);
+    try handleDiffPaneKey(testing.allocator, keyCp(']'), &built, &fd, &state, &mode, 30, &file_view_mod.build);
 
     // Every gap that was in the original view is now flagged expanded.
     for (gap_ids.items) |id| try testing.expect(state.isGapExpanded(id));
@@ -1954,6 +1964,6 @@ test "toggleFocusedGap: cursor on non-elided row is a no-op" {
     state.cursor_y = 0;
     try testing.expectEqual(LineKind.decl_anchor, built.view.unified[0].kind);
 
-    try toggleFocusedGap(testing.allocator, &built, &fd, &state, .unified, 30);
+    try toggleFocusedGap(testing.allocator, &built, &fd, &state, .unified, 30, &file_view_mod.build);
     try testing.expectEqual(@as(usize, 0), state.expanded_gaps.count());
 }

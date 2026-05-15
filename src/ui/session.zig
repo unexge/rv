@@ -27,13 +27,15 @@ const vcs = @import("../vcs/mod.zig");
 
 const app = @import("app.zig");
 const file_list = @import("file_list.zig");
+const file_view = @import("file_view.zig");
 const line_mod = @import("line.zig");
+const summary = @import("summary.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const Focus = enum { file_list, diff };
 
-pub const SummaryDirection = enum { added, removed };
+pub const SummaryDirection = summary.SummaryDirection;
 
 /// Classified, draw-ready view of the currently-selected file. Values
 /// are valid until the next `currentView` call.
@@ -229,6 +231,39 @@ fn summarize(entries: []const rv.DeclDiff) file_list.DeclSummary {
     return s;
 }
 
+/// Pick the line builder for `view`. `.diff` (modified files) uses the
+/// file-wide builder so users see the whole file with ±3 context
+/// windows and elidable gaps. Whole-file added/deleted summaries keep
+/// the decl-axis builder because there's nothing to elide and the
+/// existing pre-collapsed list is the right shape. `.placeholder` has
+/// no FileDiff to build, so the dispatch returns null.
+///
+/// Single source of truth for the builder choice; reused by
+/// `handleDiffKey` so the rebuild path (collapse / mode flip) can't
+/// drift from the initial build.
+fn buildFnForView(view: PaneView) ?app.BuildFn {
+    return switch (view) {
+        .diff => &file_view.build,
+        .summary => &line_mod.build,
+        .placeholder => null,
+    };
+}
+
+fn buildForView(
+    gpa: Allocator,
+    view: PaneView,
+    mode: line_mod.Mode,
+    state: *const line_mod.AppState,
+) !?line_mod.BuildResult {
+    const build_fn = buildFnForView(view) orelse return null;
+    const fd: *const rv.FileDiff = switch (view) {
+        .diff => |d| d,
+        .summary => |s| s.diff,
+        .placeholder => unreachable, // `buildFnForView` returned null above.
+    };
+    return try build_fn(gpa, fd, mode, state);
+}
+
 // ── event loop ────────────────────────────────────────────────────────────
 
 const Event = union(enum) {
@@ -314,17 +349,13 @@ pub fn run(
         // `built.* == null` guard) and diff-pane keys can't mutate
         // invisible cursor state behind a placeholder.
         //
-        // `.summary` reuses the standard diff renderer (with every decl
-        // pre-collapsed in `ensureLoaded`), so it builds like `.diff`.
+        // `.summary` reuses the decl-axis builder (with every decl
+        // pre-collapsed in `ensureLoaded`); `.diff` (modified files)
+        // uses the file-wide builder. `buildForView` picks.
         if (built == null) {
-            const fd: ?*const rv.FileDiff = switch (view) {
-                .diff => |d| d,
-                .summary => |s| s.diff,
-                .placeholder => null,
-            };
-            if (fd) |d| built = try line_mod.build(
+            built = try buildForView(
                 gpa,
-                d,
+                view,
                 session.mode,
                 &session.states[idx].app_state,
             );
@@ -383,6 +414,11 @@ fn handleDiffKey(
     const idx = built_idx;
     const state = &session.states[idx];
     const fd = if (state.diff) |*d| d else return;
+    // `built.* != null` means the previous frame classified this
+    // selection as `.diff` or `.summary`, so `buildFnForView` will
+    // return a real BuildFn here; the `orelse return` is just a
+    // belt-and-suspenders against a future change to the guard above.
+    const build_fn = buildFnForView(session.classify(idx)) orelse return;
     try app.handleDiffPaneKey(
         gpa,
         key,
@@ -391,6 +427,7 @@ fn handleDiffKey(
         &state.app_state,
         &session.mode,
         viewport,
+        build_fn,
     );
 }
 
@@ -480,10 +517,10 @@ fn drawRightPane(
 ) !void {
     if (pane_size.width == 0) return;
     switch (view) {
-        .diff => {
+        .diff => |d| {
             const b = built orelse return;
             const idx = session.list.cursor;
-            const header = try fileHeader(frame_alloc, session.entries[idx], b);
+            const header = try fileHeader(frame_alloc, session.entries[idx], d);
             app.drawDiffPane(
                 win,
                 pane_size,
@@ -539,92 +576,16 @@ fn drawPlaceholderPane(win: vaxis.Window, size: app.PaneSize, msg: []const u8) v
 fn fileHeader(
     arena: Allocator,
     entry: file_list.Entry,
-    built: line_mod.BuildResult,
+    file_diff: *const rv.FileDiff,
 ) !app.DiffHeader {
     // `path` is owned by the repo arena and outlives the frame, so the
     // header can borrow it directly instead of copying.
     const title = entry.change.new_path orelse entry.change.old_path orelse "<?>";
-    const stats = try std.fmt.allocPrint(
-        arena,
-        " +{d}  -{d}  ~{d}  ={d}    (Tab: focus, j/k: move, q: quit)",
-        .{ built.stats.added, built.stats.removed, built.stats.changed, built.stats.unchanged },
-    );
+    const stats = try summary.formatModifiedHeader(arena, file_diff.entries);
     return .{ .title = title, .stats = stats };
 }
 
 // ── summary header ────────────────────────────────────────────────────────
-
-/// Counts of top-level `DeclDiff` entries grouped by `Decl.kind`.
-/// Only the three most common kinds get their own slot; everything else
-/// (imports, test cases, containers, language-specific `other`) is
-/// folded into `other`.
-const DeclKindCounts = struct {
-    function: u32 = 0,
-    binding: u32 = 0,
-    type_alias: u32 = 0,
-    other: u32 = 0,
-};
-
-/// Walk top-level `DeclDiff` entries and tally them by `Decl.kind`.
-/// Only entries matching `direction` contribute: `.added` counts
-/// `.added` variants, `.removed` counts `.removed` variants. Nested
-/// containers aren't recursed - the summary reflects the file-level
-/// change, not a full decl tree.
-fn countDeclKinds(
-    entries: []const rv.DeclDiff,
-    direction: SummaryDirection,
-) DeclKindCounts {
-    var c: DeclKindCounts = .{};
-    for (entries) |e| {
-        const decl: ?rv.Decl = switch (e) {
-            .added => |a| if (direction == .added) a.decl else null,
-            .removed => |r| if (direction == .removed) r.decl else null,
-            .unchanged, .changed => null,
-        };
-        const d = decl orelse continue;
-        switch (d.kind) {
-            .function => c.function += 1,
-            .binding => c.binding += 1,
-            .type_alias => c.type_alias += 1,
-            else => c.other += 1,
-        }
-    }
-    return c;
-}
-
-/// Format a count string like `"3 fns, 2 consts added"` or
-/// `"1 type removed"`. Zero-count categories are collapsed; if every
-/// category is zero (e.g. an added file with no recognised decls) the
-/// output falls back to just the direction word (`"added"`/`"removed"`).
-fn formatSummaryHeader(
-    arena: Allocator,
-    counts: DeclKindCounts,
-    direction: SummaryDirection,
-) ![]const u8 {
-    var parts: std.ArrayList([]const u8) = .empty;
-
-    const entries = [_]struct { count: u32, singular: []const u8, plural: []const u8 }{
-        .{ .count = counts.function, .singular = "fn", .plural = "fns" },
-        .{ .count = counts.binding, .singular = "const", .plural = "consts" },
-        .{ .count = counts.type_alias, .singular = "type", .plural = "types" },
-        .{ .count = counts.other, .singular = "other", .plural = "others" },
-    };
-    for (entries) |e| {
-        if (e.count == 0) continue;
-        const word = if (e.count == 1) e.singular else e.plural;
-        try parts.append(arena, try std.fmt.allocPrint(arena, "{d} {s}", .{ e.count, word }));
-    }
-
-    const dir_word: []const u8 = switch (direction) {
-        .added => "added",
-        .removed => "removed",
-    };
-
-    if (parts.items.len == 0) return arena.dupe(u8, dir_word);
-
-    const joined = try std.mem.join(arena, ", ", parts.items);
-    return std.fmt.allocPrint(arena, "{s} {s}", .{ joined, dir_word });
-}
 
 fn summaryHeader(
     arena: Allocator,
@@ -633,8 +594,8 @@ fn summaryHeader(
     direction: SummaryDirection,
 ) !app.DiffHeader {
     const title = entry.change.new_path orelse entry.change.old_path orelse "<?>";
-    const counts = countDeclKinds(entries, direction);
-    const stats = try formatSummaryHeader(arena, counts, direction);
+    const counts = summary.countDeclKinds(entries, direction);
+    const stats = try summary.formatSummaryHeader(arena, counts, direction);
     return .{ .title = title, .stats = stats };
 }
 
@@ -890,75 +851,15 @@ test "paneLayout: sidebar width capped at 40 and at (width * 3) / 10" {
 }
 
 // ── summary header formatting ─────────────────────────────────────
+//
+// Lower-level formatter behaviour (singular/plural words, zero-count
+// collapse, counting by direction) lives in `src/ui/summary.zig`'s
+// tests. The session-level tests below check the wiring through
+// `summaryHeader` and `fileHeader` so a regression in the integration
+// is caught here even if the underlying formatter still passes its
+// unit tests.
 
-test "formatSummaryHeader: plural and singular words, comma separated" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    try testing.expectEqualStrings(
-        "3 fns, 2 consts added",
-        try formatSummaryHeader(a, .{ .function = 3, .binding = 2 }, .added),
-    );
-    try testing.expectEqualStrings(
-        "1 type removed",
-        try formatSummaryHeader(a, .{ .type_alias = 1 }, .removed),
-    );
-    try testing.expectEqualStrings(
-        "1 fn, 1 const, 1 type added",
-        try formatSummaryHeader(
-            a,
-            .{ .function = 1, .binding = 1, .type_alias = 1 },
-            .added,
-        ),
-    );
-}
-
-test "formatSummaryHeader: zero-count categories are omitted" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    try testing.expectEqualStrings(
-        "5 others added",
-        try formatSummaryHeader(a, .{ .other = 5 }, .added),
-    );
-    try testing.expectEqualStrings(
-        "added",
-        try formatSummaryHeader(a, .{}, .added),
-    );
-}
-
-test "countDeclKinds: groups added decls by kind, ignores unchanged/changed/removed" {
-    // An added `.zig` file with 2 fns and 1 const. `countDeclKinds` with
-    // direction=.added should report function=2 / binding=1. Zig has no
-    // native type_alias, so that slot stays zero.
-    const after =
-        \\pub fn a() void {}
-        \\pub fn b() void {}
-        \\pub const C: u32 = 1;
-    ;
-
-    var fd = try rv.diffSources(testing.allocator, .zig, "", after);
-    defer fd.deinit();
-
-    const counts = countDeclKinds(fd.entries, .added);
-    try testing.expectEqual(@as(u32, 2), counts.function);
-    try testing.expectEqual(@as(u32, 1), counts.binding);
-    try testing.expectEqual(@as(u32, 0), counts.type_alias);
-    try testing.expectEqual(@as(u32, 0), counts.other);
-
-    // Same entries asked about `.removed` yields nothing, since every
-    // top-level DeclDiff here is `.added`.
-    const removed_counts = countDeclKinds(fd.entries, .removed);
-    try testing.expectEqual(@as(u32, 0), removed_counts.function);
-    try testing.expectEqual(@as(u32, 0), removed_counts.binding);
-}
-
-test "summary header: added file with 3 fns and 2 consts renders expected string" {
-    // End-to-end: diff an empty before against an added Zig file with
-    // 3 fns and 2 consts, then format through the same helper the UI
-    // calls, and check the full header string.
+test "summaryHeader: added file renders English summary as the diff-pane stats" {
     const after =
         \\pub fn one() void {}
         \\pub fn two() void {}
@@ -973,22 +874,54 @@ test "summary header: added file with 3 fns and 2 consts renders expected string
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    const counts = countDeclKinds(fd.entries, .added);
-    const s = try formatSummaryHeader(arena.allocator(), counts, .added);
-    try testing.expectEqualStrings("3 fns, 2 consts added", s);
+    const entry: file_list.Entry = .{
+        .change = .{
+            .kind = .added,
+            .old_path = null,
+            .new_path = "a.zig",
+            .line_stat = .{ .added = 5, .removed = 0 },
+        },
+        .summary = null,
+    };
+    const header = try summaryHeader(arena.allocator(), entry, fd.entries, .added);
+    try testing.expectEqualStrings("a.zig", header.title);
+    try testing.expectEqualStrings("3 fns, 2 consts added", header.stats);
 }
 
-test "summary header: deleted file with 1 fn renders '1 fn removed'" {
-    const before = "pub fn gone() void {}\n";
+test "fileHeader: modified file renders English summary, not '+N -M ~K =U'" {
+    // Wiring check: `fileHeader` runs the modified-file path through
+    // `summary.formatModifiedHeader` and never the legacy numeric
+    // legend.
+    const before =
+        \\pub fn keep() void {}
+        \\pub fn mod() u32 { return 1; }
+    ;
+    const after =
+        \\pub fn keep() void {}
+        \\pub fn mod() u32 { return 2; }
+        \\pub fn fresh() void {}
+    ;
 
-    var fd = try rv.diffSources(testing.allocator, .zig, before, "");
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
-    const counts = countDeclKinds(fd.entries, .removed);
-    const s = try formatSummaryHeader(arena.allocator(), counts, .removed);
-    try testing.expectEqualStrings("1 fn removed", s);
+    const entry: file_list.Entry = .{
+        .change = .{
+            .kind = .modified,
+            .old_path = "a.zig",
+            .new_path = "a.zig",
+            .line_stat = .{ .added = 1, .removed = 1 },
+        },
+        .summary = null,
+    };
+    const header = try fileHeader(arena.allocator(), entry, &fd);
+    try testing.expectEqualStrings("a.zig", header.title);
+    try testing.expectEqualStrings("1 fn added, 1 fn modified", header.stats);
+    // Defensive: no terse legend characters leak through.
+    try testing.expect(std.mem.indexOfScalar(u8, header.stats, '+') == null);
+    try testing.expect(std.mem.indexOfScalar(u8, header.stats, '~') == null);
 }
 

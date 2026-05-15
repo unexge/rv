@@ -206,12 +206,24 @@ fn projectEntries(
         const lr = leftRangeOf(entry);
         const rr = rightRangeOf(entry, file_diff, cursors.right_byte);
 
-        // Pre-decl gap: from current cursor up to the decl's start on each
-        // side. `@max` is defensive against moves that would otherwise
-        // produce a negative range (the surrounding whitespace just gets
-        // dropped in that case; v1 doesn't try to cleverly recover).
-        const left_gap_end = if (lr) |r| @max(cursors.left_byte, r.start) else cursors.left_byte;
-        const right_gap_end = if (rr) |r| @max(cursors.right_byte, r.start) else cursors.right_byte;
+        // Pre-decl gap: from current cursor up to the start of the line
+        // that contains the decl. The bytes between the line start and
+        // `r.start` (i.e. the decl's leading indentation) are dropped:
+        // SST byte ranges for nested decls start at the keyword, so
+        // emitting them as part of the gap produces a phantom partial-line
+        // row with the wrong line number on top of an `.added` /
+        // `.removed` marker for the indent of an added/removed child.
+        // `@max` is defensive against moves that would otherwise produce
+        // a negative range (the surrounding whitespace just gets dropped
+        // in that case; v1 doesn't try to cleverly recover).
+        const left_gap_end = if (lr) |r|
+            @max(cursors.left_byte, lineStartBefore(file_diff.left_source, r.start))
+        else
+            cursors.left_byte;
+        const right_gap_end = if (rr) |r|
+            @max(cursors.right_byte, lineStartBefore(file_diff.right_source, r.start))
+        else
+            cursors.right_byte;
         try emitGap(
             arena,
             out,
@@ -261,6 +273,18 @@ fn projectEntries(
 fn consumeTrailingNewline(source: []const u8, end: u32) u32 {
     if (end < source.len and source[end] == '\n') return end + 1;
     return end;
+}
+
+/// Position of the first byte of the line that contains `pos` (i.e. one
+/// past the previous `\n`, or 0 when `pos` is on the first line). Used
+/// to back up a gap end so it stops at a line boundary instead of
+/// halfway through the leading-indent of the next decl.
+fn lineStartBefore(source: []const u8, pos: u32) u32 {
+    var i: usize = @min(pos, source.len);
+    while (i > 0) : (i -= 1) {
+        if (source[i - 1] == '\n') return @intCast(i);
+    }
+    return 0;
 }
 
 fn leftRangeOf(entry: rv.DeclDiff) ?Range {
@@ -1229,4 +1253,58 @@ test "countLines: handles trailing newline, no newline, empty" {
     try testing.expectEqual(@as(u32, 2), countLines("abc\ndef\n"));
     try testing.expectEqual(@as(u32, 1), countLines("\n"));
     try testing.expectEqual(@as(u32, 2), countLines("\n\n"));
+}
+
+test "build: nested container decl emits correct per-side line numbers" {
+    // Regression: nested decls' SST byte_range starts at the keyword,
+    // not at column 0 of their line. The pre-decl gap must stop at the
+    // newline before the decl rather than emitting the leading
+    // indentation as a phantom partial-line row, otherwise per-side
+    // line numbers slip by one for every nested decl and added/removed
+    // children produce a misleading whitespace-only `+`/`-` row.
+    const before =
+        \\pub const Thing = struct {
+        \\    pub fn one() void {}
+        \\};
+    ;
+    const after =
+        \\pub const Thing = struct {
+        \\    pub fn one() void {}
+        \\    pub fn two() void {}
+        \\};
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    // No source row should be only whitespace (the indentation of a
+    // nested decl belongs to the decl's first source line via `indent`,
+    // not to a standalone gap row).
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        const trimmed = std.mem.trim(u8, ln.text, " \t");
+        try testing.expect(trimmed.len > 0);
+    }
+
+    // `pub fn one() void {}` is line 2 on both sides;
+    // `pub fn two() void {}` is line 3 on the right.
+    var saw_one = false;
+    var saw_two = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (std.mem.indexOf(u8, ln.text, "pub fn one") != null) {
+            try testing.expectEqual(@as(?u32, 2), ln.line_no_left);
+            try testing.expectEqual(@as(?u32, 2), ln.line_no_right);
+            saw_one = true;
+        }
+        if (std.mem.indexOf(u8, ln.text, "pub fn two") != null) {
+            try testing.expectEqual(@as(?u32, null), ln.line_no_left);
+            try testing.expectEqual(@as(?u32, 3), ln.line_no_right);
+            saw_two = true;
+        }
+    }
+    try testing.expect(saw_one);
+    try testing.expect(saw_two);
 }

@@ -103,21 +103,29 @@ fn collectStats(entries: []const rv.DeclDiff, stats: *line_mod.Stats) void {
     };
 }
 
-/// Navigable rows are decl_anchor (file view) and decl_header (only here for
-/// future-proofing; the file builder never emits them). `.elided` rows are
-/// not navigation targets even though `n` / `p` will skip past them.
+/// Build the navigable decl index. Two cases share the same scan:
+///
+/// - Collapsed decls keep emitting a `.decl_anchor` row above their
+///   synthetic `.elided` body, so the anchor itself is the jump target.
+/// - Expanded decls now inline their `(name, ts_kind)` annotation on
+///   their first source row instead of emitting an anchor, so the
+///   annotated source row is the jump target.
+///
+/// Source rows are picked up only when they carry a `decl_annotation`,
+/// which by construction means the first emitted row of an expanded
+/// decl. That keeps every other source row out of the index.
 fn collectDeclIndex(arena: Allocator, view: line_mod.View) ![]const line_mod.DeclIndexEntry {
     var out: std.ArrayList(line_mod.DeclIndexEntry) = .empty;
     switch (view) {
         .unified => |lines| for (lines, 0..) |ln, i| {
-            if (!isAnchorKind(ln.kind)) continue;
+            if (!isJumpTargetRow(ln)) continue;
             try out.append(arena, .{
                 .row = i,
                 .changed = isChangedMarker(ln.marker),
             });
         },
         .split => |pairs| for (pairs, 0..) |p, i| {
-            const side = anchorSide(p) orelse continue;
+            const side = jumpTargetSide(p) orelse continue;
             try out.append(arena, .{
                 .row = i,
                 .changed = isChangedMarker(side.marker),
@@ -127,13 +135,15 @@ fn collectDeclIndex(arena: Allocator, view: line_mod.View) ![]const line_mod.Dec
     return try out.toOwnedSlice(arena);
 }
 
-fn isAnchorKind(kind: line_mod.LineKind) bool {
-    return kind == .decl_anchor or kind == .decl_header;
+fn isJumpTargetRow(ln: line_mod.StyledLine) bool {
+    if (ln.kind == .decl_anchor or ln.kind == .decl_header) return true;
+    if (ln.kind == .source and ln.decl_annotation != null) return true;
+    return false;
 }
 
-fn anchorSide(p: line_mod.LinePair) ?line_mod.StyledLine {
-    if (isAnchorKind(p.right.kind)) return p.right;
-    if (isAnchorKind(p.left.kind)) return p.left;
+fn jumpTargetSide(p: line_mod.LinePair) ?line_mod.StyledLine {
+    if (isJumpTargetRow(p.right)) return p.right;
+    if (isJumpTargetRow(p.left)) return p.left;
     return null;
 }
 
@@ -360,20 +370,21 @@ fn projectUnchanged(
     cursors: *Cursors,
 ) !void {
     const id = state_mod.declId(u.decl);
-    try out.append(arena, .{
-        .indent = indent,
-        .marker = .unchanged,
-        .kind = .decl_anchor,
-        .text = try line_mod.declHeaderText(arena, u.decl, u.moved, false),
-        .decl_id = id,
-    });
 
     if (state.isCollapsed(id)) {
+        try out.append(arena, .{
+            .indent = indent,
+            .marker = .unchanged,
+            .kind = .decl_anchor,
+            .text = try line_mod.declHeaderText(arena, u.decl, u.moved, false),
+            .decl_id = id,
+        });
         try emitCollapsedBody(arena, out, indent, id, u.decl.name, entryLineCount(.{ .unchanged = u }, file_diff));
         advanceCursorsForCollapsedEntry(.{ .unchanged = u }, file_diff, cursors);
         return;
     }
 
+    const annotation = try formatDeclAnnotation(arena, u.decl, u.moved);
     const lr = u.decl.list.byte_range;
     try emitSourceLines(
         arena,
@@ -387,6 +398,7 @@ fn projectUnchanged(
         id,
         cursors,
         .both,
+        annotation,
     );
 }
 
@@ -400,20 +412,21 @@ fn projectAdded(
     cursors: *Cursors,
 ) !void {
     const id = state_mod.declId(a.decl);
-    try out.append(arena, .{
-        .indent = indent,
-        .marker = .added,
-        .kind = .decl_anchor,
-        .text = try line_mod.declHeaderText(arena, a.decl, null, false),
-        .decl_id = id,
-    });
 
     if (state.isCollapsed(id)) {
+        try out.append(arena, .{
+            .indent = indent,
+            .marker = .added,
+            .kind = .decl_anchor,
+            .text = try line_mod.declHeaderText(arena, a.decl, null, false),
+            .decl_id = id,
+        });
         try emitCollapsedBody(arena, out, indent, id, a.decl.name, entryLineCount(.{ .added = a }, file_diff));
         advanceCursorsForCollapsedEntry(.{ .added = a }, file_diff, cursors);
         return;
     }
 
+    const annotation = try formatDeclAnnotation(arena, a.decl, null);
     const rr = a.decl.list.byte_range;
     try emitSourceLines(
         arena,
@@ -427,6 +440,7 @@ fn projectAdded(
         id,
         cursors,
         .right_only,
+        annotation,
     );
 }
 
@@ -440,20 +454,21 @@ fn projectRemoved(
     cursors: *Cursors,
 ) !void {
     const id = state_mod.declId(r.decl);
-    try out.append(arena, .{
-        .indent = indent,
-        .marker = .removed,
-        .kind = .decl_anchor,
-        .text = try line_mod.declHeaderText(arena, r.decl, null, false),
-        .decl_id = id,
-    });
 
     if (state.isCollapsed(id)) {
+        try out.append(arena, .{
+            .indent = indent,
+            .marker = .removed,
+            .kind = .decl_anchor,
+            .text = try line_mod.declHeaderText(arena, r.decl, null, false),
+            .decl_id = id,
+        });
         try emitCollapsedBody(arena, out, indent, id, r.decl.name, entryLineCount(.{ .removed = r }, file_diff));
         advanceCursorsForCollapsedEntry(.{ .removed = r }, file_diff, cursors);
         return;
     }
 
+    const annotation = try formatDeclAnnotation(arena, r.decl, null);
     const lr = r.decl.list.byte_range;
     try emitSourceLines(
         arena,
@@ -467,6 +482,7 @@ fn projectRemoved(
         id,
         cursors,
         .left_only,
+        annotation,
     );
 }
 
@@ -480,24 +496,27 @@ fn projectChanged(
     cursors: *Cursors,
 ) ProjectError!void {
     const id = state_mod.declId(c.new);
-    try out.append(arena, .{
-        .indent = indent,
-        .marker = .changed,
-        .kind = .decl_anchor,
-        .text = try line_mod.declHeaderText(arena, c.new, c.moved, false),
-        .decl_id = id,
-    });
 
     if (state.isCollapsed(id)) {
+        try out.append(arena, .{
+            .indent = indent,
+            .marker = .changed,
+            .kind = .decl_anchor,
+            .text = try line_mod.declHeaderText(arena, c.new, c.moved, false),
+            .decl_id = id,
+        });
         try emitCollapsedBody(arena, out, indent, id, c.new.name, entryLineCount(.{ .changed = c }, file_diff));
         advanceCursorsForCollapsedEntry(.{ .changed = c }, file_diff, cursors);
         return;
     }
 
+    const annotation = try formatDeclAnnotation(arena, c.new, c.moved);
+
     switch (c.body) {
         .container => |children| {
             const left_range = toRange(c.old.list.byte_range);
             const right_range = toRange(c.new.list.byte_range);
+            const start_idx = out.items.len;
             try projectEntries(
                 arena,
                 out,
@@ -509,9 +528,14 @@ fn projectChanged(
                 right_range,
                 cursors,
             );
+            // The container's signature line (`pub const Thing = struct {`)
+            // is emitted as part of the leading gap inside the recursion;
+            // stamp the annotation + decl_id onto whichever source row
+            // appeared first so `findDeclRow` can land on it.
+            stampDeclAnnotationOnFirstSource(out.items[start_idx..], annotation, id);
         },
         .leaf => |script| {
-            try projectChangedLeaf(arena, out, file_diff, script, c.old, c.new, id, indent + 1, cursors);
+            try projectChangedLeaf(arena, out, file_diff, script, c.old, c.new, id, indent + 1, cursors, annotation);
         },
     }
 }
@@ -520,6 +544,11 @@ fn projectChanged(
 /// to fill in per-side line numbers and a `decl_id`. The leaf hunk emits
 /// one row per source line on whichever side(s) it appears, so cursor
 /// advancement is purely a function of each row's marker.
+///
+/// `annotation` is stamped onto the first emitted hunk row so the
+/// expanded changed leaf still carries the `(name, ts_kind[, moved
+/// N → M])` annotation that the dropped `.decl_anchor` row used to
+/// surface.
 fn projectChangedLeaf(
     arena: Allocator,
     out: *std.ArrayList(line_mod.StyledLine),
@@ -530,8 +559,10 @@ fn projectChangedLeaf(
     decl_id: state_mod.DeclId,
     indent: u8,
     cursors: *Cursors,
+    annotation: ?[]const u8,
 ) !void {
     const hunk_lines = try line_mod.buildLeafHunk(arena, file_diff, script, old_decl, new_decl, indent);
+    var stamped = annotation == null;
     for (hunk_lines) |line| {
         var sl = line;
         sl.decl_id = decl_id;
@@ -552,6 +583,10 @@ fn projectChangedLeaf(
             },
             else => unreachable,
         }
+        if (!stamped) {
+            sl.decl_annotation = annotation;
+            stamped = true;
+        }
         try out.append(arena, sl);
     }
 }
@@ -560,9 +595,58 @@ fn projectChangedLeaf(
 
 const SideAdvance = enum { both, left_only, right_only };
 
+/// Render the trailing `(name, ts_kind)` (or `(name, ts_kind, moved
+/// N → M)`) annotation that gets stamped onto the first source row of
+/// an expanded decl in lieu of a dedicated `.decl_anchor` row. Anonymous
+/// decls fall back to `<anon>` so the annotation never collapses to an
+/// empty `()`.
+fn formatDeclAnnotation(
+    arena: Allocator,
+    decl: rv.Decl,
+    moved: ?rv.MoveInfo,
+) ![]const u8 {
+    const name = decl.name orelse "<anon>";
+    if (moved) |m| {
+        return std.fmt.allocPrint(arena, "({s}, {s}, moved {d} → {d})", .{
+            name, decl.ts_kind, m.from_idx, m.to_idx,
+        });
+    }
+    return std.fmt.allocPrint(arena, "({s}, {s})", .{ name, decl.ts_kind });
+}
+
+/// Stamp `annotation` onto the first unowned `.source` row in `slice`
+/// and tag that row with `decl_id`. "Unowned" means `decl_id == null`,
+/// i.e. the row was emitted by `emitGap` rather than by a child decl's
+/// projection. Used by the changed-container case where the container's
+/// signature line surfaces inside the recursion as a gap row that
+/// doesn't otherwise belong to any decl. No-op when `annotation` is
+/// null or no unowned source row exists (e.g. when the container and
+/// its first child share a line and the leading gap is empty); in that
+/// degenerate case the container is left un-navigable rather than
+/// hijacking a child decl's row.
+fn stampDeclAnnotationOnFirstSource(
+    slice: []line_mod.StyledLine,
+    annotation: ?[]const u8,
+    decl_id: state_mod.DeclId,
+) void {
+    const ann = annotation orelse return;
+    for (slice) |*sl| {
+        if (sl.kind != .source) continue;
+        if (sl.decl_id != null) return;
+        sl.decl_annotation = ann;
+        sl.decl_id = decl_id;
+        return;
+    }
+}
+
 /// Emit every source line of `slice` (split on `\n`, trailing empty line
 /// dropped) as a `.source` row. Highlights for the whole decl are
 /// collected once and clipped per line.
+///
+/// `annotation`, when non-null, is stamped onto the *first* emitted row's
+/// `decl_annotation` field. This lets the file-wide builder inline the
+/// `(name, ts_kind)` landmark on the decl's first source line instead
+/// of emitting a dedicated `.decl_anchor` row above it.
 fn emitSourceLines(
     arena: Allocator,
     out: *std.ArrayList(line_mod.StyledLine),
@@ -575,12 +659,14 @@ fn emitSourceLines(
     decl_id: state_mod.DeclId,
     cursors: *Cursors,
     side: SideAdvance,
+    annotation: ?[]const u8,
 ) !void {
     const highlights = try line_mod.collectHighlights(arena, decl_list, file_diff.language);
 
     var cursor_in_slice: usize = 0;
     var line_abs_start: u32 = slice_abs_start;
     var first = true;
+    var stamped = annotation == null;
     while (true) {
         const rest = slice[cursor_in_slice..];
         const nl_rel = std.mem.indexOfScalar(u8, rest, '\n');
@@ -610,6 +696,11 @@ fn emitSourceLines(
             },
         }
 
+        const row_annotation: ?[]const u8 = if (!stamped) blk: {
+            stamped = true;
+            break :blk annotation;
+        } else null;
+
         try out.append(arena, .{
             .indent = indent,
             .marker = marker,
@@ -619,6 +710,7 @@ fn emitSourceLines(
             .decl_id = decl_id,
             .line_no_left = line_no_left,
             .line_no_right = line_no_right,
+            .decl_annotation = row_annotation,
         });
 
         if (nl_rel) |p| {
@@ -917,32 +1009,37 @@ test "build: single change in a long file emits ±3 context with elided rows on 
     const lines = result.view.unified;
     var leading_elided: usize = 0;
     var trailing_elided: usize = 0;
-    var saw_changed_anchor = false;
+    var saw_changed_decl_annotation = false;
     var saw_removed_source = false;
     var saw_added_source = false;
     var first_change_idx: ?usize = null;
     var last_change_idx: ?usize = null;
     for (lines, 0..) |ln, i| {
+        if (ln.kind != .source) continue;
         switch (ln.marker) {
-            .removed => if (ln.kind == .source) {
+            .removed => {
                 saw_removed_source = true;
                 if (first_change_idx == null) first_change_idx = i;
                 last_change_idx = i;
             },
-            .added => if (ln.kind == .source) {
+            .added => {
                 saw_added_source = true;
-                if (first_change_idx == null) first_change_idx = i;
-                last_change_idx = i;
-            },
-            .changed => if (ln.kind == .decl_anchor) {
-                saw_changed_anchor = true;
                 if (first_change_idx == null) first_change_idx = i;
                 last_change_idx = i;
             },
             else => {},
         }
+        // The single-line leaf change emits the changed decl's body as
+        // a `.removed` + `.added` pair; the inline annotation lands on
+        // the first emitted row (the `.removed` line) and identifies
+        // the changed decl `e`. Match `"(e,"` rather than just `"e"`
+        // so unrelated annotations whose `ts_kind` happens to contain
+        // an `e` (e.g. `function_declaration`) don't satisfy the check.
+        if (ln.decl_annotation) |ann| {
+            if (std.mem.indexOf(u8, ann, "(e,") != null) saw_changed_decl_annotation = true;
+        }
     }
-    try testing.expect(saw_changed_anchor);
+    try testing.expect(saw_changed_decl_annotation);
     try testing.expect(saw_removed_source);
     try testing.expect(saw_added_source);
     for (lines[0..first_change_idx.?]) |ln| if (ln.kind == .elided) {
@@ -955,21 +1052,32 @@ test "build: single change in a long file emits ±3 context with elided rows on 
     try testing.expect(trailing_elided >= 1);
 }
 
-test "build: added decl emits anchor + full body, flanking unchanged collapse" {
+test "build: added decl emits annotated first source row + full body, flanking unchanged collapse" {
+    // Eight unchanged decls flank the added one so the rows past ±3
+    // context are guaranteed to elide even with the more compact layout
+    // (one fewer row per expanded decl now that anchors are gone).
     const before =
         \\pub fn a() void {}
         \\pub fn b() void {}
         \\pub fn c() void {}
         \\pub fn d() void {}
+        \\pub fn e() void {}
+        \\pub fn f() void {}
+        \\pub fn g() void {}
+        \\pub fn h() void {}
     ;
     const after =
         \\pub fn a() void {}
         \\pub fn b() void {}
+        \\pub fn c() void {}
+        \\pub fn d() void {}
         \\pub fn fresh() void {
         \\    return;
         \\}
-        \\pub fn c() void {}
-        \\pub fn d() void {}
+        \\pub fn e() void {}
+        \\pub fn f() void {}
+        \\pub fn g() void {}
+        \\pub fn h() void {}
     ;
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
@@ -979,17 +1087,28 @@ test "build: added decl emits anchor + full body, flanking unchanged collapse" {
 
     const lines = result.view.unified;
 
+    // Expanded added decl: no `.decl_anchor` row, the first added source
+    // row carries the inline `(name, ts_kind)` annotation instead.
     var saw_added_anchor = false;
     var added_source_count: usize = 0;
+    var added_with_annotation: usize = 0;
     for (lines) |ln| {
         if (ln.marker == .added and ln.kind == .decl_anchor) saw_added_anchor = true;
-        if (ln.marker == .added and ln.kind == .source) added_source_count += 1;
+        if (ln.marker == .added and ln.kind == .source) {
+            added_source_count += 1;
+            if (ln.decl_annotation) |ann| {
+                try testing.expect(std.mem.indexOf(u8, ann, "fresh") != null);
+                added_with_annotation += 1;
+            }
+        }
     }
-    try testing.expect(saw_added_anchor);
+    try testing.expect(!saw_added_anchor);
     // The added body has 3 source lines (signature, return, closing brace).
     try testing.expectEqual(@as(usize, 3), added_source_count);
+    // Annotation is stamped on exactly one row (the signature).
+    try testing.expectEqual(@as(usize, 1), added_with_annotation);
 
-    // Unchanged decls outside ±3 of the added anchor collapse.
+    // Unchanged decls far from the added decl collapse into elided rows.
     var saw_elided = false;
     for (lines) |ln| if (ln.kind == .elided) {
         saw_elided = true;
@@ -1099,8 +1218,8 @@ test "build: per-side line numbers populate per marker (added/removed/unchanged)
 
 test "build: cross-decl context windows merge when changes are within 2*context lines" {
     // Two adjacent decls, each with a single-line change. The context
-    // windows around the two anchors overlap, so no `.elided` row should
-    // appear between them.
+    // windows around the two changed decls overlap, so no `.elided` row
+    // should appear between them.
     const before =
         \\pub fn a() u32 { return 1; }
         \\pub fn b() u32 { return 1; }
@@ -1117,20 +1236,24 @@ test "build: cross-decl context windows merge when changes are within 2*context 
 
     const lines = result.view.unified;
 
-    // Locate the two `.changed` decl_anchors.
+    // Locate the two changed decls by their inline annotations. The leaf
+    // hunk emits a `.removed` + `.added` pair per change, with the
+    // annotation landing on the first row of each pair (the `.removed`
+    // line).
     var first_changed: ?usize = null;
     var last_changed: ?usize = null;
     for (lines, 0..) |ln, i| {
-        if (ln.kind == .decl_anchor and ln.marker == .changed) {
-            if (first_changed == null) first_changed = i;
-            last_changed = i;
-        }
+        if (ln.kind != .source) continue;
+        if (ln.decl_annotation == null) continue;
+        if (ln.marker != .removed and ln.marker != .added and ln.marker != .changed) continue;
+        if (first_changed == null) first_changed = i;
+        last_changed = i;
     }
     try testing.expect(first_changed != null);
     try testing.expect(last_changed != null);
     try testing.expect(first_changed.? != last_changed.?);
 
-    // No `.elided` row between the two anchors.
+    // No `.elided` row between the two changed decls.
     var middle_elided: usize = 0;
     for (lines[first_changed.?..last_changed.? + 1]) |ln| if (ln.kind == .elided) {
         middle_elided += 1;
@@ -1179,7 +1302,10 @@ test "build split: mirrored common rows, paired add/remove runs" {
     try testing.expect(saw_paired_change);
 }
 
-test "build: decl_index lists every decl_anchor row" {
+test "build: decl_index covers every navigable decl row" {
+    // 4 decls expanded → 4 entries in the index, each pointing at the
+    // first source row of the decl (the row carrying the inline
+    // annotation).
     const before =
         \\pub fn a() void {}
         \\pub fn b() u32 { return 1; }
@@ -1197,19 +1323,22 @@ test "build: decl_index lists every decl_anchor row" {
     var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
-    // 4 decls → 4 anchor rows in the index, regardless of elision.
     try testing.expectEqual(@as(usize, 4), result.decl_index.len);
     for (result.decl_index) |e| {
-        try testing.expectEqual(line_mod.LineKind.decl_anchor, result.view.unified[e.row].kind);
+        const ln = result.view.unified[e.row];
+        // Either an anchor (collapsed) or an annotated source row
+        // (expanded). With no collapse state, every entry is the latter.
+        try testing.expectEqual(line_mod.LineKind.source, ln.kind);
+        try testing.expect(ln.decl_annotation != null);
     }
 }
 
-test "build split: adjacent removed and added decl_anchors each get their own row with blank on the inactive side" {
-    // Rename: `gone` → `fresh`. The diff engine emits a `.removed` decl
-    // followed by an `.added` decl with no unchanged content between, so
-    // both pending_left and pending_right hold an anchor + body when the
-    // run flushes. Without the spec fix, the two anchors would pair up
-    // with each other on the same row.
+test "build split: adjacent removed and added decl bodies pair on the same row" {
+    // Rename: `gone` → `fresh`. Without a `.decl_anchor` row in the
+    // mix, the unified stream is just `.removed` source + `.added`
+    // source, so the split conversion pairs them onto a single row
+    // (left=removed, right=added) like any other adjacent change.
+    // Both panes carry their respective inline annotations.
     const before =
         \\pub fn gone() void { return; }
     ;
@@ -1222,27 +1351,18 @@ test "build split: adjacent removed and added decl_anchors each get their own ro
     var result = try buildForTest(testing.allocator, &fd, .split);
     defer result.deinit();
 
-    var saw_removed_anchor_pair = false;
-    var saw_added_anchor_pair = false;
+    var saw_paired_rename = false;
     for (result.view.split) |p| {
-        // A `.removed` anchor must sit on the left with blank on the right.
-        if (p.left.kind == .decl_anchor and p.left.marker == .removed) {
-            try testing.expectEqual(line_mod.LineKind.blank, p.right.kind);
-            try testing.expectEqual(line_mod.Marker.blank, p.right.marker);
-            saw_removed_anchor_pair = true;
-        }
-        // An `.added` anchor must sit on the right with blank on the left.
-        if (p.right.kind == .decl_anchor and p.right.marker == .added) {
-            try testing.expectEqual(line_mod.LineKind.blank, p.left.kind);
-            try testing.expectEqual(line_mod.Marker.blank, p.left.marker);
-            saw_added_anchor_pair = true;
-        }
-        // The two anchors must never share a row.
-        try testing.expect(!(p.left.kind == .decl_anchor and p.right.kind == .decl_anchor and
-            p.left.marker == .removed and p.right.marker == .added));
+        const left_ok = p.left.kind == .source and p.left.marker == .removed;
+        const right_ok = p.right.kind == .source and p.right.marker == .added;
+        if (!left_ok or !right_ok) continue;
+        const left_ann = p.left.decl_annotation orelse continue;
+        const right_ann = p.right.decl_annotation orelse continue;
+        try testing.expect(std.mem.indexOf(u8, left_ann, "gone") != null);
+        try testing.expect(std.mem.indexOf(u8, right_ann, "fresh") != null);
+        saw_paired_rename = true;
     }
-    try testing.expect(saw_removed_anchor_pair);
-    try testing.expect(saw_added_anchor_pair);
+    try testing.expect(saw_paired_rename);
 }
 
 test "countLines: handles trailing newline, no newline, empty" {
@@ -1307,4 +1427,324 @@ test "build: nested container decl emits correct per-side line numbers" {
     }
     try testing.expect(saw_one);
     try testing.expect(saw_two);
+}
+
+// ── inline decl annotation ────────────────────────────────────────────
+
+test "build: expanded decls emit no `.decl_anchor` rows; annotation lands on first source row" {
+    // Three decls, all expanded by default. With no anchors, every decl
+    // is anchored on its first emitted source row, which carries the
+    // inline `(name, ts_kind)` annotation.
+    const before =
+        \\pub fn a() void {}
+        \\pub fn b() u32 { return 1; }
+    ;
+    const after =
+        \\pub fn a() void {}
+        \\pub fn b() u32 { return 2; }
+        \\pub fn c() void {}
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    // No `.decl_anchor` row in the view at all — every decl is expanded.
+    for (result.view.unified) |ln| try testing.expect(ln.kind != .decl_anchor);
+
+    // Each expanded decl produces exactly one annotated source row.
+    var annotated_rows: usize = 0;
+    var annotations_seen: [3][]const u8 = undefined;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.decl_annotation) |ann| {
+            try testing.expect(annotated_rows < annotations_seen.len);
+            annotations_seen[annotated_rows] = ann;
+            annotated_rows += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), annotated_rows);
+
+    // Each annotation contains the decl name and `ts_kind`.
+    var saw_a = false;
+    var saw_b = false;
+    var saw_c = false;
+    for (annotations_seen[0..annotated_rows]) |ann| {
+        try testing.expect(std.mem.indexOf(u8, ann, "function_declaration") != null);
+        if (std.mem.indexOf(u8, ann, "(a,") != null) saw_a = true;
+        if (std.mem.indexOf(u8, ann, "(b,") != null) saw_b = true;
+        if (std.mem.indexOf(u8, ann, "(c,") != null) saw_c = true;
+    }
+    try testing.expect(saw_a);
+    try testing.expect(saw_b);
+    try testing.expect(saw_c);
+}
+
+test "build: row count drops by one per expanded decl vs. emitting a `.decl_anchor` per decl" {
+    // The dropped `.decl_anchor` row for each expanded decl is the
+    // savings the inline annotation buys. Verify the count exactly:
+    // four expanded decls → four rows fewer than (rows + decl_count).
+    const before =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub fn c() void {}
+        \\pub fn d() void {}
+    ;
+    const after =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+        \\pub fn c() void {}
+        \\pub fn d() void {}
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    // Identical sources collapse to a single `.elided` row regardless,
+    // so we artificially expand every gap to compare row counts.
+    var state = state_mod.AppState.init(testing.allocator);
+    defer state.deinit();
+    var initial = try build(testing.allocator, &fd, .unified, &state);
+    defer initial.deinit();
+    try state.expandAllGaps(initial.view);
+
+    var result = try build(testing.allocator, &fd, .unified, &state);
+    defer result.deinit();
+
+    var anchor_count: usize = 0;
+    var annotated_source_count: usize = 0;
+    for (result.view.unified) |ln| {
+        if (ln.kind == .decl_anchor) anchor_count += 1;
+        if (ln.kind == .source and ln.decl_annotation != null) annotated_source_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), anchor_count);
+    try testing.expectEqual(@as(usize, 4), annotated_source_count);
+}
+
+test "build: collapsed decls keep `.decl_anchor` row plus a synthetic elided body row" {
+    // Regression guard: the inline-annotation refactor must not change
+    // collapsed-decl shape. Each collapsed decl still emits a
+    // `.decl_anchor` landmark above an `.elided` synthetic body row, so
+    // the existing cursor target for re-expansion stays put.
+    const before = "pub fn greet() u32 { return 1; }\n";
+    const after = "pub fn greet() u32 { return 2; }\n";
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var collapse_id: state_mod.DeclId = 0;
+    for (fd.entries) |e| if (e == .changed) {
+        collapse_id = state_mod.declId(e.changed.new);
+    };
+
+    var state = state_mod.AppState.init(testing.allocator);
+    defer state.deinit();
+    _ = try state.toggle(collapse_id);
+
+    var result = try build(testing.allocator, &fd, .unified, &state);
+    defer result.deinit();
+
+    const lines = result.view.unified;
+    try testing.expect(lines.len >= 2);
+    try testing.expectEqual(line_mod.LineKind.decl_anchor, lines[0].kind);
+    try testing.expectEqual(line_mod.LineKind.elided, lines[1].kind);
+    // The collapsed anchor row carries no inline annotation — its
+    // existing `name (ts_kind)` text already tells the user what the
+    // decl is, and a redundant suffix would clutter the row.
+    try testing.expectEqual(@as(?[]const u8, null), lines[0].decl_annotation);
+}
+
+test "build: jump index targets first-source rows for expanded decls and anchors for collapsed ones" {
+    const before =
+        \\pub fn keep() void {}
+        \\pub fn tweak() u32 { return 1; }
+    ;
+    const after =
+        \\pub fn keep() void {}
+        \\pub fn tweak() u32 { return 2; }
+        \\pub fn added() void {}
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    // Collapse `tweak` to verify the per-decl mode dispatch.
+    var collapse_id: state_mod.DeclId = 0;
+    for (fd.entries) |e| if (e == .changed) {
+        collapse_id = state_mod.declId(e.changed.new);
+    };
+    var state = state_mod.AppState.init(testing.allocator);
+    defer state.deinit();
+    _ = try state.toggle(collapse_id);
+
+    var result = try build(testing.allocator, &fd, .unified, &state);
+    defer result.deinit();
+
+    // Three decls → three index entries.
+    try testing.expectEqual(@as(usize, 3), result.decl_index.len);
+
+    var saw_collapsed_anchor = false;
+    var saw_expanded_source = false;
+    for (result.decl_index) |e| {
+        const ln = result.view.unified[e.row];
+        switch (ln.kind) {
+            .decl_anchor => {
+                // Only the collapsed `tweak` produces an anchor row.
+                try testing.expectEqual(collapse_id, ln.decl_id.?);
+                saw_collapsed_anchor = true;
+            },
+            .source => {
+                try testing.expect(ln.decl_annotation != null);
+                saw_expanded_source = true;
+            },
+            else => return error.UnexpectedKind,
+        }
+    }
+    try testing.expect(saw_collapsed_anchor);
+    try testing.expect(saw_expanded_source);
+}
+
+test "build: moved decl annotation includes `moved N → M`" {
+    const before =
+        \\pub fn a() void {}
+        \\pub fn b() void {}
+    ;
+    const after =
+        \\pub fn b() void {}
+        \\pub fn a() void {}
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_moved_annotation = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        const ann = ln.decl_annotation orelse continue;
+        if (std.mem.indexOf(u8, ann, "moved ") != null and
+            std.mem.indexOf(u8, ann, " → ") != null)
+        {
+            saw_moved_annotation = true;
+        }
+    }
+    try testing.expect(saw_moved_annotation);
+}
+
+test "formatDeclAnnotation: shape matches `(name, ts_kind)` with optional move suffix" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Synthetic Decl: only `name` and `ts_kind` are read by the helper,
+    // the rest of the struct is irrelevant for the format check.
+    var dummy_list: rv.List = undefined;
+    const decl: rv.Decl = .{
+        .kind = .other,
+        .ts_kind = "function_declaration",
+        .name = "greet",
+        .list = &dummy_list,
+    };
+
+    const plain = try formatDeclAnnotation(a, decl, null);
+    try testing.expectEqualStrings("(greet, function_declaration)", plain);
+
+    const moved = try formatDeclAnnotation(a, decl, .{ .from_idx = 2, .to_idx = 7 });
+    try testing.expectEqualStrings("(greet, function_declaration, moved 2 → 7)", moved);
+}
+
+test "build: changed container's signature line carries the container annotation" {
+    // For a `.changed` container, the container's signature line
+    // (`pub const Thing = struct {`) surfaces inside the recursion as
+    // a gap row. The inline annotation must still land on that row so
+    // the container is navigable from the file-wide view.
+    const before =
+        \\pub const Thing = struct {
+        \\    pub fn one() void {}
+        \\};
+    ;
+    const after =
+        \\pub const Thing = struct {
+        \\    pub fn one() void {}
+        \\    pub fn two() void {}
+        \\};
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_container_annotation = false;
+    var container_id: ?state_mod.DeclId = null;
+    for (fd.entries) |e| if (e == .changed) {
+        container_id = state_mod.declId(e.changed.new);
+    };
+    try testing.expect(container_id != null);
+
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        const ann = ln.decl_annotation orelse continue;
+        if (std.mem.indexOf(u8, ann, "Thing") == null) continue;
+        // The annotation row also takes the container's decl_id so
+        // `findDeclRow` can land on it.
+        try testing.expectEqual(container_id.?, ln.decl_id.?);
+        try testing.expect(std.mem.startsWith(u8, ln.text, "pub const Thing"));
+        saw_container_annotation = true;
+    }
+    try testing.expect(saw_container_annotation);
+}
+
+test "build: same-line container does not hijack the first child's decl_id" {
+    // Degenerate case: container and first child share a source line, so
+    // the leading gap inside the recursion is empty and the first source
+    // row in the recursion belongs to the child rather than to a gap.
+    // `stampDeclAnnotationOnFirstSource` must skip rows that already have
+    // a `decl_id`, otherwise the container's annotation hijacks the
+    // child's row and the child becomes un-navigable.
+    const before =
+        \\pub const Thing = struct { fn one() void {} };
+    ;
+    const after =
+        \\pub const Thing = struct { fn one() u32 { return 1; } };
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var container_id: ?state_mod.DeclId = null;
+    var child_id: ?state_mod.DeclId = null;
+    for (fd.entries) |e| if (e == .changed) {
+        container_id = state_mod.declId(e.changed.new);
+        // Sanity: this fixture must hit the .container path in
+        // `projectChanged`, otherwise the bug we're guarding against is
+        // unreachable from this test.
+        try testing.expect(e.changed.body == .container);
+        for (e.changed.body.container) |child| switch (child) {
+            .changed => |c| child_id = state_mod.declId(c.new),
+            else => {},
+        };
+    };
+    try testing.expect(container_id != null);
+    try testing.expect(child_id != null);
+    try testing.expect(container_id.? != child_id.?);
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    // Whatever decl_id the first source row carries, it must not be the
+    // child's — that would mean the container hijacked the child's row.
+    // (In this degenerate case the container is left un-navigable, which
+    // is the lesser evil.)
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.decl_id) |id| {
+            // The first owned source row must belong to a real decl, not
+            // to a hijacked one. Specifically: rows annotated for the
+            // child must still report the child's id.
+            if (ln.decl_annotation != null and id == container_id.?) {
+                // Tolerated only if no child source row exists in the
+                // view — but this fixture has one, so this is a fail.
+                try testing.expect(false);
+            }
+        }
+    }
 }

@@ -128,6 +128,11 @@ pub const StyledLine = struct {
     /// Stable identity of the elided gap this row represents. Set only
     /// on `.elided` rows; `null` everywhere else.
     gap_id: ?GapId = null,
+    /// Trailing dim annotation rendered to the right of `text`. Used by
+    /// the file-wide builder to stamp a decl's `(name, ts_kind[, moved
+    /// N → M])` onto its first source row in lieu of a dedicated
+    /// `.decl_anchor` landmark line. `null` everywhere else.
+    decl_annotation: ?[]const u8 = null,
 };
 
 pub const ByteSpan = struct { start: u32, end: u32 };

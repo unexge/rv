@@ -432,9 +432,8 @@ fn focusedDeclIdLines(lines: []const StyledLine, cursor_y: usize) ?DeclId {
     var i: usize = @min(cursor_y, lines.len - 1) + 1;
     while (i > 0) {
         i -= 1;
-        if (isAnchorOrHeaderKind(lines[i].kind)) {
-            if (lines[i].decl_id) |id| return id;
-        }
+        if (!isDeclRepresentativeKind(lines[i])) continue;
+        if (lines[i].decl_id) |id| return id;
     }
     return null;
 }
@@ -444,24 +443,34 @@ fn focusedDeclIdPairs(pairs: []const LinePair, cursor_y: usize) ?DeclId {
     var i: usize = @min(cursor_y, pairs.len - 1) + 1;
     while (i > 0) {
         i -= 1;
-        if (anchorOrHeaderSide(pairs[i])) |side| if (side.decl_id) |id| return id;
+        if (declRepresentativeSide(pairs[i])) |side| if (side.decl_id) |id| return id;
     }
     return null;
 }
 
-/// Decl-axis builder emits `.decl_header`; file-wide builder emits
-/// `.decl_anchor`. Both kinds carry a `decl_id` and serve as the
-/// "enclosing decl" landmark when walking back from a source row.
-fn isAnchorOrHeaderKind(kind: LineKind) bool {
-    return kind == .decl_header or kind == .decl_anchor;
+/// A row "represents" the enclosing decl when:
+///
+/// - It is a `.decl_header` (decl-axis builder) or `.decl_anchor`
+///   (file-wide builder for collapsed decls), OR
+/// - It is an annotated `.source` row (file-wide builder for expanded
+///   decls, where the inline annotation replaces the dropped anchor
+///   row).
+///
+/// Walking back from the cursor through rows that satisfy this predicate
+/// lands on the same logical "decl landmark" regardless of which
+/// builder produced the view.
+fn isDeclRepresentativeKind(ln: StyledLine) bool {
+    if (ln.kind == .decl_header or ln.kind == .decl_anchor) return true;
+    if (ln.kind == .source and ln.decl_annotation != null) return true;
+    return false;
 }
 
-/// Split-mode counterpart of `LinePair.headerSide` that also matches
-/// `.decl_anchor`. Picks the right side first so mirrored anchors
-/// (changed/unchanged) keep their existing right-side preference.
-fn anchorOrHeaderSide(p: LinePair) ?StyledLine {
-    if (isAnchorOrHeaderKind(p.right.kind)) return p.right;
-    if (isAnchorOrHeaderKind(p.left.kind)) return p.left;
+/// Split-mode counterpart of `LinePair.headerSide` that matches every
+/// representative-row kind. Picks the right side first so mirrored
+/// representatives keep their existing right-side preference.
+fn declRepresentativeSide(p: LinePair) ?StyledLine {
+    if (isDeclRepresentativeKind(p.right)) return p.right;
+    if (isDeclRepresentativeKind(p.left)) return p.left;
     return null;
 }
 
@@ -469,14 +478,14 @@ fn findDeclRow(view: View, id: DeclId) ?usize {
     return switch (view) {
         .unified => |lines| blk: {
             for (lines, 0..) |ln, i| {
-                if (!isAnchorOrHeaderKind(ln.kind)) continue;
+                if (!isDeclRepresentativeKind(ln)) continue;
                 if (ln.decl_id) |did| if (did == id) break :blk i;
             }
             break :blk null;
         },
         .split => |pairs| blk: {
             for (pairs, 0..) |p, i| {
-                const side = anchorOrHeaderSide(p) orelse continue;
+                const side = declRepresentativeSide(p) orelse continue;
                 if (side.decl_id) |did| if (did == id) break :blk i;
             }
             break :blk null;
@@ -876,6 +885,35 @@ fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
     const text_col: u16 = 2 + indent_cols;
 
     drawStyledText(body, row, text_col, sl, base_style);
+    drawDeclAnnotation(body, row, text_col, sl);
+}
+
+/// Render `sl.decl_annotation` as a trailing dim suffix to the right of
+/// the source text. Inlined annotation on the decl's first source row
+/// replaces the dedicated `.decl_anchor` landmark row in the file-wide
+/// view. No-op when `sl.decl_annotation == null`.
+fn drawDeclAnnotation(
+    body: vaxis.Window,
+    row: u16,
+    text_col: u16,
+    sl: StyledLine,
+) void {
+    const annotation = sl.decl_annotation orelse return;
+
+    const text_cols: u16 = vaxis.gwidth.gwidth(sl.text, .unicode);
+    // 2-cell gap between the source text and the annotation so the
+    // annotation reads as a separate landmark, not a continuation of
+    // the line. Skip drawing entirely if the gap alone would push us
+    // past the body width.
+    const gap_cols: u16 = 2;
+    const start_col_u32: u32 = @as(u32, text_col) + @as(u32, text_cols) + @as(u32, gap_cols);
+    if (start_col_u32 >= body.width) return;
+    const start_col: u16 = @intCast(start_col_u32);
+
+    _ = body.print(&.{.{
+        .text = annotation,
+        .style = .{ .dim = true },
+    }}, .{ .row_offset = row, .col_offset = start_col, .wrap = .none });
 }
 
 /// Render a `… N unchanged lines …` row. Centred dim italic text with a
@@ -1779,10 +1817,12 @@ fn firstElidedRow(lines: []const StyledLine) ?usize {
     return null;
 }
 
-test "nextDeclRow / prevDeclRow: jump across decl_anchor rows in file-wide view" {
-    // file_view.zig populates `decl_index` from `.decl_anchor` rows, so
-    // the existing forward/backward walk should land on anchor rows just
-    // like it does on `.decl_header` rows in the decl-axis view.
+test "nextDeclRow / prevDeclRow: jump across decl rows in file-wide view" {
+    // file_view.zig populates `decl_index` from each decl's representative
+    // row — annotated `.source` for expanded decls, `.decl_anchor` for
+    // collapsed ones — so the existing forward/backward walk should land
+    // on those rows just like it does on `.decl_header` rows in the
+    // decl-axis view.
     const before =
         \\pub fn a() void {}
         \\pub fn b() u32 { return 1; }
@@ -1801,10 +1841,15 @@ test "nextDeclRow / prevDeclRow: jump across decl_anchor rows in file-wide view"
     var built = try buildFileViewForTest(&fd, &state);
     defer built.deinit();
 
-    // Three decls → three anchor rows in the index.
+    // Three decls → three navigable rows in the index.
     try testing.expectEqual(@as(usize, 3), built.decl_index.len);
     for (built.decl_index) |e| {
-        try testing.expectEqual(LineKind.decl_anchor, built.view.unified[e.row].kind);
+        const ln = built.view.unified[e.row];
+        // Expanded decls are anchored on their first source row (which
+        // carries the inline `(name, ts_kind)` annotation); collapsed
+        // decls would be anchored on a `.decl_anchor` row instead.
+        try testing.expectEqual(LineKind.source, ln.kind);
+        try testing.expect(ln.decl_annotation != null);
     }
 
     // Forward walk visits each anchor in row order and wraps to the first.
@@ -1959,11 +2004,177 @@ test "toggleFocusedGap: cursor on non-elided row is a no-op" {
     var built = try buildFileViewForTest(&fd, &state);
     defer built.deinit();
 
-    // Park the cursor on the changed `.decl_anchor` row, which is the
-    // first row in this short file.
+    // Park the cursor on the changed decl's first source row — with the
+    // inline annotation, that row replaces the old `.decl_anchor`
+    // landmark and is the natural "on the decl" cursor position.
     state.cursor_y = 0;
-    try testing.expectEqual(LineKind.decl_anchor, built.view.unified[0].kind);
+    try testing.expectEqual(LineKind.source, built.view.unified[0].kind);
+    try testing.expect(built.view.unified[0].decl_annotation != null);
 
     try toggleFocusedGap(testing.allocator, &built, &fd, &state, .unified, 30, &file_view_mod.build);
     try testing.expectEqual(@as(usize, 0), state.expanded_gaps.count());
+}
+
+// ── decl annotation rendering ────────────────────────────────────────────
+
+test "drawDeclAnnotation: no-op when sl.decl_annotation is null" {
+    // Render with no annotation; the cells past `text_col + text width`
+    // must stay default (untouched).
+    var screen = try vaxis.Screen.init(testing.allocator, .{
+        .cols = 40,
+        .rows = 4,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 40,
+        .height = 4,
+        .screen = &screen,
+    };
+    win.clear();
+
+    const sl: StyledLine = .{
+        .indent = 0,
+        .marker = .unchanged,
+        .kind = .source,
+        .text = "hello",
+        .decl_annotation = null,
+    };
+    drawDeclAnnotation(win, 0, 2, sl);
+
+    // Every column on row 0 stays at the default (cleared) state.
+    var col: u16 = 0;
+    while (col < win.width) : (col += 1) {
+        try testing.expect(screen.readCell(col, 0).?.default);
+    }
+}
+
+test "drawDeclAnnotation: prints the annotation past the source text in dim style" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{
+        .cols = 60,
+        .rows = 4,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 60,
+        .height = 4,
+        .screen = &screen,
+    };
+    win.clear();
+
+    const annotation = "(greet, function_declaration)";
+    const sl: StyledLine = .{
+        .indent = 0,
+        .marker = .added,
+        .kind = .source,
+        .text = "pub fn greet() void {",
+        .decl_annotation = annotation,
+    };
+    // text_col=2 (after gutter+space). text width=21. 2-cell gap.
+    const text_col: u16 = 2;
+    const expected_start: u16 = text_col + 21 + 2;
+    drawDeclAnnotation(win, 0, text_col, sl);
+
+    // First annotation char lands at the expected column with `dim`.
+    const head = screen.readCell(expected_start, 0).?;
+    try testing.expectEqualStrings("(", head.char.grapheme);
+    try testing.expect(head.style.dim);
+
+    // The cell just before the annotation stays default (the 2-cell gap).
+    try testing.expect(screen.readCell(expected_start - 1, 0).?.default);
+}
+
+test "focusedDeclId: annotated source row reports its own decl_id without walking back" {
+    // File-wide builder for an expanded decl: the first source row
+    // carries both `decl_id` and `decl_annotation`. Cursor on that row
+    // (or any source row beneath it) maps directly to the decl without
+    // needing a separate `.decl_anchor` landmark.
+    const id_a: DeclId = 0xA1;
+    const id_b: DeclId = 0xB2;
+    const lines = [_]StyledLine{
+        .{
+            .indent = 0,
+            .marker = .added,
+            .kind = .source,
+            .text = "pub fn fresh() void {",
+            .decl_id = id_a,
+            .decl_annotation = "(fresh, function_declaration)",
+        },
+        .{
+            .indent = 0,
+            .marker = .added,
+            .kind = .source,
+            .text = "    return;",
+            .decl_id = id_a,
+        },
+        .{
+            .indent = 0,
+            .marker = .changed,
+            .kind = .source,
+            .text = "pub fn other() u32 { return 1; }",
+            .decl_id = id_b,
+            .decl_annotation = "(other, function_declaration)",
+        },
+    };
+    const view: View = .{ .unified = lines[0..] };
+
+    try testing.expectEqual(@as(?DeclId, id_a), focusedDeclId(view, 0));
+    try testing.expectEqual(@as(?DeclId, id_a), focusedDeclId(view, 1));
+    try testing.expectEqual(@as(?DeclId, id_b), focusedDeclId(view, 2));
+}
+
+test "findDeclRow: lands on annotated source row for expanded decls, anchor row for collapsed" {
+    const id_expanded: DeclId = 0xEE;
+    const id_collapsed: DeclId = 0xCC;
+    const lines = [_]StyledLine{
+        // Expanded decl: first source row carries the annotation.
+        .{
+            .indent = 0,
+            .marker = .added,
+            .kind = .source,
+            .text = "pub fn fresh() void {",
+            .decl_id = id_expanded,
+            .decl_annotation = "(fresh, function_declaration)",
+        },
+        .{
+            .indent = 0,
+            .marker = .added,
+            .kind = .source,
+            .text = "}",
+            .decl_id = id_expanded,
+        },
+        // Collapsed decl: anchor row + synthetic elided body.
+        .{
+            .indent = 0,
+            .marker = .changed,
+            .kind = .decl_anchor,
+            .text = "tweak  (function_declaration)",
+            .decl_id = id_collapsed,
+        },
+        .{
+            .indent = 0,
+            .marker = .blank,
+            .kind = .elided,
+            .text = "\u{2026} body of tweak (1 lines) \u{2026}",
+        },
+    };
+    const view: View = .{ .unified = lines[0..] };
+
+    // Expanded: lands on the annotated source row, not a body row.
+    try testing.expectEqual(@as(?usize, 0), findDeclRow(view, id_expanded));
+    // Collapsed: lands on the anchor row, not the elided body.
+    try testing.expectEqual(@as(?usize, 2), findDeclRow(view, id_collapsed));
 }

@@ -113,7 +113,7 @@ pub fn draw(win: vaxis.Window, state: *const ListState, focused: bool) void {
     var row: u16 = 0;
     var i: usize = state.scroll;
     while (i < end) : (i += 1) {
-        drawRow(win, header_rows + row, state.entries[i], i == state.cursor, a);
+        drawRow(win, header_rows + row, state.entries[i], i == state.cursor, focused, a);
         row += 1;
     }
 }
@@ -123,10 +123,12 @@ fn drawRow(
     row: u16,
     entry: Entry,
     selected_row: bool,
+    focused: bool,
     a: std.mem.Allocator,
 ) void {
     const text = formatRow(a, entry) catch "";
-    const style: vaxis.Style = if (selected_row) .{ .reverse = true } else .{};
+    const base: vaxis.Style = if (selected_row) .{ .reverse = true } else .{};
+    const style = dimUnlessFocused(base, focused);
 
     const result = win.print(&.{.{ .text = text, .style = style }}, .{
         .row_offset = row,
@@ -138,13 +140,23 @@ fn drawRow(
     if (selected_row and result.col < win.width) {
         const pad: vaxis.Cell = .{
             .char = .{ .grapheme = " ", .width = 1 },
-            .style = .{ .reverse = true },
+            .style = style,
         };
         var col: u16 = result.col;
         while (col < win.width) : (col += 1) {
             win.writeCell(col, row, pad);
         }
     }
+}
+
+/// OR `.dim = true` into `style` when `focused` is false; identity
+/// otherwise. Mirrors `app.dimUnlessFocused` so the sidebar matches the
+/// diff pane's focus shading.
+fn dimUnlessFocused(style: vaxis.Style, focused: bool) vaxis.Style {
+    if (focused) return style;
+    var s = style;
+    s.dim = true;
+    return s;
 }
 
 fn formatRow(a: std.mem.Allocator, entry: Entry) ![]u8 {

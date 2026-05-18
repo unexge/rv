@@ -215,11 +215,22 @@ pub fn drawDiffPane(
         .width = size.width,
         .height = size.height,
     });
-    if (header) |h| drawHeader(pane, h.title, h.stats);
+    if (header) |h| drawHeader(pane, h.title, h.stats, focused);
     switch (mode) {
         .unified => drawUnifiedBody(pane, built, state, focused),
         .split => drawSplitBody(pane, built, state, focused),
     }
+}
+
+/// OR `.dim = true` into `style` when `focused` is false; identity
+/// otherwise. Idempotent. Applied at every cell-emitting site so the
+/// non-focused pane reads as uniformly dim and the focused pane keeps
+/// its full palette.
+fn dimUnlessFocused(style: vaxis.Style, focused: bool) vaxis.Style {
+    if (focused) return style;
+    var s = style;
+    s.dim = true;
+    return s;
 }
 
 /// Apply one keypress to the diff-pane state. Same key set as `run`'s
@@ -734,20 +745,20 @@ fn drawUnifiedBody(
     var row: u16 = 0;
     var i: usize = state.scroll_y;
     while (i < end) : (i += 1) {
-        drawLine(body, row, lines[i], focused and i == state.cursor_y);
+        drawLine(body, row, lines[i], focused and i == state.cursor_y, focused);
         row += 1;
     }
 }
 
-fn drawHeader(win: vaxis.Window, title: []const u8, stats_text: []const u8) void {
+fn drawHeader(win: vaxis.Window, title: []const u8, stats_text: []const u8, focused: bool) void {
     _ = win.print(&.{.{
         .text = title,
-        .style = .{ .bold = true },
+        .style = dimUnlessFocused(.{ .bold = true }, focused),
     }}, .{ .row_offset = 0, .wrap = .none });
 
     _ = win.print(&.{.{
         .text = stats_text,
-        .style = .{ .dim = true },
+        .style = dimUnlessFocused(.{ .dim = true }, focused),
     }}, .{ .row_offset = 1, .wrap = .none });
 }
 
@@ -842,28 +853,28 @@ fn drawSplitBody(
         const is_cursor = focused and i == state.cursor_y;
         // Cursor marker is only drawn on the left pane so the right pane's
         // gutter stays readable.
-        drawLine(left_body, row, pairs[i].left, is_cursor);
-        drawLine(right_body, row, pairs[i].right, false);
+        drawLine(left_body, row, pairs[i].left, is_cursor, focused);
+        drawLine(right_body, row, pairs[i].right, false, focused);
         row += 1;
     }
 }
 
 // ── draw: shared ───────────────────────────────────────────────────────────
 
-fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
+fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, focused: bool) void {
     if (sl.kind == .elided) {
-        drawElidedLine(body, row, sl, cursor);
+        drawElidedLine(body, row, sl, cursor, focused);
         return;
     }
     if (sl.kind == .decl_anchor) {
-        drawDeclAnchor(body, row, sl, cursor);
+        drawDeclAnchor(body, row, sl, cursor, focused);
         return;
     }
     if (sl.marker == .blank and sl.kind == .blank) {
         if (cursor) {
             _ = body.print(&.{.{
                 .text = ">",
-                .style = .{ .bold = true },
+                .style = dimUnlessFocused(.{ .bold = true }, focused),
             }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
         }
         return;
@@ -877,15 +888,15 @@ fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
     const gutter_char: []const u8 = if (cursor) ">" else sl.marker.gutter();
     _ = body.print(&.{.{
         .text = gutter_char,
-        .style = base_style,
+        .style = dimUnlessFocused(base_style, focused),
     }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
 
     // Indent columns (2 per level) start after the gutter + space.
     const indent_cols: u16 = @as(u16, @intCast(sl.indent)) * 2;
     const text_col: u16 = 2 + indent_cols;
 
-    drawStyledText(body, row, text_col, sl, base_style);
-    drawDeclAnnotation(body, row, text_col, sl);
+    drawStyledText(body, row, text_col, sl, base_style, focused);
+    drawDeclAnnotation(body, row, text_col, sl, focused);
 }
 
 /// Render `sl.decl_annotation` as a trailing dim suffix to the right of
@@ -897,6 +908,7 @@ fn drawDeclAnnotation(
     row: u16,
     text_col: u16,
     sl: StyledLine,
+    focused: bool,
 ) void {
     const annotation = sl.decl_annotation orelse return;
 
@@ -912,7 +924,7 @@ fn drawDeclAnnotation(
 
     _ = body.print(&.{.{
         .text = annotation,
-        .style = .{ .dim = true },
+        .style = dimUnlessFocused(.{ .dim = true }, focused),
     }}, .{ .row_offset = row, .col_offset = start_col, .wrap = .none });
 }
 
@@ -920,7 +932,7 @@ fn drawDeclAnnotation(
 /// `⋯` gutter to read as a structural break rather than a source line.
 /// When focused, the gutter swaps to `>` and the body text loses the dim
 /// bit so it reads as "press space to expand".
-fn drawElidedLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
+fn drawElidedLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, focused: bool) void {
     const gutter_char: []const u8 = if (cursor) ">" else "\u{22EF}";
     const gutter_style: vaxis.Style = if (cursor)
         .{ .bold = true }
@@ -928,7 +940,7 @@ fn drawElidedLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) vo
         .{ .dim = true };
     _ = body.print(&.{.{
         .text = gutter_char,
-        .style = gutter_style,
+        .style = dimUnlessFocused(gutter_style, focused),
     }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
 
     const text_style: vaxis.Style = if (cursor)
@@ -947,7 +959,7 @@ fn drawElidedLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) vo
     const text_col: u16 = prefix_cols + pad;
     _ = body.print(&.{.{
         .text = sl.text,
-        .style = text_style,
+        .style = dimUnlessFocused(text_style, focused),
     }}, .{ .row_offset = row, .col_offset = text_col, .wrap = .none });
 }
 
@@ -956,8 +968,8 @@ fn drawElidedLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) vo
 /// (added/removed/changed) tints the gutter and text. The fixed `\u{25B8}`
 /// gutter (right-pointing triangle) keeps it visually distinct from
 /// `.decl_header`'s `=`/`+`/`-`/`~` gutter.
-fn drawDeclAnchor(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool) void {
-    const base_style = styleFor(sl);
+fn drawDeclAnchor(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, focused: bool) void {
+    const base_style = dimUnlessFocused(styleFor(sl), focused);
     const gutter_char: []const u8 = if (cursor) ">" else "\u{25B8}";
     _ = body.print(&.{.{
         .text = gutter_char,
@@ -988,12 +1000,13 @@ fn drawStyledText(
     text_col: u16,
     sl: StyledLine,
     base_style: vaxis.Style,
+    focused: bool,
 ) void {
     if (sl.text.len == 0) return;
 
     // Fast path: no decoration → single print.
     if (sl.highlights.len == 0 and sl.novel_spans.len == 0) {
-        _ = body.print(&.{.{ .text = sl.text, .style = base_style }}, .{
+        _ = body.print(&.{.{ .text = sl.text, .style = dimUnlessFocused(base_style, focused) }}, .{
             .row_offset = row,
             .col_offset = text_col,
             .wrap = .none,
@@ -1013,7 +1026,7 @@ fn drawStyledText(
         if (!s.eql(run_style)) {
             _ = body.print(&.{.{
                 .text = sl.text[run_start..pos],
-                .style = run_style,
+                .style = dimUnlessFocused(run_style, focused),
             }}, .{
                 .row_offset = row,
                 .col_offset = text_col + @as(u16, @intCast(run_start)),
@@ -1025,7 +1038,7 @@ fn drawStyledText(
     }
     _ = body.print(&.{.{
         .text = sl.text[run_start..pos],
-        .style = run_style,
+        .style = dimUnlessFocused(run_style, focused),
     }}, .{
         .row_offset = row,
         .col_offset = text_col + @as(u16, @intCast(run_start)),
@@ -2046,7 +2059,7 @@ test "drawDeclAnnotation: no-op when sl.decl_annotation is null" {
         .text = "hello",
         .decl_annotation = null,
     };
-    drawDeclAnnotation(win, 0, 2, sl);
+    drawDeclAnnotation(win, 0, 2, sl, true);
 
     // Every column on row 0 stays at the default (cleared) state.
     var col: u16 = 0;
@@ -2086,7 +2099,7 @@ test "drawDeclAnnotation: prints the annotation past the source text in dim styl
     // text_col=2 (after gutter+space). text width=21. 2-cell gap.
     const text_col: u16 = 2;
     const expected_start: u16 = text_col + 21 + 2;
-    drawDeclAnnotation(win, 0, text_col, sl);
+    drawDeclAnnotation(win, 0, text_col, sl, true);
 
     // First annotation char lands at the expected column with `dim`.
     const head = screen.readCell(expected_start, 0).?;
@@ -2177,4 +2190,21 @@ test "findDeclRow: lands on annotated source row for expanded decls, anchor row 
     try testing.expectEqual(@as(?usize, 0), findDeclRow(view, id_expanded));
     // Collapsed: lands on the anchor row, not the elided body.
     try testing.expectEqual(@as(?usize, 2), findDeclRow(view, id_collapsed));
+}
+
+// ── dimUnlessFocused ─────────────────────────────────────────────
+
+test "dimUnlessFocused: focused leaves style untouched" {
+    const s: vaxis.Style = .{ .bold = true, .fg = .{ .index = 2 } };
+    const got = dimUnlessFocused(s, true);
+    try testing.expect(s.eql(got));
+    try testing.expect(!got.dim);
+}
+
+test "dimUnlessFocused: not focused sets dim, preserves other fields" {
+    const s: vaxis.Style = .{ .bold = true, .fg = .{ .index = 2 } };
+    const got = dimUnlessFocused(s, false);
+    try testing.expect(got.dim);
+    try testing.expect(got.bold);
+    try testing.expect(vaxis.Cell.Color.eql(got.fg, .{ .index = 2 }));
 }

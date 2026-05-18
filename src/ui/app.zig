@@ -814,6 +814,10 @@ fn drawUnifiedBody(
         drawLine(body, row, lines[i], gutter, focused and i == state.cursor_y, focused);
         row += 1;
     }
+
+    if (visibleCursorRow(state, body.height, lines.len, focused)) |vrow| {
+        paintCursorRowBg(body, vrow);
+    }
 }
 
 fn drawHeader(win: vaxis.Window, title: []const u8, stats_text: []const u8, focused: bool) void {
@@ -927,6 +931,51 @@ fn drawSplitBody(
         drawLine(left_body, row, pairs[i].left, left_gutter, is_cursor, focused);
         drawLine(right_body, row, pairs[i].right, right_gutter, false, focused);
         row += 1;
+    }
+
+    // Apply the highlight to `pane` (not the half-bodies) so the
+    // separator column between the two panes is also tinted, giving a
+    // continuous bar across the row.
+    if (visibleCursorRow(state, body_h, pairs.len, focused)) |vrow| {
+        paintCursorRowBg(pane, header_rows + vrow);
+    }
+}
+
+/// Visible row (within the body) that the cursor occupies, or null when
+/// it isn't currently in the viewport (e.g. an empty view, or the pane
+/// is unfocused). Used by `paintCursorRowBg` to bound the post-pass to
+/// a single row.
+fn visibleCursorRow(state: *const AppState, body_h: u16, total: usize, focused: bool) ?u16 {
+    if (!focused) return null;
+    if (total == 0) return null;
+    if (state.cursor_y < state.scroll_y) return null;
+    const offset = state.cursor_y - state.scroll_y;
+    if (offset >= body_h) return null;
+    return @intCast(offset);
+}
+
+/// Background colour overlaid on every cell of the cursor row to make
+/// the selected line readable at a glance. Indexed ANSI 8 ("bright
+/// black") renders as a subtle grey on most palettes - dark enough on
+/// light themes to read as a highlight, light enough on dark themes to
+/// stay visible without overpowering the diff colours.
+const cursor_row_bg: vaxis.Cell.Color = .{ .index = 8 };
+
+/// Walk every column on `row` of `win`, read the existing cell, stamp
+/// `cursor_row_bg` onto its `style.bg`, and write it back. Cells that
+/// were never painted by an upstream draw step (e.g. trailing space
+/// past the end of a short line) read as default and become
+/// single-space cells with the highlight bg, so the bar reads as one
+/// continuous block across the full row width.
+fn paintCursorRowBg(win: vaxis.Window, row: u16) void {
+    if (row >= win.height) return;
+    var col: u16 = 0;
+    while (col < win.width) : (col += 1) {
+        const cell = win.readCell(col, row) orelse continue;
+        var updated = cell;
+        updated.default = false;
+        updated.style.bg = cursor_row_bg;
+        win.writeCell(col, row, updated);
     }
 }
 

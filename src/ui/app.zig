@@ -725,6 +725,71 @@ fn centerOnRow(state: *AppState, target: usize, viewport: u16, total: usize) voi
     state.scroll_y = @min(state.scroll_y, max_scroll);
 }
 
+// ── line-number gutter ────────────────────────────────────────────────────
+
+/// Per-side digit count for the dim line-number gutter rendered before
+/// the marker column. `{0, 0}` means no row in the view carries a line
+/// number (e.g. summary panes from the decl-axis builder), in which case
+/// the gutter is omitted entirely so the existing layout is preserved.
+const LineNumberGutter = struct {
+    left_cols: u8 = 0,
+    right_cols: u8 = 0,
+};
+
+/// Single pass over `view` to determine how wide each line-number column
+/// must be to fit the largest 1-indexed source line. Used once per frame
+/// by `drawUnifiedBody` / `drawSplitBody`; the result is stable across
+/// scrolling so the gutter never resizes mid-file.
+fn lineNumberGutter(view: View) LineNumberGutter {
+    var max_left: u32 = 0;
+    var max_right: u32 = 0;
+    switch (view) {
+        .unified => |lines| for (lines) |ln| {
+            if (ln.line_no_left) |n| {
+                if (n > max_left) max_left = n;
+            }
+            if (ln.line_no_right) |n| {
+                if (n > max_right) max_right = n;
+            }
+        },
+        .split => |pairs| for (pairs) |p| {
+            // Each pane only renders its own side, so we only sample the
+            // column the pane will actually display.
+            if (p.left.line_no_left) |n| {
+                if (n > max_left) max_left = n;
+            }
+            if (p.right.line_no_right) |n| {
+                if (n > max_right) max_right = n;
+            }
+        },
+    }
+    return .{
+        .left_cols = digitWidth(max_left),
+        .right_cols = digitWidth(max_right),
+    };
+}
+
+/// Number of decimal digits in `n`, or 0 when `n == 0`. The 0 case maps
+/// to "no column reserved" because the file-wide builder uses 1-indexed
+/// line numbers; 0 means "this side never had a number".
+fn digitWidth(n: u32) u8 {
+    if (n == 0) return 0;
+    var w: u8 = 0;
+    var x = n;
+    while (x > 0) : (x /= 10) w += 1;
+    return w;
+}
+
+/// Total columns the line-number gutter occupies before the marker
+/// column. Each populated side contributes `cols + 1` (number + a
+/// trailing space separator).
+fn lineNumberPrefix(gutter: LineNumberGutter) u16 {
+    var p: u16 = 0;
+    if (gutter.left_cols > 0) p += @as(u16, gutter.left_cols) + 1;
+    if (gutter.right_cols > 0) p += @as(u16, gutter.right_cols) + 1;
+    return p;
+}
+
 // ── draw: unified ──────────────────────────────────────────────────────────
 
 fn drawUnifiedBody(
@@ -741,11 +806,12 @@ fn drawUnifiedBody(
     });
 
     const lines = built.view.unified;
+    const gutter = lineNumberGutter(built.view);
     const end = @min(state.scroll_y + body.height, lines.len);
     var row: u16 = 0;
     var i: usize = state.scroll_y;
     while (i < end) : (i += 1) {
-        drawLine(body, row, lines[i], focused and i == state.cursor_y, focused);
+        drawLine(body, row, lines[i], gutter, focused and i == state.cursor_y, focused);
         row += 1;
     }
 }
@@ -846,6 +912,11 @@ fn drawSplitBody(
     }
 
     const pairs = built.view.split;
+    const gutter = lineNumberGutter(built.view);
+    // Each pane only carries its own side of the line-number gutter so
+    // the column never bleeds into the other pane.
+    const left_gutter: LineNumberGutter = .{ .left_cols = gutter.left_cols, .right_cols = 0 };
+    const right_gutter: LineNumberGutter = .{ .left_cols = 0, .right_cols = gutter.right_cols };
     const end = @min(state.scroll_y + body_h, pairs.len);
     var row: u16 = 0;
     var i: usize = state.scroll_y;
@@ -853,21 +924,127 @@ fn drawSplitBody(
         const is_cursor = focused and i == state.cursor_y;
         // Cursor marker is only drawn on the left pane so the right pane's
         // gutter stays readable.
-        drawLine(left_body, row, pairs[i].left, is_cursor, focused);
-        drawLine(right_body, row, pairs[i].right, false, focused);
+        drawLine(left_body, row, pairs[i].left, left_gutter, is_cursor, focused);
+        drawLine(right_body, row, pairs[i].right, right_gutter, false, focused);
         row += 1;
     }
 }
 
 // ── draw: shared ───────────────────────────────────────────────────────────
 
-fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, focused: bool) void {
+/// String-literal digits used by `drawLineNumber`. Cells store grapheme
+/// slices by reference, so the bytes must outlive the frame; pulling
+/// digits from a static table keeps the rendered numbers safe to read
+/// after `drawLineNumber` returns.
+const digit_strs = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" };
+
+/// Render one side of the line-number gutter at `(row, col)`, right-aligned
+/// in `width` columns with `.dim` style. When `n` is null the cell range
+/// is filled with spaces so columns line up across rows that don't carry a
+/// number (`.decl_anchor`, `.elided`, `.blank`, and the blank filler side
+/// of an added/removed row).
+fn drawLineNumber(
+    body: vaxis.Window,
+    row: u16,
+    col: u16,
+    n: ?u32,
+    width: u8,
+    focused: bool,
+) void {
+    if (width == 0) return;
+
+    // u32 fits in 10 decimal digits; the buffer is sized for that plus
+    // a comfortable safety margin, so `bufPrint` cannot fail.
+    var num_buf: [16]u8 = undefined;
+    const num_str: []const u8 = if (n) |v|
+        std.fmt.bufPrint(&num_buf, "{d}", .{v}) catch unreachable
+    else
+        "";
+
+    const w: usize = width;
+    const visible: usize = @min(num_str.len, w);
+    const pad_len: usize = w - visible;
+
+    const style = dimUnlessFocused(.{ .dim = true }, focused);
+    const space_cell: vaxis.Cell = .{
+        .char = .{ .grapheme = " ", .width = 1 },
+        .style = style,
+    };
+
+    // Pad cells: leading spaces so the digits land flush against the
+    // right edge of the column. Writing one cell at a time (rather than
+    // using `body.print`) avoids passing stack-allocated text into the
+    // grapheme slice that vaxis stores by reference.
+    var i: usize = 0;
+    while (i < pad_len) : (i += 1) {
+        body.writeCell(col + @as(u16, @intCast(i)), row, space_cell);
+    }
+
+    // Visible digits. We only emit the trailing `visible` characters so
+    // overflow (a number wider than `width`) clips on the *left*, keeping
+    // the units digit visible. `bufPrint("{d}", u32)` only ever produces
+    // ASCII digits, so no defensive branch is needed.
+    const start = num_str.len - visible;
+    i = 0;
+    while (i < visible) : (i += 1) {
+        const d: u8 = num_str[start + i] - '0';
+        body.writeCell(col + @as(u16, @intCast(pad_len + i)), row, .{
+            .char = .{ .grapheme = digit_strs[d], .width = 1 },
+            .style = style,
+        });
+    }
+}
+
+/// Paint both halves of the line-number gutter for `sl` and return the
+/// column where the existing marker gutter should start. Sides whose
+/// width is zero are skipped entirely so views with no numbers (decl-axis
+/// builder, summary panes) don't get an empty column.
+fn drawLineNumberGutter(
+    body: vaxis.Window,
+    row: u16,
+    sl: StyledLine,
+    gutter: LineNumberGutter,
+    focused: bool,
+) u16 {
+    const sep_style = dimUnlessFocused(.{ .dim = true }, focused);
+    const sep_cell: vaxis.Cell = .{
+        .char = .{ .grapheme = " ", .width = 1 },
+        .style = sep_style,
+    };
+    var col: u16 = 0;
+    if (gutter.left_cols > 0) {
+        drawLineNumber(body, row, col, sl.line_no_left, gutter.left_cols, focused);
+        col += @as(u16, gutter.left_cols);
+        // Trailing space separator drawn explicitly with the dim style so
+        // it reads as part of the gutter rather than blank screen.
+        body.writeCell(col, row, sep_cell);
+        col += 1;
+    }
+    if (gutter.right_cols > 0) {
+        drawLineNumber(body, row, col, sl.line_no_right, gutter.right_cols, focused);
+        col += @as(u16, gutter.right_cols);
+        body.writeCell(col, row, sep_cell);
+        col += 1;
+    }
+    return col;
+}
+
+fn drawLine(
+    body: vaxis.Window,
+    row: u16,
+    sl: StyledLine,
+    gutter: LineNumberGutter,
+    cursor: bool,
+    focused: bool,
+) void {
+    const ln_prefix = drawLineNumberGutter(body, row, sl, gutter, focused);
+
     if (sl.kind == .elided) {
-        drawElidedLine(body, row, sl, cursor, focused);
+        drawElidedLine(body, row, sl, ln_prefix, cursor, focused);
         return;
     }
     if (sl.kind == .decl_anchor) {
-        drawDeclAnchor(body, row, sl, cursor, focused);
+        drawDeclAnchor(body, row, sl, ln_prefix, cursor, focused);
         return;
     }
     if (sl.marker == .blank and sl.kind == .blank) {
@@ -875,7 +1052,7 @@ fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, focused:
             _ = body.print(&.{.{
                 .text = ">",
                 .style = dimUnlessFocused(.{ .bold = true }, focused),
-            }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
+            }}, .{ .row_offset = row, .col_offset = ln_prefix, .wrap = .none });
         }
         return;
     }
@@ -889,11 +1066,11 @@ fn drawLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, focused:
     _ = body.print(&.{.{
         .text = gutter_char,
         .style = dimUnlessFocused(base_style, focused),
-    }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
+    }}, .{ .row_offset = row, .col_offset = ln_prefix, .wrap = .none });
 
     // Indent columns (2 per level) start after the gutter + space.
     const indent_cols: u16 = @as(u16, @intCast(sl.indent)) * 2;
-    const text_col: u16 = 2 + indent_cols;
+    const text_col: u16 = ln_prefix + 2 + indent_cols;
 
     drawStyledText(body, row, text_col, sl, base_style, focused);
     drawDeclAnnotation(body, row, text_col, sl, focused);
@@ -932,7 +1109,14 @@ fn drawDeclAnnotation(
 /// `⋯` gutter to read as a structural break rather than a source line.
 /// When focused, the gutter swaps to `>` and the body text loses the dim
 /// bit so it reads as "press space to expand".
-fn drawElidedLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, focused: bool) void {
+fn drawElidedLine(
+    body: vaxis.Window,
+    row: u16,
+    sl: StyledLine,
+    ln_prefix: u16,
+    cursor: bool,
+    focused: bool,
+) void {
     const gutter_char: []const u8 = if (cursor) ">" else "\u{22EF}";
     const gutter_style: vaxis.Style = if (cursor)
         .{ .bold = true }
@@ -941,18 +1125,19 @@ fn drawElidedLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, fo
     _ = body.print(&.{.{
         .text = gutter_char,
         .style = dimUnlessFocused(gutter_style, focused),
-    }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
+    }}, .{ .row_offset = row, .col_offset = ln_prefix, .wrap = .none });
 
     const text_style: vaxis.Style = if (cursor)
         .{ .italic = true, .bold = true }
     else
         .{ .dim = true, .italic = true };
 
-    // Centre `sl.text` inside the body width past the gutter+space prefix.
-    // Use vaxis's grapheme-width function so the multi-byte ellipsis
-    // (`\u{2026}`) counts as one column rather than three (its UTF-8 byte
-    // length); without this the text would drift right of centre.
-    const prefix_cols: u16 = 2;
+    // Centre `sl.text` inside the body width past the line-number gutter
+    // and the 2-col marker gutter. Use vaxis's grapheme-width function so
+    // the multi-byte ellipsis (`\u{2026}`) counts as one column rather
+    // than three (its UTF-8 byte length); without this the text would
+    // drift right of centre.
+    const prefix_cols: u16 = ln_prefix + 2;
     const avail: u16 = if (body.width > prefix_cols) body.width - prefix_cols else 0;
     const text_cols: u16 = @min(avail, vaxis.gwidth.gwidth(sl.text, .unicode));
     const pad: u16 = if (avail > text_cols) (avail - text_cols) / 2 else 0;
@@ -968,16 +1153,23 @@ fn drawElidedLine(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, fo
 /// (added/removed/changed) tints the gutter and text. The fixed `\u{25B8}`
 /// gutter (right-pointing triangle) keeps it visually distinct from
 /// `.decl_header`'s `=`/`+`/`-`/`~` gutter.
-fn drawDeclAnchor(body: vaxis.Window, row: u16, sl: StyledLine, cursor: bool, focused: bool) void {
+fn drawDeclAnchor(
+    body: vaxis.Window,
+    row: u16,
+    sl: StyledLine,
+    ln_prefix: u16,
+    cursor: bool,
+    focused: bool,
+) void {
     const base_style = dimUnlessFocused(styleFor(sl), focused);
     const gutter_char: []const u8 = if (cursor) ">" else "\u{25B8}";
     _ = body.print(&.{.{
         .text = gutter_char,
         .style = base_style,
-    }}, .{ .row_offset = row, .col_offset = 0, .wrap = .none });
+    }}, .{ .row_offset = row, .col_offset = ln_prefix, .wrap = .none });
 
     const indent_cols: u16 = @as(u16, @intCast(sl.indent)) * 2;
-    const text_col: u16 = 2 + indent_cols;
+    const text_col: u16 = ln_prefix + 2 + indent_cols;
     _ = body.print(&.{.{
         .text = sl.text,
         .style = base_style,
@@ -2207,4 +2399,237 @@ test "dimUnlessFocused: not focused sets dim, preserves other fields" {
     try testing.expect(got.dim);
     try testing.expect(got.bold);
     try testing.expect(vaxis.Cell.Color.eql(got.fg, .{ .index = 2 }));
+}
+
+// ── lineNumberGutter ───────────────────────────────────────────────────────────
+
+test "lineNumberGutter: max digits per side across the unified view" {
+    const lines = [_]StyledLine{
+        .{ .indent = 0, .marker = .unchanged, .kind = .source, .text = "a", .line_no_left = 1, .line_no_right = 1 },
+        .{ .indent = 0, .marker = .removed, .kind = .source, .text = "b", .line_no_left = 99 },
+        .{ .indent = 0, .marker = .added, .kind = .source, .text = "c", .line_no_right = 1234 },
+    };
+    const gutter = lineNumberGutter(.{ .unified = lines[0..] });
+    try testing.expectEqual(@as(u8, 2), gutter.left_cols);
+    try testing.expectEqual(@as(u8, 4), gutter.right_cols);
+}
+
+test "lineNumberGutter: empty view returns {0, 0}" {
+    const empty_unified = lineNumberGutter(.{ .unified = &.{} });
+    try testing.expectEqual(@as(u8, 0), empty_unified.left_cols);
+    try testing.expectEqual(@as(u8, 0), empty_unified.right_cols);
+
+    const empty_split = lineNumberGutter(.{ .split = &.{} });
+    try testing.expectEqual(@as(u8, 0), empty_split.left_cols);
+    try testing.expectEqual(@as(u8, 0), empty_split.right_cols);
+}
+
+test "lineNumberGutter: rows without numbers (summary panes) report {0, 0}" {
+    // Summary panes (added/deleted/binary) and the decl-axis builder
+    // emit `.source` rows without `line_no_*` populated; the gutter
+    // should report {0, 0} so the existing layout is preserved.
+    const lines = [_]StyledLine{
+        .{ .indent = 0, .marker = .added, .kind = .source, .text = "+ binary file" },
+        .{ .indent = 0, .marker = .added, .kind = .source, .text = "+ no decls" },
+    };
+    const gutter = lineNumberGutter(.{ .unified = lines[0..] });
+    try testing.expectEqual(@as(u8, 0), gutter.left_cols);
+    try testing.expectEqual(@as(u8, 0), gutter.right_cols);
+}
+
+test "lineNumberGutter: split view scans each pane's own side" {
+    const blank: StyledLine = .{ .indent = 0, .marker = .blank, .kind = .blank, .text = "" };
+    const pairs = [_]LinePair{
+        .{
+            .left = .{ .indent = 0, .marker = .removed, .kind = .source, .text = "old", .line_no_left = 12 },
+            .right = blank,
+        },
+        .{
+            .left = blank,
+            .right = .{ .indent = 0, .marker = .added, .kind = .source, .text = "new", .line_no_right = 999 },
+        },
+    };
+    const gutter = lineNumberGutter(.{ .split = pairs[0..] });
+    try testing.expectEqual(@as(u8, 2), gutter.left_cols);
+    try testing.expectEqual(@as(u8, 3), gutter.right_cols);
+}
+
+// ── drawLineNumber ─────────────────────────────────────────────────────────────
+
+test "drawLineNumber: prints number right-aligned in width with dim style" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{
+        .cols = 20,
+        .rows = 2,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 2,
+        .screen = &screen,
+    };
+    win.clear();
+
+    drawLineNumber(win, 0, 0, 7, 4, true);
+
+    // Three leading spaces, then "7" at col 3, all dim.
+    try testing.expectEqualStrings(" ", screen.readCell(0, 0).?.char.grapheme);
+    try testing.expect(screen.readCell(0, 0).?.style.dim);
+    try testing.expectEqualStrings(" ", screen.readCell(2, 0).?.char.grapheme);
+    try testing.expectEqualStrings("7", screen.readCell(3, 0).?.char.grapheme);
+    try testing.expect(screen.readCell(3, 0).?.style.dim);
+    // Cells past the gutter stay default.
+    try testing.expect(screen.readCell(4, 0).?.default);
+}
+
+test "drawLineNumber: null pads with spaces so columns stay aligned" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{
+        .cols = 20,
+        .rows = 2,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 20,
+        .height = 2,
+        .screen = &screen,
+    };
+    win.clear();
+
+    drawLineNumber(win, 0, 0, null, 3, true);
+
+    // Width=3 cells of spaces, marked as drawn (not default) so a later
+    // overdraw won't bleed previous content into the gutter.
+    var col: u16 = 0;
+    while (col < 3) : (col += 1) {
+        const cell = screen.readCell(col, 0).?;
+        try testing.expectEqualStrings(" ", cell.char.grapheme);
+        try testing.expect(!cell.default);
+    }
+}
+
+test "drawLineNumber: width=0 is a no-op" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{
+        .cols = 4,
+        .rows = 2,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 4,
+        .height = 2,
+        .screen = &screen,
+    };
+    win.clear();
+
+    drawLineNumber(win, 0, 0, 42, 0, true);
+
+    var col: u16 = 0;
+    while (col < 4) : (col += 1) {
+        try testing.expect(screen.readCell(col, 0).?.default);
+    }
+}
+
+// ── line-number gutter: end-to-end render ───────────────────────────────
+
+test "drawDiffPane: file-wide unified view paints the line-number gutter before the marker" {
+    // Real file-wide BuildResult so the test exercises the same path as
+    // runtime: builder populates `line_no_left` / `line_no_right`, the
+    // pane scans the view to size the gutter, and `drawLine` renders
+    // both columns ahead of the marker character.
+    const before =
+        \\pub fn a() u32 { return 1; }
+    ;
+    const after =
+        \\pub fn a() u32 { return 2; }
+    ;
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    var built = try buildFileViewForTest(&fd, &state);
+    defer built.deinit();
+
+    // Sanity: at least one row carries a line number.
+    var saw_left = false;
+    var saw_right = false;
+    for (built.view.unified) |ln| {
+        if (ln.line_no_left != null) saw_left = true;
+        if (ln.line_no_right != null) saw_right = true;
+    }
+    try testing.expect(saw_left);
+    try testing.expect(saw_right);
+
+    const gutter = lineNumberGutter(built.view);
+    try testing.expect(gutter.left_cols > 0);
+    try testing.expect(gutter.right_cols > 0);
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{
+        .cols = 80,
+        .rows = 20,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 80,
+        .height = 20,
+        .screen = &screen,
+    };
+    win.clear();
+
+    drawDiffPane(win, .{ .x_off = 0, .y_off = 0, .width = 80, .height = 20 }, built, &state, .unified, true, null);
+
+    // The marker must sit at column = lineNumberPrefix(gutter); columns
+    // before that are dim line-number cells (digits or padding spaces).
+    const prefix = lineNumberPrefix(gutter);
+    try testing.expect(prefix > 0);
+
+    // Find the first row that has a marker character (`-`, `+`, `~`, `=`).
+    var marker_row: ?u16 = null;
+    var r: u16 = header_rows;
+    while (r < 20) : (r += 1) {
+        const cell = screen.readCell(prefix, r) orelse continue;
+        const g = cell.char.grapheme;
+        if (std.mem.eql(u8, g, "-") or
+            std.mem.eql(u8, g, "+") or
+            std.mem.eql(u8, g, "~") or
+            std.mem.eql(u8, g, "="))
+        {
+            marker_row = r;
+            break;
+        }
+    }
+    try testing.expect(marker_row != null);
+
+    // Cells in [0, prefix) on the same row are dim line-number cells.
+    var c: u16 = 0;
+    while (c < prefix) : (c += 1) {
+        const cell = screen.readCell(c, marker_row.?).?;
+        try testing.expect(cell.style.dim);
+    }
 }

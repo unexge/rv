@@ -1122,36 +1122,6 @@ fn drawLine(
     const text_col: u16 = ln_prefix + 2 + indent_cols;
 
     drawStyledText(body, row, text_col, sl, base_style, focused);
-    drawDeclAnnotation(body, row, text_col, sl, focused);
-}
-
-/// Render `sl.decl_annotation` as a trailing dim suffix to the right of
-/// the source text. Inlined annotation on the decl's first source row
-/// replaces the dedicated `.decl_anchor` landmark row in the file-wide
-/// view. No-op when `sl.decl_annotation == null`.
-fn drawDeclAnnotation(
-    body: vaxis.Window,
-    row: u16,
-    text_col: u16,
-    sl: StyledLine,
-    focused: bool,
-) void {
-    const annotation = sl.decl_annotation orelse return;
-
-    const text_cols: u16 = vaxis.gwidth.gwidth(sl.text, .unicode);
-    // 2-cell gap between the source text and the annotation so the
-    // annotation reads as a separate landmark, not a continuation of
-    // the line. Skip drawing entirely if the gap alone would push us
-    // past the body width.
-    const gap_cols: u16 = 2;
-    const start_col_u32: u32 = @as(u32, text_col) + @as(u32, text_cols) + @as(u32, gap_cols);
-    if (start_col_u32 >= body.width) return;
-    const start_col: u16 = @intCast(start_col_u32);
-
-    _ = body.print(&.{.{
-        .text = annotation,
-        .style = dimUnlessFocused(.{ .dim = true }, focused),
-    }}, .{ .row_offset = row, .col_offset = start_col, .wrap = .none });
 }
 
 /// Render a `… N unchanged lines …` row. Centred dim italic text with a
@@ -2270,86 +2240,6 @@ test "toggleFocusedGap: cursor on non-elided row is a no-op" {
 }
 
 // ── decl annotation rendering ────────────────────────────────────────────
-
-test "drawDeclAnnotation: no-op when sl.decl_annotation is null" {
-    // Render with no annotation; the cells past `text_col + text width`
-    // must stay default (untouched).
-    var screen = try vaxis.Screen.init(testing.allocator, .{
-        .cols = 40,
-        .rows = 4,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(testing.allocator);
-
-    const win: vaxis.Window = .{
-        .x_off = 0,
-        .y_off = 0,
-        .parent_x_off = 0,
-        .parent_y_off = 0,
-        .width = 40,
-        .height = 4,
-        .screen = &screen,
-    };
-    win.clear();
-
-    const sl: StyledLine = .{
-        .indent = 0,
-        .marker = .unchanged,
-        .kind = .source,
-        .text = "hello",
-        .decl_annotation = null,
-    };
-    drawDeclAnnotation(win, 0, 2, sl, true);
-
-    // Every column on row 0 stays at the default (cleared) state.
-    var col: u16 = 0;
-    while (col < win.width) : (col += 1) {
-        try testing.expect(screen.readCell(col, 0).?.default);
-    }
-}
-
-test "drawDeclAnnotation: prints the annotation past the source text in dim style" {
-    var screen = try vaxis.Screen.init(testing.allocator, .{
-        .cols = 60,
-        .rows = 4,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(testing.allocator);
-
-    const win: vaxis.Window = .{
-        .x_off = 0,
-        .y_off = 0,
-        .parent_x_off = 0,
-        .parent_y_off = 0,
-        .width = 60,
-        .height = 4,
-        .screen = &screen,
-    };
-    win.clear();
-
-    const annotation = "(greet, function_declaration)";
-    const sl: StyledLine = .{
-        .indent = 0,
-        .marker = .added,
-        .kind = .source,
-        .text = "pub fn greet() void {",
-        .decl_annotation = annotation,
-    };
-    // text_col=2 (after gutter+space). text width=21. 2-cell gap.
-    const text_col: u16 = 2;
-    const expected_start: u16 = text_col + 21 + 2;
-    drawDeclAnnotation(win, 0, text_col, sl, true);
-
-    // First annotation char lands at the expected column with `dim`.
-    const head = screen.readCell(expected_start, 0).?;
-    try testing.expectEqualStrings("(", head.char.grapheme);
-    try testing.expect(head.style.dim);
-
-    // The cell just before the annotation stays default (the 2-cell gap).
-    try testing.expect(screen.readCell(expected_start - 1, 0).?.default);
-}
 
 test "focusedDeclId: annotated source row reports its own decl_id without walking back" {
     // File-wide builder for an expanded decl: the first source row

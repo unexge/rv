@@ -381,11 +381,11 @@ fn wrapAtom(arena: std.mem.Allocator, atom: node.Atom) AlignError!*const node.No
 
 // ── import-group body diff ─────────────────────────────────────────────────
 
-/// Build an `ImportGroupDiff` body if both sides supply a non-null
-/// `import_group_key`; otherwise return null and let the caller fall back
-/// to the regular leaf/container body. The two-sided null check is
-/// defensive - paired decls that landed here already shared an identity,
-/// which (for an import-group identity) implies both sides had a key.
+/// Build an `ImportGroupDiff` body if the matched pair share an
+/// import-group identity; otherwise return null and let the caller fall
+/// back to the regular leaf/container body. Pairing already requires
+/// matching `IdentityKey.import_group` flags, so checking either side is
+/// sufficient.
 fn maybeImportGroupBody(
     arena: std.mem.Allocator,
     cfg: *const config_mod.LangConfig,
@@ -394,10 +394,7 @@ fn maybeImportGroupBody(
     left_source: []const u8,
     right_source: []const u8,
 ) AlignError!?result.DeclBody {
-    const key_fn = cfg.import_group_key orelse return null;
-    const left_key = key_fn(ld.list, left_source);
-    const right_key = key_fn(rd.list, right_source);
-    if (left_key == null or right_key == null) return null;
+    if (!ld.identity.import_group) return null;
     return try importGroupBody(arena, cfg, ld, rd, left_source, right_source);
 }
 
@@ -458,9 +455,10 @@ fn importGroupBody(
         }
     }
 
-    const prefix = cfg.import_group_key.?(rd.list, right_source).?;
+    // `extractDecls` stored the import-group key as `identity.name`, so
+    // we don't have to re-invoke `import_group_key` to recover the prefix.
     return .{ .import_group = .{
-        .prefix = prefix,
+        .prefix = rd.identity.name.?,
         .entries = try entries.toOwnedSlice(arena),
     } };
 }

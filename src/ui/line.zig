@@ -370,7 +370,7 @@ fn appendEntries(
                         try out.appendSlice(arena, hunk_lines);
                     },
                     .import_group => |group| {
-                        const line = try buildImportGroupLine(arena, file_diff, group, c.old, c.new, indent + 1);
+                        const line = try buildImportGroupLine(arena, group, indent + 1);
                         try out.append(arena, line);
                     },
                 }
@@ -481,7 +481,7 @@ fn appendEntriesSplit(
                         try appendLeafHunkPairs(arena, out, hunk_lines, indent + 1);
                     },
                     .import_group => |group| {
-                        const line = try buildImportGroupLine(arena, file_diff, group, c.old, c.new, indent + 1);
+                        const line = try buildImportGroupLine(arena, group, indent + 1);
                         try out.append(arena, .{ .left = line, .right = line });
                     },
                 }
@@ -599,18 +599,9 @@ pub fn buildLeafHunk(
 /// `mapHighlightsToLine` round-trip is needed.
 pub fn buildImportGroupLine(
     arena: std.mem.Allocator,
-    file_diff: *const rv.FileDiff,
     group: rv.ImportGroupDiff,
-    old_decl: rv.Decl,
-    new_decl: rv.Decl,
     indent: u8,
 ) !StyledLine {
-    // The synthesized text is built from `group` alone; the rest of the
-    // signature mirrors `buildLeafHunk` for call-site uniformity.
-    _ = file_diff;
-    _ = old_decl;
-    _ = new_decl;
-
     const Symbol = struct { text: []const u8, class: TokenClass };
     var kept_or_added: std.ArrayList(Symbol) = .empty;
     var removed: std.ArrayList([]const u8) = .empty;
@@ -2059,22 +2050,11 @@ test "build: decl_index row order is strictly ascending" {
 
 // ── buildImportGroupLine ────────────────────────────────────────────────
 
-/// Synthetic `FileDiff`/`Decl` shells for `buildImportGroupLine` tests.
-/// The function only consumes `group`, so the shells never get
-/// dereferenced; we hand them out as `undefined` pointers so we don't
-/// have to construct a parsed tree just to exercise the synthesizer.
 fn buildImportGroupLineForTest(
     arena: std.mem.Allocator,
     group: rv.ImportGroupDiff,
 ) !StyledLine {
-    const fd: *const rv.FileDiff = undefined;
-    const decl: rv.Decl = .{
-        .kind = .import,
-        .ts_kind = "use_declaration",
-        .name = null,
-        .list = undefined,
-    };
-    return buildImportGroupLine(arena, fd, group, decl, decl, 0);
+    return buildImportGroupLine(arena, group, 0);
 }
 
 fn findHighlight(line: StyledLine, want: []const u8) ?HighlightSpan {

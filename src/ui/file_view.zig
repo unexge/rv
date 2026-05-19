@@ -635,7 +635,7 @@ fn projectChangedImportGroup(
     cursors: *Cursors,
     annotation: ?[]const u8,
 ) !void {
-    var line = try line_mod.buildImportGroupLine(arena, file_diff, group, old_decl, new_decl, indent);
+    var line = try line_mod.buildImportGroupLine(arena, group, indent);
     line.decl_id = decl_id;
     line.decl_annotation = annotation;
     line.line_no_left = cursors.left_line;

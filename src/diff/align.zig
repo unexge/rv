@@ -126,6 +126,20 @@ pub fn alignDecls(
                     .decl = makeDecl(ld),
                     .moved = moved,
                 } });
+            } else if (try maybeImportGroupBody(arena, cfg, ld, rd, left_source, right_source)) |ig_body| {
+                if (isAllKept(ig_body)) {
+                    try out.append(arena, .{ .unchanged = .{
+                        .decl = makeDecl(rd),
+                        .moved = moved,
+                    } });
+                } else {
+                    try out.append(arena, .{ .changed = .{
+                        .old = makeDecl(ld),
+                        .new = makeDecl(rd),
+                        .body = ig_body,
+                        .moved = moved,
+                    } });
+                }
             } else {
                 const body: result.DeclBody = blk: {
                     if (containerListOf(cfg, ld.list)) |ld_inner| {
@@ -171,6 +185,12 @@ const IdentityKey = struct {
     ts_kind: []const u8,
     name: ?[]const u8,
     occ: usize,
+    /// True when `name` came from `cfg.import_group_key` rather than
+    /// `cfg.extract_name`. Keeps the two namespaces disjoint so that, for
+    /// example, `use foo;` (extract_name "foo") doesn't accidentally pair
+    /// with `use foo::Bar;` (import_group_key "foo") when one side opts
+    /// out of import-group alignment.
+    import_group: bool,
 };
 
 /// Internal record: a Decl plus the metadata alignment needs to track.
@@ -199,14 +219,30 @@ fn extractDecls(
             .list => |l| {
                 if (!contains(cfg.decl_ts_kinds, l.ts_kind)) continue;
                 const list_ptr = &child_ptr.list;
-                const name = cfg.extract_name(list_ptr, source);
+                const display_name = cfg.extract_name(list_ptr, source);
+                // Identity name overrides display name for import-group
+                // decls: two `use foo::Bar;` and `use foo::Baz;` share the
+                // identity `foo` so they pair under a common prefix while
+                // still rendering their full path as the display name.
+                // The `import_group` flag keeps these prefix identities in
+                // a separate namespace from regular extract_name ones.
+                const ig_key: ?[]const u8 = if (cfg.import_group_key) |key_fn|
+                    key_fn(list_ptr, source)
+                else
+                    null;
+                const identity_name: ?[]const u8 = ig_key orelse display_name;
+                const is_ig_identity = ig_key != null;
                 const decl_kind = cfg.classify(l.ts_kind);
 
-                // Compute nth_occurrence of (ts_kind, name) among already-
-                // extracted decls on this side. O(n²); decl counts are small.
+                // Compute nth_occurrence of (ts_kind, identity_name,
+                // import_group) among already-extracted decls on this
+                // side. O(n²); decl counts are small.
                 var occ: usize = 0;
                 for (out.items) |prior| {
-                    if (std.mem.eql(u8, prior.ts_kind, l.ts_kind) and nameEqual(prior.name, name)) {
+                    if (std.mem.eql(u8, prior.ts_kind, l.ts_kind) and
+                        prior.identity.import_group == is_ig_identity and
+                        nameEqual(prior.identity.name, identity_name))
+                    {
                         occ += 1;
                     }
                 }
@@ -216,9 +252,14 @@ fn extractDecls(
                     .list = list_ptr,
                     .child_idx = idx,
                     .ts_kind = l.ts_kind,
-                    .name = name,
+                    .name = display_name,
                     .decl_kind = decl_kind,
-                    .identity = .{ .ts_kind = l.ts_kind, .name = name, .occ = occ },
+                    .identity = .{
+                        .ts_kind = l.ts_kind,
+                        .name = identity_name,
+                        .occ = occ,
+                        .import_group = is_ig_identity,
+                    },
                 });
             },
         }
@@ -249,6 +290,7 @@ fn nameEqual(a: ?[]const u8, b: ?[]const u8) bool {
 
 fn identityEqual(a: IdentityKey, b: IdentityKey) bool {
     if (!std.mem.eql(u8, a.ts_kind, b.ts_kind)) return false;
+    if (a.import_group != b.import_group) return false;
     if (!nameEqual(a.name, b.name)) return false;
     return a.occ == b.occ;
 }
@@ -335,6 +377,108 @@ fn wrapAtom(arena: std.mem.Allocator, atom: node.Atom) AlignError!*const node.No
     const wrapper = try arena.create(node.Node);
     wrapper.* = .{ .atom = atom };
     return wrapper;
+}
+
+// ── import-group body diff ─────────────────────────────────────────────────
+
+/// Build an `ImportGroupDiff` body if both sides supply a non-null
+/// `import_group_key`; otherwise return null and let the caller fall back
+/// to the regular leaf/container body. The two-sided null check is
+/// defensive - paired decls that landed here already shared an identity,
+/// which (for an import-group identity) implies both sides had a key.
+fn maybeImportGroupBody(
+    arena: std.mem.Allocator,
+    cfg: *const config_mod.LangConfig,
+    ld: DeclInfo,
+    rd: DeclInfo,
+    left_source: []const u8,
+    right_source: []const u8,
+) AlignError!?result.DeclBody {
+    const key_fn = cfg.import_group_key orelse return null;
+    const left_key = key_fn(ld.list, left_source);
+    const right_key = key_fn(rd.list, right_source);
+    if (left_key == null or right_key == null) return null;
+    return try importGroupBody(arena, cfg, ld, rd, left_source, right_source);
+}
+
+/// Diff two paired import-group decls as a per-symbol delta.
+///
+/// Output ordering: walks the right-side symbol list and emits each one as
+/// `.kept` (text-equal match against an unconsumed left symbol) or
+/// `.added`. Unmatched left symbols are spliced as `.removed` next to
+/// their matched neighbour on the left side: those before the first
+/// matched left go at the front, and those between (or after) matched
+/// lefts are emitted right after the kept entry for their preceding match.
+fn importGroupBody(
+    arena: std.mem.Allocator,
+    cfg: *const config_mod.LangConfig,
+    ld: DeclInfo,
+    rd: DeclInfo,
+    left_source: []const u8,
+    right_source: []const u8,
+) AlignError!result.DeclBody {
+    const left_syms = try cfg.import_symbols.?(arena, ld.list, left_source);
+    const right_syms = try cfg.import_symbols.?(arena, rd.list, right_source);
+
+    // Match each right symbol to the first available text-equal left.
+    const left_matched = try arena.alloc(bool, left_syms.len);
+    @memset(left_matched, false);
+    const right_match = try arena.alloc(?usize, right_syms.len);
+    for (right_syms, 0..) |rs, ri| {
+        right_match[ri] = null;
+        for (left_syms, 0..) |ls, li| {
+            if (left_matched[li]) continue;
+            if (std.mem.eql(u8, ls.text, rs.text)) {
+                left_matched[li] = true;
+                right_match[ri] = li;
+                break;
+            }
+        }
+    }
+
+    var entries: std.ArrayList(result.ImportSymbolEntry) = .empty;
+
+    // Lead-in: unmatched lefts before the first matched left.
+    var lead: usize = 0;
+    while (lead < left_syms.len and !left_matched[lead]) : (lead += 1) {
+        try entries.append(arena, .{ .removed = left_syms[lead] });
+    }
+
+    // Walk right symbols in order. After each kept entry, splice any
+    // unmatched lefts that immediately follow its matched left index.
+    for (right_syms, 0..) |rs, ri| {
+        if (right_match[ri]) |li| {
+            try entries.append(arena, .{ .kept = rs });
+            var j = li + 1;
+            while (j < left_syms.len and !left_matched[j]) : (j += 1) {
+                try entries.append(arena, .{ .removed = left_syms[j] });
+            }
+        } else {
+            try entries.append(arena, .{ .added = rs });
+        }
+    }
+
+    const prefix = cfg.import_group_key.?(rd.list, right_source).?;
+    return .{ .import_group = .{
+        .prefix = prefix,
+        .entries = try entries.toOwnedSlice(arena),
+    } };
+}
+
+/// Returns true when `body` is an `import_group` whose entries are all
+/// `.kept` (i.e. left and right have the exact same symbol set, just in a
+/// different order or with whitespace edits). Such bodies represent
+/// reorder-only changes and should demote to `Unchanged`.
+fn isAllKept(body: result.DeclBody) bool {
+    return switch (body) {
+        .import_group => |g| blk: {
+            for (g.entries) |e| {
+                if (e != .kept) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -931,4 +1075,363 @@ test "property: output ordering is deterministic across runs" {
         };
         try testing.expect(nameEqual(name_a, name_b));
     }
+}
+
+// ── import-group alignment ───────────────────────────────────────────────
+//
+// These tests parse real Rust source so they exercise the full pipeline:
+// the import_group_key / import_symbols hooks on `LangConfig` and the
+// alignment integration in this file. They're the contract for the
+// sub-task in dex 7hc4bs38.
+
+const treez = @import("treez");
+const convert = @import("../sst/convert.zig");
+const rust = @import("../lang/rust.zig");
+
+const RustAlignFixture = struct {
+    left_ts: *treez.Tree,
+    right_ts: *treez.Tree,
+    entries: []const result.DeclDiff,
+
+    fn deinit(self: *RustAlignFixture) void {
+        self.left_ts.destroy();
+        self.right_ts.destroy();
+    }
+};
+
+fn alignRust(
+    arena: std.mem.Allocator,
+    left_src: []const u8,
+    right_src: []const u8,
+) !RustAlignFixture {
+    const lang = try treez.Language.get("rust");
+    const parser = try treez.Parser.create();
+    defer parser.destroy();
+    try parser.setLanguage(lang);
+
+    const left_ts = try parser.parseString(null, left_src);
+    errdefer left_ts.destroy();
+    const right_ts = try parser.parseString(null, right_src);
+    errdefer right_ts.destroy();
+
+    const left_res = try convert.fromTreeSitter(arena, left_ts, left_src, &rust.config);
+    const right_res = try convert.fromTreeSitter(arena, right_ts, right_src, &rust.config);
+    hash_mod.hashTree(left_res.tree);
+    hash_mod.hashTree(right_res.tree);
+
+    const entries = try alignDecls(
+        arena,
+        &rust.config,
+        &left_res.tree.root.list,
+        &right_res.tree.root.list,
+        left_src,
+        right_src,
+    );
+    return .{ .left_ts = left_ts, .right_ts = right_ts, .entries = entries };
+}
+
+fn expectImportGroup(
+    entry: result.DeclDiff,
+    expected_prefix: []const u8,
+    expected: []const result.ImportSymbolEntry,
+) !void {
+    try testing.expect(entry == .changed);
+    try testing.expect(entry.changed.body == .import_group);
+    const ig = entry.changed.body.import_group;
+    try testing.expectEqualStrings(expected_prefix, ig.prefix);
+    try testing.expectEqual(expected.len, ig.entries.len);
+    for (expected, ig.entries) |want, got| {
+        try testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+        const want_text = switch (want) {
+            .kept => |s| s.text,
+            .added => |s| s.text,
+            .removed => |s| s.text,
+        };
+        const got_text = switch (got) {
+            .kept => |s| s.text,
+            .added => |s| s.text,
+            .removed => |s| s.text,
+        };
+        try testing.expectEqualStrings(want_text, got_text);
+    }
+}
+
+fn sym(text: []const u8) result.ImportSymbol {
+    return .{ .text = text };
+}
+
+test "import-group: single-symbol → brace expansion (Serialize → Deserialize, Serialize)" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use serde::Serialize;\n",
+        "use serde::{Deserialize, Serialize};\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fx.entries.len);
+    try expectImportGroup(fx.entries[0], "serde", &.{
+        .{ .added = sym("Deserialize") },
+        .{ .kept = sym("Serialize") },
+    });
+}
+
+test "import-group: brace → brace add only" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use foo::{a, b};\n",
+        "use foo::{a, b, c};\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fx.entries.len);
+    try expectImportGroup(fx.entries[0], "foo", &.{
+        .{ .kept = sym("a") },
+        .{ .kept = sym("b") },
+        .{ .added = sym("c") },
+    });
+}
+
+test "import-group: brace → brace remove only" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use foo::{a, b, c};\n",
+        "use foo::{a, c};\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fx.entries.len);
+    try expectImportGroup(fx.entries[0], "foo", &.{
+        .{ .kept = sym("a") },
+        .{ .removed = sym("b") },
+        .{ .kept = sym("c") },
+    });
+}
+
+test "import-group: brace → brace add and remove" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use foo::{a, b};\n",
+        "use foo::{a, c};\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fx.entries.len);
+    try expectImportGroup(fx.entries[0], "foo", &.{
+        .{ .kept = sym("a") },
+        .{ .removed = sym("b") },
+        .{ .added = sym("c") },
+    });
+}
+
+test "import-group: single rename under same prefix" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use std::sync::Old;\n",
+        "use std::sync::New;\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fx.entries.len);
+    try expectImportGroup(fx.entries[0], "std::sync", &.{
+        .{ .removed = sym("Old") },
+        .{ .added = sym("New") },
+    });
+}
+
+test "import-group: different sub-prefixes don't merge" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use std::io::Write;\n",
+        "use std::path::Path;\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 2), fx.entries.len);
+    // Right-side first (added), then left-side trailing (removed).
+    try testing.expect(fx.entries[0] == .added);
+    try testing.expect(fx.entries[1] == .removed);
+}
+
+test "import-group: two same-prefix decls don't cross-pair" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use foo::A;\nuse foo::B;\n",
+        "use foo::A;\nuse foo::C;\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 2), fx.entries.len);
+    // `use foo::A;` is byte-identical → Unchanged.
+    try testing.expect(fx.entries[0] == .unchanged);
+    // `use foo::B;` and `use foo::C;` share identity "foo" at occ 1.
+    try expectImportGroup(fx.entries[1], "foo", &.{
+        .{ .removed = sym("B") },
+        .{ .added = sym("C") },
+    });
+}
+
+test "import-group: wildcard opts out" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use foo::*;\n",
+        "use foo::{Bar};\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 2), fx.entries.len);
+    // Different identities → not paired.
+    try testing.expect(fx.entries[0] == .added);
+    try testing.expect(fx.entries[1] == .removed);
+}
+
+test "import-group: pub use opts out" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use foo::Bar;\n",
+        "pub use foo::Bar;\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 2), fx.entries.len);
+    try testing.expect(fx.entries[0] == .added);
+    try testing.expect(fx.entries[1] == .removed);
+}
+
+test "import-group: all-kept reorder demotes to Unchanged" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use foo::{a, b, c};\n",
+        "use foo::{c, a, b};\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fx.entries.len);
+    try testing.expect(fx.entries[0] == .unchanged);
+}
+
+test "import-group: aliases are kept verbatim" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use foo::Bar as Baz;\n",
+        "use foo::{Bar as Baz, Qux};\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fx.entries.len);
+    try expectImportGroup(fx.entries[0], "foo", &.{
+        .{ .kept = sym("Bar as Baz") },
+        .{ .added = sym("Qux") },
+    });
+}
+
+test "import-group: self symbol" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fx = try alignRust(
+        arena,
+        "use foo::{Bar};\n",
+        "use foo::{self, Bar};\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fx.entries.len);
+    try expectImportGroup(fx.entries[0], "foo", &.{
+        .{ .added = sym("self") },
+        .{ .kept = sym("Bar") },
+    });
+}
+
+test "import-group: single-segment use does not collide with prefixed use under same name" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `use foo;` opts out of import-group alignment (single segment, key
+    // returns null). Even though its extract_name happens to be "foo" -
+    // matching the import-group key of `use foo::Bar;` on the right side -
+    // the two must NOT pair: they live in separate identity namespaces.
+    var fx = try alignRust(
+        arena,
+        "use foo;\n",
+        "use foo::Bar;\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 2), fx.entries.len);
+    try testing.expect(fx.entries[0] == .added);
+    try testing.expect(fx.entries[1] == .removed);
+}
+
+test "import-group: use_declaration moved between top-level decls populates `moved`" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Same use line, different position relative to other top-level decls.
+    var fx = try alignRust(
+        arena,
+        "use foo::Bar;\nfn x() {}\n",
+        "fn x() {}\nuse foo::Bar;\n",
+    );
+    defer fx.deinit();
+
+    try testing.expectEqual(@as(usize, 2), fx.entries.len);
+    // `fn x` first on the right side, unchanged with moved 1→0.
+    try testing.expect(fx.entries[0] == .unchanged);
+    try testing.expectEqualStrings("x", fx.entries[0].unchanged.decl.name.?);
+    try testing.expect(fx.entries[0].unchanged.moved != null);
+
+    // Then the use line: byte-identical content, so this is the hash-equal
+    // Unchanged path — `moved` carries the index change orthogonally.
+    try testing.expect(fx.entries[1] == .unchanged);
+    try testing.expectEqualStrings("use_declaration", fx.entries[1].unchanged.decl.ts_kind);
+    try testing.expect(fx.entries[1].unchanged.moved != null);
+    try testing.expectEqual(@as(usize, 0), fx.entries[1].unchanged.moved.?.from_idx);
+    try testing.expectEqual(@as(usize, 1), fx.entries[1].unchanged.moved.?.to_idx);
 }

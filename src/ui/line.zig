@@ -369,7 +369,10 @@ fn appendEntries(
                         const hunk_lines = try buildLeafHunk(arena, file_diff, script, c.old, c.new, indent + 1);
                         try out.appendSlice(arena, hunk_lines);
                     },
-                    .import_group => unreachable, // wired in subtask 2
+                    .import_group => |group| {
+                        const line = try buildImportGroupLine(arena, file_diff, group, c.old, c.new, indent + 1);
+                        try out.append(arena, line);
+                    },
                 }
             },
         }
@@ -477,7 +480,10 @@ fn appendEntriesSplit(
                         const hunk_lines = try buildLeafHunk(arena, file_diff, script, c.old, c.new, indent + 1);
                         try appendLeafHunkPairs(arena, out, hunk_lines, indent + 1);
                     },
-                    .import_group => unreachable, // wired in subtask 2
+                    .import_group => |group| {
+                        const line = try buildImportGroupLine(arena, file_diff, group, c.old, c.new, indent + 1);
+                        try out.append(arena, .{ .left = line, .right = line });
+                    },
                 }
             },
         }
@@ -572,6 +578,104 @@ pub fn buildLeafHunk(
         });
     }
     return try out.toOwnedSlice(arena);
+}
+
+/// Render a `Changed` import-group body as a single inline `.changed`
+/// source row. Walks `group.entries`, splices kept-and-added symbols into
+/// the canonical `use <prefix>::{ ... };` form (or a single-symbol form
+/// when only one such symbol exists, regardless of removals), and surfaces
+/// any removed symbols as a trailing dim ` removed: a, b` suffix so the
+/// brace text stays parseable Rust.
+///
+/// Per-symbol tints come through `StyledLine.highlights`: kept symbols
+/// get the neutral `.ident` class (so they inherit the `.changed`
+/// marker colour), added symbols get `.import_symbol_added`, the literal
+/// `removed:` label gets `.comment`, and each name in the suffix gets
+/// `.import_symbol_removed`. The renderer in `app.zig` then layers
+/// those on top of the row's marker style without any new code paths.
+///
+/// The synthesized text contains no tabs, so byte offsets in the
+/// returned `text` double as display offsets - no `expandTabs` /
+/// `mapHighlightsToLine` round-trip is needed.
+pub fn buildImportGroupLine(
+    arena: std.mem.Allocator,
+    file_diff: *const rv.FileDiff,
+    group: rv.ImportGroupDiff,
+    old_decl: rv.Decl,
+    new_decl: rv.Decl,
+    indent: u8,
+) !StyledLine {
+    // The synthesized text is built from `group` alone; the rest of the
+    // signature mirrors `buildLeafHunk` for call-site uniformity.
+    _ = file_diff;
+    _ = old_decl;
+    _ = new_decl;
+
+    const Symbol = struct { text: []const u8, class: TokenClass };
+    var kept_or_added: std.ArrayList(Symbol) = .empty;
+    var removed: std.ArrayList([]const u8) = .empty;
+    for (group.entries) |entry| switch (entry) {
+        .kept => |s| try kept_or_added.append(arena, .{ .text = s.text, .class = .ident }),
+        .added => |s| try kept_or_added.append(arena, .{ .text = s.text, .class = .import_symbol_added }),
+        .removed => |s| try removed.append(arena, s.text),
+    };
+
+    var buf: std.ArrayList(u8) = .empty;
+    var spans: std.ArrayList(HighlightSpan) = .empty;
+
+    try buf.appendSlice(arena, "use ");
+    try buf.appendSlice(arena, group.prefix);
+    try buf.appendSlice(arena, "::");
+
+    // Single-symbol form is allowed even when there are removals: the
+    // suffix surfaces those, the inline brace would otherwise just
+    // wrap one identifier. `use foo::{};` (zero kept-or-added) still
+    // takes the brace path so the produced text is the empty-brace
+    // degenerate case rather than a stray `use foo::;`.
+    const use_brace = kept_or_added.items.len != 1;
+    if (use_brace) try buf.append(arena, '{');
+
+    for (kept_or_added.items, 0..) |sym, i| {
+        if (i > 0) try buf.appendSlice(arena, ", ");
+        const sym_start: u32 = @intCast(buf.items.len);
+        try buf.appendSlice(arena, sym.text);
+        const sym_end: u32 = @intCast(buf.items.len);
+        try spans.append(arena, .{ .start = sym_start, .end = sym_end, .class = sym.class });
+    }
+
+    if (use_brace) try buf.append(arena, '}');
+    try buf.append(arena, ';');
+
+    if (removed.items.len > 0) {
+        try buf.append(arena, ' ');
+        const label_start: u32 = @intCast(buf.items.len);
+        try buf.appendSlice(arena, "removed:");
+        const label_end: u32 = @intCast(buf.items.len);
+        try spans.append(arena, .{
+            .start = label_start,
+            .end = label_end,
+            .class = .comment,
+        });
+        for (removed.items, 0..) |sym, i| {
+            try buf.appendSlice(arena, if (i == 0) " " else ", ");
+            const sym_start: u32 = @intCast(buf.items.len);
+            try buf.appendSlice(arena, sym);
+            const sym_end: u32 = @intCast(buf.items.len);
+            try spans.append(arena, .{
+                .start = sym_start,
+                .end = sym_end,
+                .class = .import_symbol_removed,
+            });
+        }
+    }
+
+    return .{
+        .indent = indent,
+        .marker = .changed,
+        .kind = .source,
+        .text = try buf.toOwnedSlice(arena),
+        .highlights = try spans.toOwnedSlice(arena),
+    };
 }
 
 /// Convert the unified hunk-line sequence produced by `buildLeafHunk`
@@ -1953,3 +2057,165 @@ test "build: decl_index row order is strictly ascending" {
     }
 }
 
+// ── buildImportGroupLine ────────────────────────────────────────────────
+
+/// Synthetic `FileDiff`/`Decl` shells for `buildImportGroupLine` tests.
+/// The function only consumes `group`, so the shells never get
+/// dereferenced; we hand them out as `undefined` pointers so we don't
+/// have to construct a parsed tree just to exercise the synthesizer.
+fn buildImportGroupLineForTest(
+    arena: std.mem.Allocator,
+    group: rv.ImportGroupDiff,
+) !StyledLine {
+    const fd: *const rv.FileDiff = undefined;
+    const decl: rv.Decl = .{
+        .kind = .import,
+        .ts_kind = "use_declaration",
+        .name = null,
+        .list = undefined,
+    };
+    return buildImportGroupLine(arena, fd, group, decl, decl, 0);
+}
+
+fn findHighlight(line: StyledLine, want: []const u8) ?HighlightSpan {
+    for (line.highlights) |h| {
+        if (std.mem.eql(u8, line.text[h.start..h.end], want)) return h;
+    }
+    return null;
+}
+
+test "buildImportGroupLine: brace form when an addition mixes with kept symbols" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const entries = [_]rv.ImportSymbolEntry{
+        .{ .added = .{ .text = "Deserialize" } },
+        .{ .kept = .{ .text = "Serialize" } },
+    };
+    const line = try buildImportGroupLineForTest(a, .{ .prefix = "serde", .entries = &entries });
+
+    try testing.expectEqualStrings("use serde::{Deserialize, Serialize};", line.text);
+    try testing.expectEqual(Marker.changed, line.marker);
+    try testing.expectEqual(LineKind.source, line.kind);
+
+    const added = findHighlight(line, "Deserialize") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.import_symbol_added, added.class);
+
+    const kept = findHighlight(line, "Serialize") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.ident, kept.class);
+}
+
+test "buildImportGroupLine: removed-only entries surface as a trailing suffix" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const entries = [_]rv.ImportSymbolEntry{
+        .{ .kept = .{ .text = "a" } },
+        .{ .removed = .{ .text = "b" } },
+        .{ .kept = .{ .text = "c" } },
+    };
+    const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
+
+    try testing.expectEqualStrings("use foo::{a, c}; removed: b", line.text);
+    const removed = findHighlight(line, "b") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.import_symbol_removed, removed.class);
+    const label = findHighlight(line, "removed:") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.comment, label.class);
+}
+
+test "buildImportGroupLine: add and remove combined" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const entries = [_]rv.ImportSymbolEntry{
+        .{ .kept = .{ .text = "a" } },
+        .{ .removed = .{ .text = "b" } },
+        .{ .added = .{ .text = "c" } },
+    };
+    const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
+
+    try testing.expectEqualStrings("use foo::{a, c}; removed: b", line.text);
+    const c_span = findHighlight(line, "c") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.import_symbol_added, c_span.class);
+    const b_span = findHighlight(line, "b") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.import_symbol_removed, b_span.class);
+}
+
+test "buildImportGroupLine: single kept symbol uses single-symbol form" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const entries = [_]rv.ImportSymbolEntry{
+        .{ .kept = .{ .text = "Bar" } },
+    };
+    const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
+
+    try testing.expectEqualStrings("use foo::Bar;", line.text);
+}
+
+test "buildImportGroupLine: single added symbol uses single-symbol form" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const entries = [_]rv.ImportSymbolEntry{
+        .{ .added = .{ .text = "Bar" } },
+    };
+    const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
+
+    try testing.expectEqualStrings("use foo::Bar;", line.text);
+    const span = findHighlight(line, "Bar") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.import_symbol_added, span.class);
+}
+
+test "buildImportGroupLine: all-removed degenerate case yields empty brace and full suffix" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const entries = [_]rv.ImportSymbolEntry{
+        .{ .removed = .{ .text = "a" } },
+        .{ .removed = .{ .text = "b" } },
+    };
+    const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
+
+    try testing.expectEqualStrings("use foo::{}; removed: a, b", line.text);
+}
+
+test "buildImportGroupLine: aliases are kept verbatim and tagged correctly" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const entries = [_]rv.ImportSymbolEntry{
+        .{ .kept = .{ .text = "Bar as Baz" } },
+        .{ .added = .{ .text = "Qux" } },
+    };
+    const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
+
+    try testing.expectEqualStrings("use foo::{Bar as Baz, Qux};", line.text);
+    const qux = findHighlight(line, "Qux") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.import_symbol_added, qux.class);
+    const aliased = findHighlight(line, "Bar as Baz") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.ident, aliased.class);
+}
+
+test "buildImportGroupLine: self symbol is just another entry" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const entries = [_]rv.ImportSymbolEntry{
+        .{ .added = .{ .text = "self" } },
+        .{ .kept = .{ .text = "Bar" } },
+    };
+    const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
+
+    try testing.expectEqualStrings("use foo::{self, Bar};", line.text);
+    const self_span = findHighlight(line, "self") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.import_symbol_added, self_span.class);
+}

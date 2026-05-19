@@ -35,6 +35,14 @@ pub const TokenClass = enum {
     punct,
     ident,
     other,
+    /// Per-symbol tint for an added entry inside a `Changed` import-group
+    /// row. Distinct from the file-level `.added` marker style so a green
+    /// symbol on a yellow `.changed` row reads as a within-row tint rather
+    /// than a full added line.
+    import_symbol_added,
+    /// Per-symbol tint for a removed entry surfaced in the trailing
+    /// `removed: ...` suffix of a `Changed` import-group row.
+    import_symbol_removed,
 };
 
 /// Classify an SST atom. `atom_kind` comes from conversion; `bytes` is the
@@ -102,6 +110,17 @@ pub fn style(class: TokenClass, base: vaxis.Style) vaxis.Style {
         .comment => {
             s.fg = .{ .index = 8 };
             s.dim = true;
+        },
+        // Bold lifts the per-symbol tint above its surrounding `.changed`
+        // row colour and distinguishes it from a regular `.added` /
+        // `.removed` source line (which is the same fg without bold).
+        .import_symbol_added => {
+            s.fg = .{ .index = 2 };
+            s.bold = true;
+        },
+        .import_symbol_removed => {
+            s.fg = .{ .index = 1 };
+            s.bold = true;
         },
         .ident, .punct, .other => {},
     }
@@ -305,4 +324,23 @@ test "style: comment carries dim" {
     const base: vaxis.Style = .{};
     const c = style(.comment, base);
     try testing.expect(c.dim);
+}
+
+test "style: import-symbol classes are visually distinct from file-level add/remove" {
+    // A regular `.added` source line uses fg index 2 with no bold; the
+    // per-symbol `.import_symbol_added` class layered on a `.changed`
+    // row's yellow base must end up structurally different so the user
+    // can tell a within-row tint from a full added line.
+    const added_row_base: vaxis.Style = .{ .fg = .{ .index = 2 } };
+    const changed_row_base: vaxis.Style = .{ .fg = .{ .index = 3 } };
+
+    const symbol_added = style(.import_symbol_added, changed_row_base);
+    const symbol_removed = style(.import_symbol_removed, changed_row_base);
+
+    try testing.expect(!added_row_base.eql(symbol_added));
+    try testing.expect(!added_row_base.eql(symbol_removed));
+    try testing.expect(symbol_added.bold);
+    try testing.expect(symbol_removed.bold);
+    try testing.expect(symbol_added.fg == .index and symbol_added.fg.index == 2);
+    try testing.expect(symbol_removed.fg == .index and symbol_removed.fg.index == 1);
 }

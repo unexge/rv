@@ -537,7 +537,27 @@ fn projectChanged(
         .leaf => |script| {
             try projectChangedLeaf(arena, out, file_diff, script, c.old, c.new, id, indent + 1, cursors, annotation);
         },
-        .import_group => unreachable, // wired in subtask 2
+        .import_group => |group| {
+            // Import-group annotation reads `(<prefix>, use_group)` rather
+            // than `(<full_path>, use_declaration)` so the navigable
+            // landmark surfaces the shared prefix the alignment keyed on,
+            // not the verbatim path of one side. `formatDeclAnnotation`
+            // stays unchanged for every other body so its existing tests
+            // and call sites are untouched.
+            const ig_annotation = try formatImportGroupAnnotation(arena, group.prefix, c.moved);
+            try projectChangedImportGroup(
+                arena,
+                out,
+                file_diff,
+                group,
+                c.old,
+                c.new,
+                id,
+                indent + 1,
+                cursors,
+                ig_annotation,
+            );
+        },
     }
 }
 
@@ -592,9 +612,65 @@ fn projectChangedLeaf(
     }
 }
 
+/// Render a paired import-group `Changed` decl as one synthetic
+/// `.changed` source row via `line_mod.buildImportGroupLine`, stamping
+/// it with the decl's id and inline annotation so it shows up in
+/// `decl_index` like any other navigable decl row.
+///
+/// The single emitted line stands in for whatever physical line range
+/// each side spanned, so per-side line cursors advance by
+/// `countLines(byte_range)` rather than `+= 1`. That keeps subsequent
+/// gap rendering's per-side line numbers in sync with the source
+/// buffers even when one side spans multiple physical lines (the
+/// rumqttc multi-line example) and the other a single line.
+fn projectChangedImportGroup(
+    arena: Allocator,
+    out: *std.ArrayList(line_mod.StyledLine),
+    file_diff: *const rv.FileDiff,
+    group: rv.ImportGroupDiff,
+    old_decl: rv.Decl,
+    new_decl: rv.Decl,
+    decl_id: state_mod.DeclId,
+    indent: u8,
+    cursors: *Cursors,
+    annotation: ?[]const u8,
+) !void {
+    var line = try line_mod.buildImportGroupLine(arena, file_diff, group, old_decl, new_decl, indent);
+    line.decl_id = decl_id;
+    line.decl_annotation = annotation;
+    line.line_no_left = cursors.left_line;
+    line.line_no_right = cursors.right_line;
+    try out.append(arena, line);
+
+    const old_range = old_decl.list.byte_range;
+    const new_range = new_decl.list.byte_range;
+    cursors.left_line += countLines(file_diff.left_source[old_range.start..old_range.end]);
+    cursors.right_line += countLines(file_diff.right_source[new_range.start..new_range.end]);
+}
+
 // ── source-line and gap emission ───────────────────────────────────────────
 
 const SideAdvance = enum { both, left_only, right_only };
+
+/// Variant of `formatDeclAnnotation` for `.import_group` changed decls.
+/// The annotation reads `(<prefix>, use_group)` (with an optional
+/// `, moved N → M` suffix) so the inline landmark identifies the
+/// shared path prefix the alignment keyed on rather than the verbatim
+/// path of one side. `use_group` is a synthetic ts_kind: it has no
+/// counterpart in tree-sitter's grammar, but reads naturally next to
+/// `use_declaration` in the rest of the UI.
+fn formatImportGroupAnnotation(
+    arena: Allocator,
+    prefix: []const u8,
+    moved: ?rv.MoveInfo,
+) ![]const u8 {
+    if (moved) |m| {
+        return std.fmt.allocPrint(arena, "({s}, use_group, moved {d} → {d})", .{
+            prefix, m.from_idx, m.to_idx,
+        });
+    }
+    return std.fmt.allocPrint(arena, "({s}, use_group)", .{prefix});
+}
 
 /// Render the trailing `(name, ts_kind)` (or `(name, ts_kind, moved
 /// N → M)`) annotation that gets stamped onto the first source row of
@@ -1748,4 +1824,197 @@ test "build: same-line container does not hijack the first child's decl_id" {
             }
         }
     }
+}
+
+// ── import-group rendering (subtask 3) ─────────────────────────────────
+
+/// Locate the single `.changed` source row produced by an import-group
+/// projection. Tests use this to skip past the file's gap and elided
+/// rows and land on the merged row directly.
+fn findImportGroupRow(lines: []const line_mod.StyledLine) ?line_mod.StyledLine {
+    for (lines) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker != .changed) continue;
+        if (std.mem.startsWith(u8, ln.text, "use ")) return ln;
+    }
+    return null;
+}
+
+test "build: serde import-group renders as one .changed row with `Deserialize` tagged added" {
+    const before = "use serde::Serialize;\n";
+    const after = "use serde::{Deserialize, Serialize};\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    // Exactly one `.changed` source row (the merged import-group line).
+    var changed_source_count: usize = 0;
+    for (result.view.unified) |ln| {
+        if (ln.kind == .source and ln.marker == .changed) changed_source_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), changed_source_count);
+
+    const row = findImportGroupRow(result.view.unified) orelse return error.MissingImportGroupRow;
+    try testing.expectEqualStrings("use serde::{Deserialize, Serialize};", row.text);
+
+    var saw_added = false;
+    for (row.highlights) |h| {
+        if (h.class != .import_symbol_added) continue;
+        try testing.expectEqualStrings("Deserialize", row.text[h.start..h.end]);
+        saw_added = true;
+    }
+    try testing.expect(saw_added);
+}
+
+test "build: rumqttc multi-line vs single-line import-group collapses to one row" {
+    const before = "use rumqttc::{AsyncClient, ConnectionError, Event, EventLoop, MqttOptions, Packet, QoS};\n";
+    const after = "use rumqttc::{\n    AsyncClient, ConnectionError, Event, EventLoop, MqttOptions, Packet, QoS, Transport,\n};\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const row = findImportGroupRow(result.view.unified) orelse return error.MissingImportGroupRow;
+    try testing.expect(std.mem.indexOf(u8, row.text, "Transport") != null);
+
+    var saw_transport_added = false;
+    for (row.highlights) |h| {
+        if (h.class != .import_symbol_added) continue;
+        if (std.mem.eql(u8, row.text[h.start..h.end], "Transport")) saw_transport_added = true;
+    }
+    try testing.expect(saw_transport_added);
+
+    // First physical line on each side (both decls start at line 1).
+    try testing.expectEqual(@as(?u32, 1), row.line_no_left);
+    try testing.expectEqual(@as(?u32, 1), row.line_no_right);
+}
+
+test "build: rename use decl renders single-symbol form with trailing removed suffix" {
+    const before = "use std::sync::Old;\n";
+    const after = "use std::sync::New;\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const row = findImportGroupRow(result.view.unified) orelse return error.MissingImportGroupRow;
+    try testing.expectEqualStrings("use std::sync::New; removed: Old", row.text);
+
+    var saw_new_added = false;
+    var saw_old_removed = false;
+    for (row.highlights) |h| {
+        const slice = row.text[h.start..h.end];
+        if (h.class == .import_symbol_added and std.mem.eql(u8, slice, "New")) saw_new_added = true;
+        if (h.class == .import_symbol_removed and std.mem.eql(u8, slice, "Old")) saw_old_removed = true;
+    }
+    try testing.expect(saw_new_added);
+    try testing.expect(saw_old_removed);
+}
+
+test "build: all-kept reorder of an import-group does not produce a `.changed` row" {
+    // Engine-layer regression smoke: alignment subtask demotes
+    // reorder-only bodies to `.unchanged`, so the file view must show
+    // no `.changed` row for the use decl.
+    const before = "use foo::{a, b};\n";
+    const after = "use foo::{b, a};\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker == .changed) {
+            try testing.expect(!std.mem.startsWith(u8, ln.text, "use "));
+        }
+    }
+}
+
+test "build: import-group line shows up in decl_index exactly once with changed = true" {
+    const before = "use serde::Serialize;\n";
+    const after = "use serde::{Deserialize, Serialize};\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var ig_entries: usize = 0;
+    for (result.decl_index) |e| {
+        const ln = result.view.unified[e.row];
+        if (ln.kind == .source and std.mem.startsWith(u8, ln.text, "use ")) {
+            try testing.expect(e.changed);
+            ig_entries += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), ig_entries);
+}
+
+test "build: import-group stats counter increments `changed` once for the merged group" {
+    const before = "use serde::Serialize;\n";
+    const after = "use serde::{Deserialize, Serialize};\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.stats.changed);
+    try testing.expectEqual(@as(usize, 0), result.stats.added);
+    try testing.expectEqual(@as(usize, 0), result.stats.removed);
+}
+
+test "build split: import-group emits the same merged line on both panes" {
+    const before = "use serde::Serialize;\n";
+    const after = "use serde::{Deserialize, Serialize};\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .split);
+    defer result.deinit();
+
+    var saw_mirrored = false;
+    for (result.view.split) |p| {
+        if (p.left.kind != .source or p.right.kind != .source) continue;
+        if (!std.mem.startsWith(u8, p.left.text, "use ")) continue;
+        try testing.expectEqualStrings(p.left.text, p.right.text);
+        try testing.expectEqual(p.left.marker, p.right.marker);
+        try testing.expectEqual(line_mod.Marker.changed, p.left.marker);
+        saw_mirrored = true;
+    }
+    try testing.expect(saw_mirrored);
+}
+
+test "build: moved import-group decl annotation includes `moved N → M`" {
+    // Same body change, but the use decl moves position relative to a
+    // sibling top-level decl. The `moved` info must propagate into the
+    // inline annotation so N/P navigation can land on a row that still
+    // identifies which decl moved.
+    const before = "use serde::Serialize;\nfn x() {}\n";
+    const after = "fn x() {}\nuse serde::{Deserialize, Serialize};\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const row = findImportGroupRow(result.view.unified) orelse return error.MissingImportGroupRow;
+    const annotation = row.decl_annotation orelse return error.MissingAnnotation;
+    try testing.expect(std.mem.indexOf(u8, annotation, "use_group") != null);
+    try testing.expect(std.mem.indexOf(u8, annotation, "serde") != null);
+    try testing.expect(std.mem.indexOf(u8, annotation, "moved ") != null);
+    try testing.expect(std.mem.indexOf(u8, annotation, " → ") != null);
 }

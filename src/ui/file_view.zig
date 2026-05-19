@@ -537,6 +537,7 @@ fn projectChanged(
         .leaf => |script| {
             try projectChangedLeaf(arena, out, file_diff, script, c.old, c.new, id, indent + 1, cursors, annotation);
         },
+        .import_group => unreachable, // wired in subtask 2
     }
 }
 

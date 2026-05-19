@@ -18,6 +18,9 @@ pub const Decl = @import("diff/result.zig").Decl;
 pub const MoveInfo = @import("diff/result.zig").MoveInfo;
 pub const DeclBody = @import("diff/result.zig").DeclBody;
 pub const DeclDiff = @import("diff/result.zig").DeclDiff;
+pub const ImportSymbol = @import("diff/result.zig").ImportSymbol;
+pub const ImportSymbolEntry = @import("diff/result.zig").ImportSymbolEntry;
+pub const ImportGroupDiff = @import("diff/result.zig").ImportGroupDiff;
 pub const ParseError = @import("diff/result.zig").ParseError;
 pub const FileDiff = @import("diff/result.zig").FileDiff;
 

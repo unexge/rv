@@ -369,6 +369,7 @@ fn appendEntries(
                         const hunk_lines = try buildLeafHunk(arena, file_diff, script, c.old, c.new, indent + 1);
                         try out.appendSlice(arena, hunk_lines);
                     },
+                    .import_group => unreachable, // wired in subtask 2
                 }
             },
         }
@@ -476,6 +477,7 @@ fn appendEntriesSplit(
                         const hunk_lines = try buildLeafHunk(arena, file_diff, script, c.old, c.new, indent + 1);
                         try appendLeafHunkPairs(arena, out, hunk_lines, indent + 1);
                     },
+                    .import_group => unreachable, // wired in subtask 2
                 }
             },
         }

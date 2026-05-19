@@ -6,6 +6,7 @@
 //! The config captures everything the language-agnostic engine needs to know
 //! to process a given grammar.
 
+const std = @import("std");
 const node = @import("../sst/node.zig");
 const result = @import("../diff/result.zig");
 
@@ -65,4 +66,35 @@ pub const LangConfig = struct {
     /// to null, in which case container detection falls back to
     /// `container_ts_kinds`.
     container_list_of: ?*const fn (list: *const node.List) ?*const node.List = null,
+
+    // ── Import-group alignment ──────────────────────────────────────────
+
+    /// Optional: identify the path prefix of an import-group decl so two
+    /// declarations sharing the same prefix can be paired and rendered as a
+    /// per-symbol diff (see `result.ImportGroupDiff`).
+    ///
+    /// Returning null means "this decl falls back to regular `extract_name`
+    /// and never participates in import-group alignment". Common opt-out
+    /// reasons: single-segment paths, wildcards, visibility modifiers.
+    ///
+    /// Returned slice borrows from `source`.
+    ///
+    /// Must be set together with `import_symbols`, or both must be null.
+    import_group_key: ?*const fn (
+        list: *const node.List,
+        source: []const u8,
+    ) ?[]const u8 = null,
+
+    /// Optional: parse the leaf symbols of an import-group decl in source
+    /// order (see `result.ImportSymbol`).
+    ///
+    /// Allocates the outer slice (and any synthesized symbol text) from
+    /// `arena`. Inner slices borrow from `source` whenever possible.
+    ///
+    /// Must be set together with `import_group_key`, or both must be null.
+    import_symbols: ?*const fn (
+        arena: std.mem.Allocator,
+        list: *const node.List,
+        source: []const u8,
+    ) std.mem.Allocator.Error![]const result.ImportSymbol = null,
 };

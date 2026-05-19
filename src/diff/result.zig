@@ -55,15 +55,52 @@ pub const MoveInfo = struct {
     to_idx: usize,
 };
 
+/// A single symbol entry within an import group's leaf list.
+///
+/// `text` is a slice (typically borrowed from the source buffer) representing
+/// one symbol as it would appear inside the brace list of a `use` declaration.
+/// Whitespace and surrounding commas are trimmed.
+///
+/// Examples: `"Bar"`, `"Bar as Baz"`, `"self"`, `"*"`.
+pub const ImportSymbol = struct {
+    /// Raw source slice, trimmed of surrounding whitespace/commas.
+    text: []const u8,
+};
+
+/// Per-symbol diff status for an `ImportGroupDiff`.
+pub const ImportSymbolEntry = union(enum) {
+    kept: ImportSymbol,
+    added: ImportSymbol,
+    removed: ImportSymbol,
+};
+
+/// Body for a paired import-group `Changed` entry.
+///
+/// Produced when two import declarations share the same path prefix (see
+/// `LangConfig.import_group_key`) so the diff can describe the change as a
+/// per-symbol delta inside that prefix instead of a full Added/Removed pair.
+pub const ImportGroupDiff = struct {
+    /// Shared path prefix that keyed the alignment, e.g. `"rumqttc"` or
+    /// `"std::sync"`. Borrowed from one of the source buffers.
+    prefix: []const u8,
+    /// Right-side display order with removed entries spliced in next to
+    /// their left-side anchor.
+    entries: []const ImportSymbolEntry,
+};
+
 /// Body of a `Changed` entry.
 ///
 /// `leaf` for leaf Decls (function bodies, const expressions, etc.) - a flat
 /// edit script over the interior nodes.
 ///
 /// `container` for container Decls - recursive alignment of their members.
+///
+/// `import_group` for paired import declarations whose path prefixes match -
+/// the body lists per-symbol kept/added/removed entries.
 pub const DeclBody = union(enum) {
     leaf: edit.EditScript,
     container: []const DeclDiff,
+    import_group: ImportGroupDiff,
 };
 
 pub const DeclDiff = union(enum) {

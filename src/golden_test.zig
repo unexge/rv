@@ -161,6 +161,7 @@ fn writeBody(ws: *std.json.Stringify, body: rv.DeclBody) Writer.Error!void {
             try ws.objectField("children");
             try writeEntries(ws, children);
         },
+        .import_group => unreachable, // wired in subtask 2
     }
     try ws.endObject();
 }

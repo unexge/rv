@@ -99,6 +99,8 @@ pub const config: config_mod.LangConfig = .{
     .classify = classify,
     .extract_name = extractName,
     .container_list_of = containerListOf,
+    .import_group_key = importGroupKey,
+    .import_symbols = importSymbols,
 };
 
 fn classify(ts_kind: []const u8) result.DeclKind {
@@ -278,6 +280,201 @@ fn macroPath(list: *const node.List, source: []const u8) ?[]const u8 {
 
 fn nodeSource(source: []const u8, range: node.ByteRange) []const u8 {
     return source[range.start..range.end];
+}
+
+// ── import-group hooks ──────────────────────────────────────────────────────
+//
+// `importGroupKey` and `importSymbols` together let the diff engine pair two
+// `use foo::...;` declarations under the shared prefix `foo` and surface the
+// brace-list delta as a per-symbol diff. See `result.ImportGroupDiff`.
+//
+// Both hooks operate on the same SST shape produced by tree-sitter-rust:
+//
+//   use_declaration
+//     [visibility_modifier]      // `pub`, `pub(crate)` etc. - opt-out
+//     "use"
+//     <path>                     // identifier | scoped_identifier |
+//                                // scoped_use_list | use_wildcard |
+//                                // use_as_clause | use_list
+//     ";"
+//
+// `scoped_identifier` is `<path> :: <name>` with three children
+// `[<path>, "::", <name>]`. `scoped_use_list` is `<path> :: { ... }` with
+// children `[<path>, "::", use_list]`. `use_as_clause` is `<path> as <alias>`
+// with children `[<path>, "as", <alias>]`.
+
+/// Returns the path prefix of a Rust `use_declaration` for import-group
+/// alignment, or null to opt out. See the LangConfig hook contract.
+fn importGroupKey(list: *const node.List, source: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, list.ts_kind, "use_declaration")) return null;
+
+    const path_child = findUsePathChild(list) orelse return null;
+    return prefixOfPath(path_child, source);
+}
+
+/// Find the path child of a `use_declaration` while opting out for `pub use`.
+/// Returns null if a `visibility_modifier` is present anywhere in the decl,
+/// or if no path child can be found.
+fn findUsePathChild(list: *const node.List) ?*const node.Node {
+    var path_child: ?*const node.Node = null;
+    for (list.children) |*c| switch (c.*) {
+        .atom => |a| {
+            if (a.kind != .code) continue;
+            // Skip the `use` keyword and trailing `;`. Anything else atomic
+            // here is a single-identifier path like `use foo;`.
+            if (std.mem.eql(u8, a.bytes, "use")) continue;
+            if (std.mem.eql(u8, a.bytes, ";")) continue;
+            if (path_child == null) path_child = c;
+        },
+        .list => |inner| {
+            if (std.mem.eql(u8, inner.ts_kind, "visibility_modifier")) return null;
+            if (path_child == null) path_child = c;
+        },
+    };
+    return path_child;
+}
+
+/// Return the prefix slice of a path node, dropping the final segment.
+/// Single-segment paths and wildcards return null (opt-out).
+fn prefixOfPath(n: *const node.Node, source: []const u8) ?[]const u8 {
+    return switch (n.*) {
+        // Single identifier: `use foo;` - no `::`, no prefix.
+        .atom => null,
+        .list => |l| blk: {
+            // `<prefix> :: <name>` and `<prefix> :: { ... }` both store the
+            // prefix path as their first child. The `::` is contiguous in
+            // source so the first child's byte range already excludes it.
+            if (std.mem.eql(u8, l.ts_kind, "scoped_identifier") or
+                std.mem.eql(u8, l.ts_kind, "scoped_use_list"))
+            {
+                if (l.children.len == 0) break :blk null;
+                break :blk nodeSource(source, l.children[0].byteRange());
+            }
+            // `use foo::Bar as Baz;` - alignment keys off the path being
+            // aliased, not the alias itself.
+            if (std.mem.eql(u8, l.ts_kind, "use_as_clause")) {
+                if (l.children.len == 0) break :blk null;
+                break :blk prefixOfPath(&l.children[0], source);
+            }
+            // `use foo::*;`, `use { ... };`, or anything unrecognised: opt out.
+            break :blk null;
+        },
+    };
+}
+
+/// Parse the leaf symbols of a Rust `use_declaration` in source order.
+/// See `result.ImportSymbol` and the LangConfig hook contract.
+fn importSymbols(
+    arena: std.mem.Allocator,
+    list: *const node.List,
+    source: []const u8,
+) std.mem.Allocator.Error![]const result.ImportSymbol {
+    var entries: std.ArrayList(result.ImportSymbol) = .empty;
+    if (!std.mem.eql(u8, list.ts_kind, "use_declaration")) {
+        return entries.toOwnedSlice(arena);
+    }
+
+    if (findUsePathChild(list)) |pc| {
+        try collectImportSymbols(arena, &entries, pc, source);
+    }
+    return entries.toOwnedSlice(arena);
+}
+
+fn collectImportSymbols(
+    arena: std.mem.Allocator,
+    entries: *std.ArrayList(result.ImportSymbol),
+    n: *const node.Node,
+    source: []const u8,
+) std.mem.Allocator.Error!void {
+    switch (n.*) {
+        // Bare identifier: `use foo;` - emit `"foo"`.
+        .atom => |a| try entries.append(arena, .{ .text = a.bytes }),
+        .list => |l| {
+            // `path :: name` - the symbol is the last segment.
+            if (std.mem.eql(u8, l.ts_kind, "scoped_identifier")) {
+                if (l.children.len > 0) {
+                    const last = &l.children[l.children.len - 1];
+                    try entries.append(arena, .{ .text = nodeSource(source, last.byteRange()) });
+                }
+                return;
+            }
+            // `path :: { ... }` - dispatch into the trailing use_list.
+            if (std.mem.eql(u8, l.ts_kind, "scoped_use_list")) {
+                if (l.children.len > 0) {
+                    const last = &l.children[l.children.len - 1];
+                    try collectImportSymbols(arena, entries, last, source);
+                }
+                return;
+            }
+            // Wildcard. `importGroupKey` opts out earlier; this branch is the
+            // defensive fallback if `importSymbols` is called directly.
+            if (std.mem.eql(u8, l.ts_kind, "use_wildcard")) {
+                try entries.append(arena, .{ .text = "*" });
+                return;
+            }
+            // Top-level `use <path> as <alias>;` - render as a single
+            // `"<last_segment> as <alias>"` entry.
+            if (std.mem.eql(u8, l.ts_kind, "use_as_clause")) {
+                try entries.append(arena, .{ .text = renderUseAsClause(&l, source) });
+                return;
+            }
+            // `{ a, b, ... }` brace list. Iterate comma-separated entries.
+            if (std.mem.eql(u8, l.ts_kind, "use_list")) {
+                for (l.children) |*child| switch (child.*) {
+                    .atom => |a| {
+                        if (a.kind != .code) continue;
+                        if (std.mem.eql(u8, a.bytes, ",")) continue;
+                        // Identifier-shaped atoms inside a use_list:
+                        // `identifier`, `type_identifier`, `self`, `super`,
+                        // `crate`. Surface raw bytes verbatim.
+                        try entries.append(arena, .{ .text = a.bytes });
+                    },
+                    .list => |inner| {
+                        if (std.mem.eql(u8, inner.ts_kind, "use_wildcard")) {
+                            try entries.append(arena, .{ .text = "*" });
+                        } else {
+                            // `use_as_clause`, `scoped_identifier`, nested
+                            // `use_list`, `scoped_use_list`. v1 does NOT
+                            // flatten nested groups - surface the raw source
+                            // slice (which already spans `<lhs> as <rhs>` for
+                            // an as-clause) as a single ImportSymbol so
+                            // callers see something coherent.
+                            // TODO(v2): flatten nested groups into individual
+                            // symbols.
+                            try entries.append(arena, .{ .text = nodeSource(source, inner.byte_range) });
+                        }
+                    },
+                };
+                return;
+            }
+            // Unknown shape: surface the raw slice so the renderer has
+            // *something* to display.
+            try entries.append(arena, .{ .text = nodeSource(source, l.byte_range) });
+        },
+    }
+}
+
+/// Render a `use_as_clause` as `"<last_segment_of_path> as <alias>"` by
+/// taking a single source slice that spans both, relying on the source
+/// being contiguous in the buffer.
+fn renderUseAsClause(l: *const node.List, source: []const u8) []const u8 {
+    if (l.children.len < 1) return nodeSource(source, l.byte_range);
+    const path_node = &l.children[0];
+    const last_child = &l.children[l.children.len - 1];
+    const lhs_range = lastSegmentRange(path_node);
+    return source[lhs_range.start..last_child.byteRange().end];
+}
+
+fn lastSegmentRange(n: *const node.Node) node.ByteRange {
+    return switch (n.*) {
+        .atom => |a| a.byte_range,
+        .list => |l| blk: {
+            if (std.mem.eql(u8, l.ts_kind, "scoped_identifier") and l.children.len > 0) {
+                break :blk l.children[l.children.len - 1].byteRange();
+            }
+            break :blk l.byte_range;
+        },
+    };
 }
 
 /// For Decls whose body is a `declaration_list` (Rust's container body for
@@ -619,4 +816,118 @@ test "containerListOf: function_item is not a container" {
 
     const f = findTopDecl(&fx.res.tree.root.list, "function_item").?;
     try testing.expect(containerListOf(f) == null);
+}
+
+// ── importGroupKey ─────────────────────────────────────────────────────────────
+
+fn expectImportGroupKey(src: []const u8, expected: ?[]const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var fx = try convertRust(arena.allocator(), src);
+    defer fx.deinit();
+
+    const u = findTopDecl(&fx.res.tree.root.list, "use_declaration").?;
+    const got = importGroupKey(u, fx.res.tree.source);
+    if (expected) |e| {
+        try testing.expect(got != null);
+        try testing.expectEqualStrings(e, got.?);
+    } else {
+        try testing.expect(got == null);
+    }
+}
+
+test "importGroupKey: single-segment use opts out" {
+    try expectImportGroupKey("use foo;\n", null);
+}
+
+test "importGroupKey: scoped path returns prefix" {
+    try expectImportGroupKey("use foo::Bar;\n", "foo");
+}
+
+test "importGroupKey: deep scoped path drops final segment" {
+    try expectImportGroupKey("use foo::bar::Baz;\n", "foo::bar");
+}
+
+test "importGroupKey: brace list returns parent prefix" {
+    try expectImportGroupKey("use foo::{a, b};\n", "foo");
+}
+
+test "importGroupKey: deep brace list returns parent prefix" {
+    try expectImportGroupKey("use foo::bar::{a};\n", "foo::bar");
+}
+
+test "importGroupKey: wildcard opts out" {
+    try expectImportGroupKey("use foo::*;\n", null);
+}
+
+test "importGroupKey: pub use opts out" {
+    try expectImportGroupKey("pub use foo::Bar;\n", null);
+}
+
+test "importGroupKey: std::sync::Arc" {
+    try expectImportGroupKey("use std::sync::Arc;\n", "std::sync");
+}
+
+test "importGroupKey: crate::foo::Bar" {
+    try expectImportGroupKey("use crate::foo::Bar;\n", "crate::foo");
+}
+
+// ── importSymbols ───────────────────────────────────────────────────────────────
+
+fn expectImportSymbols(src: []const u8, expected: []const []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var fx = try convertRust(arena.allocator(), src);
+    defer fx.deinit();
+
+    const u = findTopDecl(&fx.res.tree.root.list, "use_declaration").?;
+    const got = try importSymbols(arena.allocator(), u, fx.res.tree.source);
+    try testing.expectEqual(expected.len, got.len);
+    for (expected, got) |e, g| {
+        try testing.expectEqualStrings(e, g.text);
+    }
+}
+
+test "importSymbols: single scoped name" {
+    try expectImportSymbols("use foo::Bar;\n", &.{"Bar"});
+}
+
+test "importSymbols: brace list of identifiers" {
+    try expectImportSymbols("use foo::{a, b};\n", &.{ "a", "b" });
+}
+
+test "importSymbols: brace list with self" {
+    try expectImportSymbols("use foo::{self, Bar};\n", &.{ "self", "Bar" });
+}
+
+test "importSymbols: top-level as-clause renders last segment" {
+    try expectImportSymbols("use foo::Bar as Baz;\n", &.{"Bar as Baz"});
+}
+
+test "importSymbols: as-clause inside brace list" {
+    try expectImportSymbols(
+        "use foo::{a, b as c, d};\n",
+        &.{ "a", "b as c", "d" },
+    );
+}
+
+test "importSymbols: multi-line brace list trims whitespace" {
+    try expectImportSymbols(
+        "use foo::{\n  a,\n  b,\n};\n",
+        &.{ "a", "b" },
+    );
+}
+
+test "importSymbols: deep scoped path returns last segment" {
+    try expectImportSymbols("use foo::bar::Baz;\n", &.{"Baz"});
+}
+
+test "importSymbols: nested scoped as-clause keeps full path" {
+    // Inside a brace list, `use_as_clause` should surface the raw source
+    // slice so a scoped path on the lhs (`c::d as alias`) is preserved
+    // verbatim rather than collapsed to its last segment.
+    try expectImportSymbols(
+        "use foo::{c::d as alias};\n",
+        &.{"c::d as alias"},
+    );
 }

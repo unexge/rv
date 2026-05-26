@@ -17,6 +17,7 @@ comptime {
     _ = @import("ui/file_view.zig");
     _ = @import("ui/hunk.zig");
     _ = @import("ui/line.zig");
+    _ = @import("ui/line_align.zig");
     _ = @import("ui/search.zig");
     _ = @import("ui/session.zig");
     _ = @import("ui/state.zig");

@@ -588,7 +588,7 @@ fn projectChangedLeaf(
         var sl = line;
         sl.decl_id = decl_id;
         switch (line.marker) {
-            .context => {
+            .context, .changed => {
                 sl.line_no_left = cursors.left_line;
                 sl.line_no_right = cursors.right_line;
                 cursors.left_line += 1;
@@ -1087,38 +1087,30 @@ test "build: single change in a long file emits ±3 context with elided rows on 
     var leading_elided: usize = 0;
     var trailing_elided: usize = 0;
     var saw_changed_decl_annotation = false;
-    var saw_removed_source = false;
-    var saw_added_source = false;
+    var saw_change_source = false;
     var first_change_idx: ?usize = null;
     var last_change_idx: ?usize = null;
     for (lines, 0..) |ln, i| {
         if (ln.kind != .source) continue;
         switch (ln.marker) {
-            .removed => {
-                saw_removed_source = true;
-                if (first_change_idx == null) first_change_idx = i;
-                last_change_idx = i;
-            },
-            .added => {
-                saw_added_source = true;
+            .removed, .added, .changed => {
+                saw_change_source = true;
                 if (first_change_idx == null) first_change_idx = i;
                 last_change_idx = i;
             },
             else => {},
         }
-        // The single-line leaf change emits the changed decl's body as
-        // a `.removed` + `.added` pair; the inline annotation lands on
-        // the first emitted row (the `.removed` line) and identifies
-        // the changed decl `e`. Match `"(e,"` rather than just `"e"`
-        // so unrelated annotations whose `ts_kind` happens to contain
-        // an `e` (e.g. `function_declaration`) don't satisfy the check.
+        // The 1:1 inline-collapsed leaf change emits a single
+        // `.changed` source row whose `decl_annotation` identifies the
+        // changed decl `e`. Match `"(e,"` rather than just `"e"` so
+        // unrelated annotations whose `ts_kind` happens to contain an
+        // `e` (e.g. `function_declaration`) don't satisfy the check.
         if (ln.decl_annotation) |ann| {
             if (std.mem.indexOf(u8, ann, "(e,") != null) saw_changed_decl_annotation = true;
         }
     }
     try testing.expect(saw_changed_decl_annotation);
-    try testing.expect(saw_removed_source);
-    try testing.expect(saw_added_source);
+    try testing.expect(saw_change_source);
     for (lines[0..first_change_idx.?]) |ln| if (ln.kind == .elided) {
         leading_elided += 1;
     };
@@ -1339,13 +1331,20 @@ test "build: cross-decl context windows merge when changes are within 2*context 
 }
 
 test "build split: mirrored common rows, paired add/remove runs" {
+    // Use leaf bodies whose differing line is dissimilar enough that
+    // the inline 1:1 collapse doesn't kick in - the test specifically
+    // exercises split-mode `.removed` / `.added` pairing.
     const before =
         \\pub fn a() void {}
-        \\pub fn b() u32 { return 1; }
+        \\pub fn b() u32 {
+        \\    QQQQQQQQQQ();
+        \\}
     ;
     const after =
         \\pub fn a() void {}
-        \\pub fn b() u32 { return 2; }
+        \\pub fn b() u32 {
+        \\    WWWWWWWWWW();
+        \\}
     ;
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
@@ -1862,7 +1861,7 @@ test "build: serde import-group renders as one .changed row with `Deserialize` t
 
     var saw_added = false;
     for (row.highlights) |h| {
-        if (h.class != .import_symbol_added) continue;
+        if (h.class != .inline_added) continue;
         try testing.expectEqualStrings("Deserialize", row.text[h.start..h.end]);
         saw_added = true;
     }
@@ -1884,7 +1883,7 @@ test "build: rumqttc multi-line vs single-line import-group collapses to one row
 
     var saw_transport_added = false;
     for (row.highlights) |h| {
-        if (h.class != .import_symbol_added) continue;
+        if (h.class != .inline_added) continue;
         if (std.mem.eql(u8, row.text[h.start..h.end], "Transport")) saw_transport_added = true;
     }
     try testing.expect(saw_transport_added);
@@ -1894,7 +1893,7 @@ test "build: rumqttc multi-line vs single-line import-group collapses to one row
     try testing.expectEqual(@as(?u32, 1), row.line_no_right);
 }
 
-test "build: rename use decl renders single-symbol form with trailing removed suffix" {
+test "build: rename use decl splices removed and added symbols inline" {
     const before = "use std::sync::Old;\n";
     const after = "use std::sync::New;\n";
 
@@ -1905,14 +1904,15 @@ test "build: rename use decl renders single-symbol form with trailing removed su
     defer result.deinit();
 
     const row = findImportGroupRow(result.view.unified) orelse return error.MissingImportGroupRow;
-    try testing.expectEqualStrings("use std::sync::New; removed: Old", row.text);
+    try testing.expectEqualStrings("use std::sync::{Old, New};", row.text);
+    try testing.expect(std.mem.indexOf(u8, row.text, "removed:") == null);
 
     var saw_new_added = false;
     var saw_old_removed = false;
     for (row.highlights) |h| {
         const slice = row.text[h.start..h.end];
-        if (h.class == .import_symbol_added and std.mem.eql(u8, slice, "New")) saw_new_added = true;
-        if (h.class == .import_symbol_removed and std.mem.eql(u8, slice, "Old")) saw_old_removed = true;
+        if (h.class == .inline_added and std.mem.eql(u8, slice, "New")) saw_new_added = true;
+        if (h.class == .inline_removed and std.mem.eql(u8, slice, "Old")) saw_old_removed = true;
     }
     try testing.expect(saw_new_added);
     try testing.expect(saw_old_removed);

@@ -35,14 +35,15 @@ pub const TokenClass = enum {
     punct,
     ident,
     other,
-    /// Per-symbol tint for an added entry inside a `Changed` import-group
-    /// row. Distinct from the file-level `.added` marker style so a green
-    /// symbol on a yellow `.changed` row reads as a within-row tint rather
+    /// Per-byte tint for an added inline run (added symbol inside an
+    /// import-group, or added bytes spliced into a 1:1 leaf word-diff).
+    /// Distinct from the file-level `.added` marker style so a green
+    /// span on a yellow `.changed` row reads as a within-row tint rather
     /// than a full added line.
-    import_symbol_added,
-    /// Per-symbol tint for a removed entry surfaced in the trailing
-    /// `removed: ...` suffix of a `Changed` import-group row.
-    import_symbol_removed,
+    inline_added,
+    /// Per-byte tint for a removed inline run, the counterpart to
+    /// `.inline_added`.
+    inline_removed,
 };
 
 /// Classify an SST atom. `atom_kind` comes from conversion; `bytes` is the
@@ -111,16 +112,19 @@ pub fn style(class: TokenClass, base: vaxis.Style) vaxis.Style {
             s.fg = .{ .index = 8 };
             s.dim = true;
         },
-        // Bold lifts the per-symbol tint above its surrounding `.changed`
-        // row colour and distinguishes it from a regular `.added` /
-        // `.removed` source line (which is the same fg without bold).
-        .import_symbol_added => {
+        // Bold + underline / strikethrough lift the per-byte tint above
+        // its surrounding `.changed` row colour and distinguish it from
+        // a regular `.added` / `.removed` source line (which carries the
+        // same fg without these attributes).
+        .inline_added => {
             s.fg = .{ .index = 2 };
             s.bold = true;
+            s.ul_style = .single;
         },
-        .import_symbol_removed => {
+        .inline_removed => {
             s.fg = .{ .index = 1 };
             s.bold = true;
+            s.strikethrough = true;
         },
         .ident, .punct, .other => {},
     }
@@ -326,21 +330,23 @@ test "style: comment carries dim" {
     try testing.expect(c.dim);
 }
 
-test "style: import-symbol classes are visually distinct from file-level add/remove" {
+test "style: inline classes are visually distinct from file-level add/remove" {
     // A regular `.added` source line uses fg index 2 with no bold; the
-    // per-symbol `.import_symbol_added` class layered on a `.changed`
-    // row's yellow base must end up structurally different so the user
-    // can tell a within-row tint from a full added line.
+    // per-byte `.inline_added` class layered on a `.changed` row's
+    // yellow base must end up structurally different so the user can
+    // tell a within-row tint from a full added line.
     const added_row_base: vaxis.Style = .{ .fg = .{ .index = 2 } };
     const changed_row_base: vaxis.Style = .{ .fg = .{ .index = 3 } };
 
-    const symbol_added = style(.import_symbol_added, changed_row_base);
-    const symbol_removed = style(.import_symbol_removed, changed_row_base);
+    const inline_added = style(.inline_added, changed_row_base);
+    const inline_removed = style(.inline_removed, changed_row_base);
 
-    try testing.expect(!added_row_base.eql(symbol_added));
-    try testing.expect(!added_row_base.eql(symbol_removed));
-    try testing.expect(symbol_added.bold);
-    try testing.expect(symbol_removed.bold);
-    try testing.expect(symbol_added.fg == .index and symbol_added.fg.index == 2);
-    try testing.expect(symbol_removed.fg == .index and symbol_removed.fg.index == 1);
+    try testing.expect(!added_row_base.eql(inline_added));
+    try testing.expect(!added_row_base.eql(inline_removed));
+    try testing.expect(inline_added.bold);
+    try testing.expect(inline_removed.bold);
+    try testing.expect(inline_added.fg == .index and inline_added.fg.index == 2);
+    try testing.expect(inline_removed.fg == .index and inline_removed.fg.index == 1);
+    try testing.expectEqual(vaxis.Style.Underline.single, inline_added.ul_style);
+    try testing.expect(inline_removed.strikethrough);
 }

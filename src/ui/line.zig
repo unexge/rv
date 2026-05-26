@@ -37,6 +37,7 @@ const rv = @import("rv");
 const hunk_mod = @import("hunk.zig");
 const state_mod = @import("state.zig");
 const theme = @import("theme.zig");
+const word_lcs = @import("word_lcs.zig");
 
 pub const AppState = state_mod.AppState;
 pub const DeclId = state_mod.DeclId;
@@ -510,6 +511,13 @@ fn blankLine(indent: u8) StyledLine {
 ///   `.right`  → `marker = .added` with right-side novel and highlight
 ///               spans mapped in.
 ///
+/// Inline 1:1 collapse: an adjacent `.left` / `.right` pair whose two
+/// raw lines share ≥ 50% of the shorter side's bytes is merged into a
+/// single `marker = .changed` row with byte-level `.inline_removed` /
+/// `.inline_added` highlight spans (see `tryBuildInlineCollapsedLine`).
+/// Pairs below the threshold fall back to separate `.removed` /
+/// `.added` rows.
+///
 /// Returned lines are arena-owned and caller-owned; they go straight into
 /// the unified output or get re-paired for split mode (see
 /// `appendLeafHunkPairs`).
@@ -537,7 +545,26 @@ pub fn buildLeafHunk(
     const hunks = try hunk_mod.hunk(arena, left_slice, right_slice);
 
     var out: std.ArrayList(StyledLine) = .empty;
-    for (hunks) |h| {
+    var k: usize = 0;
+    while (k < hunks.len) : (k += 1) {
+        const h = hunks[k];
+
+        // 1:1 inline collapse: an adjacent `.left` / `.right` (or
+        // `.right` / `.left`) pair whose two raw lines share ≥ 50% of
+        // the shorter side's bytes renders as a single `.changed` row
+        // with the differing runs spanned as `.inline_removed` /
+        // `.inline_added`. Common runs inherit the row's base marker
+        // style, mirroring how `.context` rows are unspanned today.
+        if (k + 1 < hunks.len and isInlinePairCandidate(h, hunks[k + 1])) {
+            const left_h = if (h.side == .left) h else hunks[k + 1];
+            const right_h = if (h.side == .right) h else hunks[k + 1];
+            if (try tryBuildInlineCollapsedLine(arena, left_h.text, right_h.text, indent)) |line| {
+                try out.append(arena, line);
+                k += 1; // skip the second member of the pair (the loop's k += 1 advances past it).
+                continue;
+            }
+        }
+
         const marker: Marker = switch (h.side) {
             .common => .context,
             .left => .removed,
@@ -580,19 +607,85 @@ pub fn buildLeafHunk(
     return try out.toOwnedSlice(arena);
 }
 
-/// Render a `Changed` import-group body as a single inline `.changed`
-/// source row. Walks `group.entries`, splices kept-and-added symbols into
-/// the canonical `use <prefix>::{ ... };` form (or a single-symbol form
-/// when only one such symbol exists, regardless of removals), and surfaces
-/// any removed symbols as a trailing dim ` removed: a, b` suffix so the
-/// brace text stays parseable Rust.
+/// True iff `a` and `b` are an adjacent 1:1 candidate: one is `.left`,
+/// the other is `.right`, in either order. The linewise hunker can pair
+/// them either way depending on tie-breaking, so we accept both.
+fn isInlinePairCandidate(a: hunk_mod.HunkLine, b: hunk_mod.HunkLine) bool {
+    return (a.side == .left and b.side == .right) or
+        (a.side == .right and b.side == .left);
+}
+
+/// Attempt to splice `left_text` and `right_text` (raw, pre-tab-expansion
+/// line bytes) into a single `.changed` source line. Returns the line on
+/// success or `null` when the byte-level LCS shares < 50% of the shorter
+/// side - in that case the caller falls back to emitting two rows.
 ///
-/// Per-symbol tints come through `StyledLine.highlights`: kept symbols
-/// get the neutral `.ident` class (so they inherit the `.changed`
-/// marker colour), added symbols get `.import_symbol_added`, the literal
-/// `removed:` label gets `.comment`, and each name in the suffix gets
-/// `.import_symbol_removed`. The renderer in `app.zig` then layers
-/// those on top of the row's marker style without any new code paths.
+/// The output's `text` is built byte-by-byte with tabs expanded inline
+/// so highlight offsets land on display columns directly, avoiding a
+/// separate `expandTabs` / `mapHighlightsToLine` round-trip. Common
+/// runs are emitted unspanned; removed runs get `.inline_removed`,
+/// added runs get `.inline_added`. Syntax highlighting is intentionally
+/// dropped on collapsed rows for v1 (see the inline word-diff plan).
+fn tryBuildInlineCollapsedLine(
+    arena: std.mem.Allocator,
+    left_text: []const u8,
+    right_text: []const u8,
+    indent: u8,
+) !?StyledLine {
+    const min_len = @min(left_text.len, right_text.len);
+    if (min_len == 0) return null;
+
+    const runs = try word_lcs.diff(arena, left_text, right_text);
+    var shared: usize = 0;
+    for (runs) |r| if (r.side == .common) {
+        shared += r.bytes.len;
+    };
+    if (shared * 2 < min_len) return null;
+
+    var buf: std.ArrayList(u8) = .empty;
+    var spans: std.ArrayList(HighlightSpan) = .empty;
+    for (runs) |r| {
+        const disp_start: u32 = @intCast(buf.items.len);
+        for (r.bytes) |c| {
+            if (c == '\t') {
+                try buf.appendNTimes(arena, ' ', tab_width);
+            } else {
+                try buf.append(arena, c);
+            }
+        }
+        const disp_end: u32 = @intCast(buf.items.len);
+        const class: ?TokenClass = switch (r.side) {
+            .common => null,
+            .removed => .inline_removed,
+            .added => .inline_added,
+        };
+        if (class) |cl| {
+            try spans.append(arena, .{ .start = disp_start, .end = disp_end, .class = cl });
+        }
+    }
+
+    return .{
+        .indent = indent,
+        .marker = .changed,
+        .kind = .source,
+        .text = try buf.toOwnedSlice(arena),
+        .highlights = try spans.toOwnedSlice(arena),
+    };
+}
+
+/// Render a `Changed` import-group body as a single inline `.changed`
+/// source row. Walks `group.entries` once, in order, splicing every
+/// symbol into the brace - kept, added, and removed alike. Per-symbol
+/// tints come through `StyledLine.highlights`: kept symbols get the
+/// neutral `.ident` class so they inherit the row's marker colour,
+/// added symbols get `.inline_added`, removed symbols get
+/// `.inline_removed`. The renderer in `app.zig` layers those on top of
+/// the row's marker style without any new code paths.
+///
+/// Brace heuristic: `entries.len > 1` always uses the `use foo::{...};`
+/// form; a single entry collapses to single-symbol form
+/// (`use foo::Bar;`) which still reads correctly with the
+/// strikethrough/underline applied for an added or removed entry.
 ///
 /// The synthesized text contains no tabs, so byte offsets in the
 /// returned `text` double as display offsets - no `expandTabs` /
@@ -602,15 +695,6 @@ pub fn buildImportGroupLine(
     group: rv.ImportGroupDiff,
     indent: u8,
 ) !StyledLine {
-    const Symbol = struct { text: []const u8, class: TokenClass };
-    var kept_or_added: std.ArrayList(Symbol) = .empty;
-    var removed: std.ArrayList([]const u8) = .empty;
-    for (group.entries) |entry| switch (entry) {
-        .kept => |s| try kept_or_added.append(arena, .{ .text = s.text, .class = .ident }),
-        .added => |s| try kept_or_added.append(arena, .{ .text = s.text, .class = .import_symbol_added }),
-        .removed => |s| try removed.append(arena, s.text),
-    };
-
     var buf: std.ArrayList(u8) = .empty;
     var spans: std.ArrayList(HighlightSpan) = .empty;
 
@@ -618,47 +702,29 @@ pub fn buildImportGroupLine(
     try buf.appendSlice(arena, group.prefix);
     try buf.appendSlice(arena, "::");
 
-    // Single-symbol form is allowed even when there are removals: the
-    // suffix surfaces those, the inline brace would otherwise just
-    // wrap one identifier. `use foo::{};` (zero kept-or-added) still
-    // takes the brace path so the produced text is the empty-brace
-    // degenerate case rather than a stray `use foo::;`.
-    const use_brace = kept_or_added.items.len != 1;
+    const use_brace = group.entries.len > 1;
     if (use_brace) try buf.append(arena, '{');
 
-    for (kept_or_added.items, 0..) |sym, i| {
+    for (group.entries, 0..) |entry, i| {
         if (i > 0) try buf.appendSlice(arena, ", ");
         const sym_start: u32 = @intCast(buf.items.len);
-        try buf.appendSlice(arena, sym.text);
+        const sym_text = switch (entry) {
+            .kept => |s| s.text,
+            .added => |s| s.text,
+            .removed => |s| s.text,
+        };
+        const sym_class: TokenClass = switch (entry) {
+            .kept => .ident,
+            .added => .inline_added,
+            .removed => .inline_removed,
+        };
+        try buf.appendSlice(arena, sym_text);
         const sym_end: u32 = @intCast(buf.items.len);
-        try spans.append(arena, .{ .start = sym_start, .end = sym_end, .class = sym.class });
+        try spans.append(arena, .{ .start = sym_start, .end = sym_end, .class = sym_class });
     }
 
     if (use_brace) try buf.append(arena, '}');
     try buf.append(arena, ';');
-
-    if (removed.items.len > 0) {
-        try buf.append(arena, ' ');
-        const label_start: u32 = @intCast(buf.items.len);
-        try buf.appendSlice(arena, "removed:");
-        const label_end: u32 = @intCast(buf.items.len);
-        try spans.append(arena, .{
-            .start = label_start,
-            .end = label_end,
-            .class = .comment,
-        });
-        for (removed.items, 0..) |sym, i| {
-            try buf.appendSlice(arena, if (i == 0) " " else ", ");
-            const sym_start: u32 = @intCast(buf.items.len);
-            try buf.appendSlice(arena, sym);
-            const sym_end: u32 = @intCast(buf.items.len);
-            try spans.append(arena, .{
-                .start = sym_start,
-                .end = sym_end,
-                .class = .import_symbol_removed,
-            });
-        }
-    }
 
     return .{
         .indent = indent,
@@ -686,7 +752,7 @@ fn appendLeafHunkPairs(
     for (lines) |sl| switch (sl.marker) {
         .removed => try pending_left.append(arena, sl),
         .added => try pending_right.append(arena, sl),
-        .context => {
+        .context, .changed => {
             try flushPendingPairs(arena, out, &pending_left, &pending_right, indent);
             try out.append(arena, .{ .left = sl, .right = sl });
         },
@@ -1080,9 +1146,21 @@ test "build: removed Zig fn → header + all source lines marked removed, from L
     try testing.expect(saw_removed_source);
 }
 
-test "build: changed leaf → - lines (left) then + lines (right)" {
-    const before = "pub fn greet() u32 { return 1; }\n";
-    const after = "pub fn greet() u32 { return 2; }\n";
+test "build: changed leaf below collapse threshold renders separate -/+ rows" {
+    // Two leaf bodies whose differing line shares <50% of the shorter
+    // side's bytes do NOT collapse into a single inline row; they fall
+    // back to the original git-style hunk with a `-` line followed by
+    // a `+` line.
+    const before =
+        \\pub fn greet() u32 {
+        \\    QQQQQQQQQQ();
+        \\}
+    ;
+    const after =
+        \\pub fn greet() u32 {
+        \\    WWWWWWWWWW();
+        \\}
+    ;
 
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
@@ -1094,7 +1172,8 @@ test "build: changed leaf → - lines (left) then + lines (right)" {
 
     const lines = result.view.unified;
 
-    // Expected order: changed header, then removed source lines, then added source lines.
+    // Expected order: changed header, optional context, then a removed
+    // source line, then an added source line.
     try testing.expect(lines.len >= 3);
     try testing.expectEqual(Marker.changed, lines[0].marker);
 
@@ -1263,10 +1342,23 @@ test "build split: removed decl → right pane blank, left pane has header + sou
     try testing.expect(saw_removed_source_left);
 }
 
-test "build split: changed leaf → left `-` paired with right `+`, padded to equal counts" {
-    // Old body: 1 line; new body: 3 lines, to force padding on the left.
-    const before = "pub fn greet() u32 { return 1; }\n";
-    const after = "pub fn greet() u32 {\n    const x: u32 = 42;\n    return x;\n}\n";
+test "build split: changed leaf body pairs `-` rows with `+` rows, padding the shorter side" {
+    // Use distinct content on each line so the 1:1 inline-collapse
+    // heuristic doesn't kick in (no pair shares ≥ 50% of the shorter
+    // side's bytes). This isolates split-mode pairing from the inline
+    // word-diff: we want to see real `-`/`+` pairs padded with blanks.
+    const before =
+        \\pub fn greet() u32 {
+        \\    A_ABCDEFGHIJ();
+        \\}
+    ;
+    const after =
+        \\pub fn greet() u32 {
+        \\    Z_ZYXWVUTS();
+        \\    Q_QPONMLK();
+        \\    1234567890();
+        \\}
+    ;
 
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
@@ -1278,29 +1370,23 @@ test "build split: changed leaf → left `-` paired with right `+`, padded to eq
     // First pair: the changed header, identical on both sides.
     try testing.expectEqual(Marker.changed, pairs[0].left.marker);
     try testing.expectEqual(Marker.changed, pairs[0].right.marker);
-    try testing.expectEqualStrings(pairs[0].left.text, pairs[0].right.text);
+    try testing.expectEqual(LineKind.decl_header, pairs[0].left.kind);
 
-    // Body pairs: every row has either a real `-` on the left or a blank, and
-    // either a real `+` on the right or a blank; never both sides blank.
-    var total_body: usize = 0;
     var left_real: usize = 0;
     var right_real: usize = 0;
+    var blank_pairs: usize = 0;
     for (pairs[1..]) |p| {
-        total_body += 1;
         const left_blank = p.left.marker == .blank;
         const right_blank = p.right.marker == .blank;
         try testing.expect(!(left_blank and right_blank));
-        if (!left_blank) {
-            try testing.expectEqual(Marker.removed, p.left.marker);
-            left_real += 1;
-        }
-        if (!right_blank) {
-            try testing.expectEqual(Marker.added, p.right.marker);
-            right_real += 1;
-        }
+        if (p.left.marker == .removed) left_real += 1;
+        if (p.right.marker == .added) right_real += 1;
+        // Surplus right rows are paired with blank fillers on the left.
+        if (left_blank and p.right.marker == .added) blank_pairs += 1;
     }
-    try testing.expect(right_real > left_real);
-    try testing.expectEqual(@max(left_real, right_real), total_body);
+    try testing.expectEqual(@as(usize, 1), left_real);
+    try testing.expectEqual(@as(usize, 3), right_real);
+    try testing.expect(blank_pairs >= 2);
 }
 
 test "build split: changed container → header shared, children recurse with indent" {
@@ -1361,9 +1447,20 @@ fn collectHighlightedText(
     return try buf.toOwnedSlice(arena);
 }
 
-test "build: changed leaf populates novel_spans covering exactly the differing atoms" {
-    const before = "pub fn greet() u32 { return 1; }\n";
-    const after = "pub fn greet() u32 { return 2; }\n";
+test "build: changed leaf below collapse threshold populates novel_spans on -/+ rows" {
+    // Disjoint leaf bodies don't collapse into an inline row; the
+    // separate `-` and `+` rows still carry their atom-level novel
+    // spans for syntax-overlay rendering.
+    const before =
+        \\pub fn greet() u32 {
+        \\    QQQQQQQQQQ();
+        \\}
+    ;
+    const after =
+        \\pub fn greet() u32 {
+        \\    WWWWWWWWWW();
+        \\}
+    ;
 
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
@@ -1378,13 +1475,20 @@ test "build: changed leaf populates novel_spans covering exactly the differing a
     const removed_highlight = try collectHighlightedText(a, result.view.unified, .removed);
     const added_highlight = try collectHighlightedText(a, result.view.unified, .added);
 
-    try testing.expectEqualStrings("1", removed_highlight);
-    try testing.expectEqualStrings("2", added_highlight);
+    // The exact atoms in each side's novel spans depend on Dijkstra's
+    // edit script, but each body line's distinctive identifier only
+    // exists on its own side, so it must surface in the corresponding
+    // novel-span concatenation.
+    try testing.expect(std.mem.indexOf(u8, removed_highlight, "QQQQQQQQQQ") != null);
+    try testing.expect(std.mem.indexOf(u8, added_highlight, "WWWWWWWWWW") != null);
 }
 
-test "build: body_change fixture (1 → 42) — novel_spans cover exactly the literals" {
-    // Mirrors tests/fixtures/zig/body_change. This is the acceptance case
-    // called out in the task: the `1` and `42` should be tinted, inclusive.
+test "build: body_change fixture (1 → 42) collapses into one inline row with inline_added/inline_removed spans" {
+    // Mirrors tests/fixtures/zig/body_change. The middle line is a 1:1
+    // pair whose shared bytes (`    return ` + `;`) are well over 50%
+    // of the shorter side, so it collapses into a single `.changed`
+    // row with `1` tagged `.inline_removed` and `42` tagged
+    // `.inline_added`.
     const before =
         \\pub fn greet() u32 {
         \\    return 1;
@@ -1402,21 +1506,31 @@ test "build: body_change fixture (1 → 42) — novel_spans cover exactly the li
     var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
+    var inline_row: ?StyledLine = null;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker != .changed) continue;
+        inline_row = ln;
+    }
+    const row = inline_row orelse return error.MissingInlineRow;
 
-    const removed_highlight = try collectHighlightedText(a, result.view.unified, .removed);
-    const added_highlight = try collectHighlightedText(a, result.view.unified, .added);
-
-    try testing.expectEqualStrings("1", removed_highlight);
-    try testing.expectEqualStrings("42", added_highlight);
+    var removed_text: ?[]const u8 = null;
+    var added_text: ?[]const u8 = null;
+    for (row.highlights) |h| switch (h.class) {
+        .inline_removed => removed_text = row.text[h.start..h.end],
+        .inline_added => added_text = row.text[h.start..h.end],
+        else => {},
+    };
+    try testing.expectEqualStrings("1", removed_text orelse return error.MissingRemoved);
+    try testing.expectEqualStrings("42", added_text orelse return error.MissingAdded);
 }
 
 test "build: body_change fixture renders hunk with context lines shown once (Option B)" {
-    // Acceptance case for the linewise-LCS task: the surrounding lines
-    // (function signature and closing brace) show once as `.context`, only
-    // the differing middle line gets a `-` / `+` pair.
+    // Acceptance case for the linewise-LCS task plus inline word-diff:
+    // surrounding lines (function signature and closing brace) show
+    // once as `.context`; the differing middle line collapses into a
+    // single `.changed` row instead of producing a separate `-` / `+`
+    // pair.
     const before =
         \\pub fn greet() u32 {
         \\    return 1;
@@ -1435,8 +1549,8 @@ test "build: body_change fixture renders hunk with context lines shown once (Opt
     defer result.deinit();
 
     const lines = result.view.unified;
-    // Expected: changed header, context, removed, added, context.
-    try testing.expectEqual(@as(usize, 5), lines.len);
+    // Expected: changed header, context, inline-changed, context.
+    try testing.expectEqual(@as(usize, 4), lines.len);
 
     try testing.expectEqual(Marker.changed, lines[0].marker);
     try testing.expectEqual(LineKind.decl_header, lines[0].kind);
@@ -1445,18 +1559,18 @@ test "build: body_change fixture renders hunk with context lines shown once (Opt
     try testing.expectEqual(LineKind.source, lines[1].kind);
     try testing.expect(std.mem.indexOf(u8, lines[1].text, "pub fn greet() u32 {") != null);
 
-    try testing.expectEqual(Marker.removed, lines[2].marker);
-    try testing.expect(std.mem.indexOf(u8, lines[2].text, "return 1;") != null);
+    try testing.expectEqual(Marker.changed, lines[2].marker);
+    try testing.expectEqual(LineKind.source, lines[2].kind);
+    try testing.expect(std.mem.indexOf(u8, lines[2].text, "return") != null);
+    try testing.expect(std.mem.indexOf(u8, lines[2].text, "1") != null);
+    try testing.expect(std.mem.indexOf(u8, lines[2].text, "42") != null);
 
-    try testing.expectEqual(Marker.added, lines[3].marker);
-    try testing.expect(std.mem.indexOf(u8, lines[3].text, "return 42;") != null);
-
-    try testing.expectEqual(Marker.context, lines[4].marker);
-    try testing.expect(std.mem.indexOf(u8, lines[4].text, "}") != null);
+    try testing.expectEqual(Marker.context, lines[3].marker);
+    try testing.expect(std.mem.indexOf(u8, lines[3].text, "}") != null);
 
     // Context lines carry no novel spans by construction.
     try testing.expectEqual(@as(usize, 0), lines[1].novel_spans.len);
-    try testing.expectEqual(@as(usize, 0), lines[4].novel_spans.len);
+    try testing.expectEqual(@as(usize, 0), lines[3].novel_spans.len);
 }
 
 test "build: context marker uses a blank gutter (git-style)" {
@@ -1464,9 +1578,13 @@ test "build: context marker uses a blank gutter (git-style)" {
 }
 
 test "build: novel_spans respect tab expansion (display offsets, not raw)" {
-    // Leading `\t` on the return line shifts every raw offset by
+    // Leading `\t` on body lines shifts every raw offset by
     // `tab_width - 1`. The novel span must land on the expanded position.
-    const before = "pub fn greet() u32 {\n\treturn 1;\n}\n";
+    // The before has two body lines and the after has one, so the
+    // hunker's adjacent-pair check pairs the second left with the right
+    // and leaves `\treturn 1;` as a solo `.removed` row whose atom-
+    // level novel spans (covering the literal `1`) we can probe.
+    const before = "pub fn greet() u32 {\n\treturn 1;\n\tabandon();\n}\n";
     const after = "pub fn greet() u32 {\n\treturn 2;\n}\n";
 
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
@@ -1490,10 +1608,15 @@ test "build: novel_spans respect tab expansion (display offsets, not raw)" {
     // After tab expansion, the line begins with 4 spaces. `return ` then
     // ends at column 11, so `1` lives at columns [11, 12).
     try testing.expect(ln.novel_spans.len >= 1);
-    const span = ln.novel_spans[0];
-    try testing.expectEqualStrings("1", ln.text[span.start..span.end]);
-    try testing.expectEqual(@as(u32, 11), span.start);
-    try testing.expectEqual(@as(u32, 12), span.end);
+    var found_one = false;
+    for (ln.novel_spans) |span| {
+        if (std.mem.eql(u8, ln.text[span.start..span.end], "1")) {
+            try testing.expectEqual(@as(u32, 11), span.start);
+            try testing.expectEqual(@as(u32, 12), span.end);
+            found_one = true;
+        }
+    }
+    try testing.expect(found_one);
     try testing.expect(std.mem.startsWith(u8, ln.text, "    return "));
 }
 
@@ -1514,7 +1637,7 @@ test "build: unchanged/added/removed decls carry no novel_spans" {
     }
 }
 
-test "build split: changed leaf populates novel_spans on both panes" {
+test "build split: collapsed inline row mirrors on both panes with inline_added/inline_removed spans" {
     const before = "pub fn greet() u32 { return 1; }\n";
     const after = "pub fn greet() u32 { return 2; }\n";
 
@@ -1524,22 +1647,30 @@ test "build split: changed leaf populates novel_spans on both panes" {
     var result = try buildForTest(testing.allocator, &fd, .split);
     defer result.deinit();
 
-    var left_any = false;
-    var right_any = false;
+    var saw_collapsed_pair = false;
     for (result.view.split) |p| {
-        if (p.left.kind == .source and p.left.novel_spans.len > 0) {
-            const s = p.left.novel_spans[0];
-            try testing.expectEqualStrings("1", p.left.text[s.start..s.end]);
-            left_any = true;
-        }
-        if (p.right.kind == .source and p.right.novel_spans.len > 0) {
-            const s = p.right.novel_spans[0];
-            try testing.expectEqualStrings("2", p.right.text[s.start..s.end]);
-            right_any = true;
-        }
+        if (p.left.kind != .source or p.right.kind != .source) continue;
+        if (p.left.marker != .changed or p.right.marker != .changed) continue;
+        try testing.expectEqualStrings(p.left.text, p.right.text);
+
+        var saw_removed = false;
+        var saw_added = false;
+        for (p.left.highlights) |h| switch (h.class) {
+            .inline_removed => {
+                try testing.expectEqualStrings("1", p.left.text[h.start..h.end]);
+                saw_removed = true;
+            },
+            .inline_added => {
+                try testing.expectEqualStrings("2", p.left.text[h.start..h.end]);
+                saw_added = true;
+            },
+            else => {},
+        };
+        try testing.expect(saw_removed);
+        try testing.expect(saw_added);
+        saw_collapsed_pair = true;
     }
-    try testing.expect(left_any);
-    try testing.expect(right_any);
+    try testing.expect(saw_collapsed_pair);
 }
 
 test "mapNovelsToLine: novel outside the emitted line is dropped" {
@@ -1877,8 +2008,21 @@ test "highlights: offsets are in display coordinates (tab expansion respected)" 
 }
 
 test "highlights: Zig changed leaf classifies `const` and `return` as keywords" {
-    const before = "pub fn greet() u32 { return 1; }\n";
-    const after = "pub fn greet() u32 {\n    const x: u32 = 2;\n    return x;\n}\n";
+    // Use a multi-line before whose body line is dissimilar from any
+    // line in the after, so the inline 1:1 collapse doesn't kick in
+    // and we still emit a `.context` and `.added` rows whose syntax
+    // highlights we can probe.
+    const before =
+        \\pub fn greet() u32 {
+        \\    QQQQQQQQQQ();
+        \\}
+    ;
+    const after =
+        \\pub fn greet() u32 {
+        \\    const x: u32 = 2;
+        \\    return x;
+        \\}
+    ;
 
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
@@ -1901,8 +2045,19 @@ test "highlights: Zig changed leaf classifies `const` and `return` as keywords" 
 }
 
 test "highlights: split mode populates highlights on both panes" {
-    const before = "pub fn greet() u32 { return 1; }\n";
-    const after = "pub fn greet() u32 { return 2; }\n";
+    // Multi-line bodies whose middle line is dissimilar enough not to
+    // trigger the inline collapse, so each pane keeps its real
+    // `.context` / `.removed` / `.added` rows with syntax highlights.
+    const before =
+        \\pub fn greet() u32 {
+        \\    QQQQQQQQQQ();
+        \\}
+    ;
+    const after =
+        \\pub fn greet() u32 {
+        \\    WWWWWWWWWW();
+        \\}
+    ;
 
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
@@ -2048,6 +2203,178 @@ test "build: decl_index row order is strictly ascending" {
     }
 }
 
+// ── inline 1:1 word-diff collapse ────────────────────────────────────────
+
+/// Locate the single `.changed` source row produced by an inline 1:1
+/// collapse. Tests use this to skip past header / context rows and
+/// land on the spliced row directly.
+fn findInlineCollapsedRow(lines: []const StyledLine) ?StyledLine {
+    for (lines) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker != .changed) continue;
+        return ln;
+    }
+    return null;
+}
+
+fn findHighlightOnLine(line: StyledLine, want: []const u8) ?HighlightSpan {
+    for (line.highlights) |h| {
+        if (std.mem.eql(u8, line.text[h.start..h.end], want)) return h;
+    }
+    return null;
+}
+
+test "inline collapse: single-token substitution becomes one row with one inline_removed and one inline_added span" {
+    const before =
+        \\fn f(x: Foo) {}
+    ;
+    const after =
+        \\fn f(x: Bar) {}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const row = findInlineCollapsedRow(result.view.unified) orelse return error.MissingCollapsedRow;
+
+    var inline_removed_count: usize = 0;
+    var inline_added_count: usize = 0;
+    for (row.highlights) |h| switch (h.class) {
+        .inline_removed => inline_removed_count += 1,
+        .inline_added => inline_added_count += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), inline_removed_count);
+    try testing.expectEqual(@as(usize, 1), inline_added_count);
+
+    const removed = findHighlightOnLine(row, "Foo") orelse return error.MissingFooSpan;
+    try testing.expectEqual(TokenClass.inline_removed, removed.class);
+    const added = findHighlightOnLine(row, "Bar") orelse return error.MissingBarSpan;
+    try testing.expectEqual(TokenClass.inline_added, added.class);
+
+    // The text contains both `Foo` (in the inline_removed span) and
+    // `Bar` (in the inline_added span).
+    try testing.expect(std.mem.indexOf(u8, row.text, "Foo") != null);
+    try testing.expect(std.mem.indexOf(u8, row.text, "Bar") != null);
+}
+
+test "inline collapse: tabs are expanded so spans land on display offsets" {
+    // Wrap the differing line in a multi-line outer function so the
+    // leading `\t` lands inside the decl's body (where the hunker can
+    // see it) rather than being trimmed off the front of a top-level
+    // decl by tree-sitter.
+    const before = "fn outer() {\n\treturn handle(Foo);\n}\n";
+    const after = "fn outer() {\n\treturn handle(Bar);\n}\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const row = findInlineCollapsedRow(result.view.unified) orelse return error.MissingCollapsedRow;
+
+    // After tab expansion the leading `\t` becomes 4 spaces, so the
+    // displayed text starts with `    return handle(` (18 bytes of
+    // prefix before the differing identifier).
+    try testing.expect(std.mem.startsWith(u8, row.text, "    return handle("));
+
+    const removed = findHighlightOnLine(row, "Foo") orelse return error.MissingFooSpan;
+    try testing.expectEqual(@as(u32, 18), removed.start);
+    try testing.expectEqual(@as(u32, 21), removed.end);
+
+    const added = findHighlightOnLine(row, "Bar") orelse return error.MissingBarSpan;
+    try testing.expectEqual(@as(u32, 21), added.start);
+    try testing.expectEqual(@as(u32, 24), added.end);
+}
+
+test "inline collapse: pure addition inside a line spans only the inserted bytes" {
+    // Both inputs share the identifiers up to `bar`; the only change
+    // is appending ` baz` on the right side. Word LCS pairs them with
+    // shared bytes well above the 50% threshold so the collapse fires
+    // and the inserted bytes form an `.inline_added` span; nothing on
+    // the left becomes `.inline_removed`.
+    const before = "fn x() { foo bar }\n";
+    const after = "fn x() { foo bar baz }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const row = findInlineCollapsedRow(result.view.unified) orelse return error.MissingCollapsedRow;
+
+    var added_count: usize = 0;
+    var removed_count: usize = 0;
+    for (row.highlights) |h| switch (h.class) {
+        .inline_added => added_count += 1,
+        .inline_removed => removed_count += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 0), removed_count);
+    try testing.expect(added_count >= 1);
+    try testing.expect(std.mem.indexOf(u8, row.text, "baz") != null);
+}
+
+test "inline collapse: pure deletion inside a line spans only the removed bytes" {
+    const before = "fn x() { foo bar baz }\n";
+    const after = "fn x() { foo baz }\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const row = findInlineCollapsedRow(result.view.unified) orelse return error.MissingCollapsedRow;
+
+    var added_count: usize = 0;
+    var removed_count: usize = 0;
+    for (row.highlights) |h| switch (h.class) {
+        .inline_added => added_count += 1,
+        .inline_removed => removed_count += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 0), added_count);
+    try testing.expect(removed_count >= 1);
+    try testing.expect(std.mem.indexOf(u8, row.text, "bar") != null);
+}
+
+test "inline collapse: imports splice removed names inline (no `removed:` suffix)" {
+    const before = "use mod_x::{Keep, Old};\n";
+    const after = "use mod_x::{Keep, New};\n";
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var ig_row: ?StyledLine = null;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker != .changed) continue;
+        if (!std.mem.startsWith(u8, ln.text, "use ")) continue;
+        ig_row = ln;
+    }
+    const row = ig_row orelse return error.MissingImportRow;
+    try testing.expect(std.mem.indexOf(u8, row.text, "removed:") == null);
+    try testing.expect(std.mem.indexOf(u8, row.text, "Keep") != null);
+    try testing.expect(std.mem.indexOf(u8, row.text, "Old") != null);
+    try testing.expect(std.mem.indexOf(u8, row.text, "New") != null);
+
+    const keep = findHighlightOnLine(row, "Keep") orelse return error.MissingKeepSpan;
+    try testing.expectEqual(TokenClass.ident, keep.class);
+    const old_span = findHighlightOnLine(row, "Old") orelse return error.MissingOldSpan;
+    try testing.expectEqual(TokenClass.inline_removed, old_span.class);
+    const new_span = findHighlightOnLine(row, "New") orelse return error.MissingNewSpan;
+    try testing.expectEqual(TokenClass.inline_added, new_span.class);
+}
+
 // ── buildImportGroupLine ────────────────────────────────────────────────
 
 fn buildImportGroupLineForTest(
@@ -2080,13 +2407,13 @@ test "buildImportGroupLine: brace form when an addition mixes with kept symbols"
     try testing.expectEqual(LineKind.source, line.kind);
 
     const added = findHighlight(line, "Deserialize") orelse return error.MissingHighlight;
-    try testing.expectEqual(TokenClass.import_symbol_added, added.class);
+    try testing.expectEqual(TokenClass.inline_added, added.class);
 
     const kept = findHighlight(line, "Serialize") orelse return error.MissingHighlight;
     try testing.expectEqual(TokenClass.ident, kept.class);
 }
 
-test "buildImportGroupLine: removed-only entries surface as a trailing suffix" {
+test "buildImportGroupLine: removed symbols are spliced inline, not surfaced as a suffix" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2098,14 +2425,15 @@ test "buildImportGroupLine: removed-only entries surface as a trailing suffix" {
     };
     const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
 
-    try testing.expectEqualStrings("use foo::{a, c}; removed: b", line.text);
+    try testing.expectEqualStrings("use foo::{a, b, c};", line.text);
+    try testing.expect(std.mem.indexOf(u8, line.text, "removed:") == null);
     const removed = findHighlight(line, "b") orelse return error.MissingHighlight;
-    try testing.expectEqual(TokenClass.import_symbol_removed, removed.class);
-    const label = findHighlight(line, "removed:") orelse return error.MissingHighlight;
-    try testing.expectEqual(TokenClass.comment, label.class);
+    try testing.expectEqual(TokenClass.inline_removed, removed.class);
+    const a_span = findHighlight(line, "a") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.ident, a_span.class);
 }
 
-test "buildImportGroupLine: add and remove combined" {
+test "buildImportGroupLine: add and remove combined splice in source order" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2117,11 +2445,11 @@ test "buildImportGroupLine: add and remove combined" {
     };
     const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
 
-    try testing.expectEqualStrings("use foo::{a, c}; removed: b", line.text);
+    try testing.expectEqualStrings("use foo::{a, b, c};", line.text);
     const c_span = findHighlight(line, "c") orelse return error.MissingHighlight;
-    try testing.expectEqual(TokenClass.import_symbol_added, c_span.class);
+    try testing.expectEqual(TokenClass.inline_added, c_span.class);
     const b_span = findHighlight(line, "b") orelse return error.MissingHighlight;
-    try testing.expectEqual(TokenClass.import_symbol_removed, b_span.class);
+    try testing.expectEqual(TokenClass.inline_removed, b_span.class);
 }
 
 test "buildImportGroupLine: single kept symbol uses single-symbol form" {
@@ -2149,10 +2477,10 @@ test "buildImportGroupLine: single added symbol uses single-symbol form" {
 
     try testing.expectEqualStrings("use foo::Bar;", line.text);
     const span = findHighlight(line, "Bar") orelse return error.MissingHighlight;
-    try testing.expectEqual(TokenClass.import_symbol_added, span.class);
+    try testing.expectEqual(TokenClass.inline_added, span.class);
 }
 
-test "buildImportGroupLine: all-removed degenerate case yields empty brace and full suffix" {
+test "buildImportGroupLine: all-removed group splices removed names inline" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2163,7 +2491,28 @@ test "buildImportGroupLine: all-removed degenerate case yields empty brace and f
     };
     const line = try buildImportGroupLineForTest(a, .{ .prefix = "foo", .entries = &entries });
 
-    try testing.expectEqualStrings("use foo::{}; removed: a, b", line.text);
+    try testing.expectEqualStrings("use foo::{a, b};", line.text);
+    try testing.expect(std.mem.indexOf(u8, line.text, "removed:") == null);
+    const a_span = findHighlight(line, "a") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.inline_removed, a_span.class);
+    const b_span = findHighlight(line, "b") orelse return error.MissingHighlight;
+    try testing.expectEqual(TokenClass.inline_removed, b_span.class);
+}
+
+test "buildImportGroupLine: brace heuristic uses entries.len > 1 (single entry collapses)" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Single removed entry would normally not happen at engine level
+    // (decl-level Removed handles it), but the heuristic must still
+    // collapse to single-symbol form for any tag.
+    const removed_only = [_]rv.ImportSymbolEntry{.{ .removed = .{ .text = "Old" } }};
+    const line_removed = try buildImportGroupLineForTest(
+        a,
+        .{ .prefix = "foo", .entries = &removed_only },
+    );
+    try testing.expectEqualStrings("use foo::Old;", line_removed.text);
 }
 
 test "buildImportGroupLine: aliases are kept verbatim and tagged correctly" {
@@ -2179,7 +2528,7 @@ test "buildImportGroupLine: aliases are kept verbatim and tagged correctly" {
 
     try testing.expectEqualStrings("use foo::{Bar as Baz, Qux};", line.text);
     const qux = findHighlight(line, "Qux") orelse return error.MissingHighlight;
-    try testing.expectEqual(TokenClass.import_symbol_added, qux.class);
+    try testing.expectEqual(TokenClass.inline_added, qux.class);
     const aliased = findHighlight(line, "Bar as Baz") orelse return error.MissingHighlight;
     try testing.expectEqual(TokenClass.ident, aliased.class);
 }
@@ -2197,5 +2546,5 @@ test "buildImportGroupLine: self symbol is just another entry" {
 
     try testing.expectEqualStrings("use foo::{self, Bar};", line.text);
     const self_span = findHighlight(line, "self") orelse return error.MissingHighlight;
-    try testing.expectEqual(TokenClass.import_symbol_added, self_span.class);
+    try testing.expectEqual(TokenClass.inline_added, self_span.class);
 }

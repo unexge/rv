@@ -22,6 +22,7 @@ comptime {
     _ = @import("ui/state.zig");
     _ = @import("ui/summary.zig");
     _ = @import("ui/theme.zig");
+    _ = @import("ui/word_lcs.zig");
     _ = @import("vcs/mod.zig");
 }
 

@@ -2495,10 +2495,14 @@ test "drawDiffPane: file-wide unified view paints the line-number gutter before 
     // pane scans the view to size the gutter, and `drawLine` renders
     // both columns ahead of the marker character.
     const before =
-        \\pub fn a() u32 { return 1; }
+        \\pub fn a() u32 {
+        \\    return 1;
+        \\}
     ;
     const after =
-        \\pub fn a() u32 { return 2; }
+        \\pub fn a() u32 {
+        \\    return 2;
+        \\}
     ;
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();

@@ -800,11 +800,16 @@ fn emitSourceLines(
 /// Run a linewise LCS on the gap region and emit one `.source` row per
 /// `HunkLine`. Common rows are emitted as `.unchanged` so they elide the
 /// same way unchanged-decl source lines do; left-only / right-only rows
-/// pick up `.removed` / `.added` markers.
+/// pick up `.removed` / `.added` markers. Consecutive `-` / `+` runs
+/// pass through `line_mod.alignHunks` so leading-trivia comment blocks
+/// (doc comments, `//` notes) on a renamed decl collapse into single
+/// inline `.changed` rows the same way leaf bodies do.
 ///
 /// No highlight collection here: gap regions in real source files are
 /// almost entirely whitespace, occasionally with stray comments. Painting
-/// them at v1 isn't worth the extra SST walking.
+/// them at v1 isn't worth the extra SST walking; collapsed `.changed`
+/// rows already drop highlights by design (see
+/// `tryBuildInlineCollapsedLine`).
 fn emitGap(
     arena: Allocator,
     out: *std.ArrayList(line_mod.StyledLine),
@@ -820,42 +825,60 @@ fn emitGap(
     const left_slice = file_diff.left_source[left_start..left_end];
     const right_slice = file_diff.right_source[right_start..right_end];
     const hunks = try hunk_mod.hunk(arena, left_slice, right_slice);
-    for (hunks) |h| {
-        const marker: line_mod.Marker = switch (h.side) {
-            .common => .unchanged,
-            .left => .removed,
-            .right => .added,
-        };
-        const expanded = try line_mod.expandTabs(arena, h.text);
-
-        var line_no_left: ?u32 = null;
-        var line_no_right: ?u32 = null;
-        switch (h.side) {
-            .common => {
-                line_no_left = cursors.left_line;
-                line_no_right = cursors.right_line;
-                cursors.left_line += 1;
-                cursors.right_line += 1;
-            },
-            .left => {
-                line_no_left = cursors.left_line;
-                cursors.left_line += 1;
-            },
-            .right => {
-                line_no_right = cursors.right_line;
-                cursors.right_line += 1;
-            },
-        }
-
-        try out.append(arena, .{
-            .indent = indent,
-            .marker = marker,
-            .kind = .source,
-            .text = expanded,
-            .line_no_left = line_no_left,
-            .line_no_right = line_no_right,
-        });
-    }
+    const steps = try line_mod.alignHunks(arena, hunks, indent);
+    for (steps) |step| switch (step) {
+        .common => |h| {
+            const expanded = try line_mod.expandTabs(arena, h.text);
+            const ll = cursors.left_line;
+            const rl = cursors.right_line;
+            cursors.left_line += 1;
+            cursors.right_line += 1;
+            try out.append(arena, .{
+                .indent = indent,
+                .marker = .unchanged,
+                .kind = .source,
+                .text = expanded,
+                .line_no_left = ll,
+                .line_no_right = rl,
+            });
+        },
+        .plain => |h| {
+            const expanded = try line_mod.expandTabs(arena, h.text);
+            var line_no_left: ?u32 = null;
+            var line_no_right: ?u32 = null;
+            const marker: line_mod.Marker = switch (h.side) {
+                .left => blk: {
+                    line_no_left = cursors.left_line;
+                    cursors.left_line += 1;
+                    break :blk .removed;
+                },
+                .right => blk: {
+                    line_no_right = cursors.right_line;
+                    cursors.right_line += 1;
+                    break :blk .added;
+                },
+                .common => unreachable,
+            };
+            try out.append(arena, .{
+                .indent = indent,
+                .marker = marker,
+                .kind = .source,
+                .text = expanded,
+                .line_no_left = line_no_left,
+                .line_no_right = line_no_right,
+            });
+        },
+        .collapsed => |line| {
+            // A collapsed pair consumes one line on each side, just like
+            // a `.context` / `.unchanged` row would.
+            var styled = line;
+            styled.line_no_left = cursors.left_line;
+            styled.line_no_right = cursors.right_line;
+            cursors.left_line += 1;
+            cursors.right_line += 1;
+            try out.append(arena, styled);
+        },
+    };
 }
 
 // ── collapsed-decl helpers ─────────────────────────────────────────────────
@@ -2017,4 +2040,69 @@ test "build: moved import-group decl annotation includes `moved N → M`" {
     try testing.expect(std.mem.indexOf(u8, annotation, "serde") != null);
     try testing.expect(std.mem.indexOf(u8, annotation, "moved ") != null);
     try testing.expect(std.mem.indexOf(u8, annotation, " → ") != null);
+}
+
+test "build: doc-comment rename in gap before a changed decl collapses to inline `~` rows" {
+    // Engine emits the leading-trivia comment block as part of the gap
+    // region between file start and the decl. Without `emitGap` running
+    // through `line_mod.alignHunks`, those comments would render as four
+    // separate `-` / `+` rows even for a clean rename. After the fix
+    // they collapse into two `.changed` rows that mirror how leaf bodies
+    // already render the same kind of pair.
+    const before =
+        \\/// Creates a minimal [`Foo`] from epoch.
+        \\// TODO: Remove this once `Foo` is ready.
+        \\pub fn mk() -> Foo { Foo {} }
+        \\
+    ;
+    const after =
+        \\/// Creates a minimal [`Bar`] from epoch.
+        \\// TODO: Remove this once `Bar` is ready.
+        \\pub fn mk() -> Bar { Bar {} }
+        \\
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_doc = false;
+    var saw_todo = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (std.mem.startsWith(u8, ln.text, "/// ")) {
+            try testing.expectEqual(line_mod.Marker.changed, ln.marker);
+            try testing.expectEqual(@as(?u32, 1), ln.line_no_left);
+            try testing.expectEqual(@as(?u32, 1), ln.line_no_right);
+            try expectInlineRename(ln, "Foo", "Bar");
+            saw_doc = true;
+        }
+        if (std.mem.startsWith(u8, ln.text, "// TODO")) {
+            try testing.expectEqual(line_mod.Marker.changed, ln.marker);
+            try testing.expectEqual(@as(?u32, 2), ln.line_no_left);
+            try testing.expectEqual(@as(?u32, 2), ln.line_no_right);
+            try expectInlineRename(ln, "Foo", "Bar");
+            saw_todo = true;
+        }
+    }
+    try testing.expect(saw_doc);
+    try testing.expect(saw_todo);
+}
+
+fn expectInlineRename(
+    ln: line_mod.StyledLine,
+    removed: []const u8,
+    added: []const u8,
+) !void {
+    var saw_removed = false;
+    var saw_added = false;
+    for (ln.highlights) |h| {
+        const slice = ln.text[h.start..h.end];
+        if (h.class == .inline_removed and std.mem.eql(u8, slice, removed)) saw_removed = true;
+        if (h.class == .inline_added and std.mem.eql(u8, slice, added)) saw_added = true;
+    }
+    try testing.expect(saw_removed);
+    try testing.expect(saw_added);
 }

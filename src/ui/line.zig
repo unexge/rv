@@ -552,25 +552,13 @@ pub fn buildLeafHunk(
     };
 
     const hunks = try hunk_mod.hunk(arena, left_slice, right_slice);
+    const steps = try alignHunks(arena, hunks, indent);
 
     var out: std.ArrayList(StyledLine) = .empty;
-    var k: usize = 0;
-    while (k < hunks.len) {
-        const h = hunks[k];
-        if (h.side == .common) {
-            try out.append(arena, try emitPlainHunkRow(arena, h, ctx));
-            k += 1;
-            continue;
-        }
-
-        // Gather the entire `.left` / `.right` run starting at `k`.
-        // line_align then aligns lines within the run by char-level
-        // similarity (≥ 50% shared / min_len) and yields an alignment
-        // script that the inline-collapse path consumes pair-wise.
-        const run_start = k;
-        while (k < hunks.len and hunks[k].side != .common) k += 1;
-        try emitAlignedRun(arena, &out, hunks[run_start..k], ctx);
-    }
+    for (steps) |step| switch (step) {
+        .common, .plain => |h| try out.append(arena, try emitPlainHunkRow(arena, h, ctx)),
+        .collapsed => |line| try out.append(arena, line),
+    };
     return try out.toOwnedSlice(arena);
 }
 
@@ -586,16 +574,66 @@ const LeafCtx = struct {
     right_highlights: Highlights,
 };
 
-/// Walk one consecutive `.left` / `.right` run from the linewise hunker,
-/// run line_align over the per-side line bytes, and append the script's
-/// rows to `out`. Pairs collapse into single inline rows when the
-/// similarity backs it up; falls back to plain `.removed` / `.added`
-/// rows for sub-threshold pairs and the unpaired sides.
-fn emitAlignedRun(
+/// One step in an aligned hunk stream. Produced by `alignHunks` and
+/// consumed by `buildLeafHunk` (leaf bodies) and
+/// `file_view.zig::emitGap` (between-decl trivia gaps). Both callers
+/// share the run-aware loop and the inline-collapse pair logic but
+/// stamp their own marker / line-number / highlight context onto the
+/// emitted rows.
+pub const RunStep = union(enum) {
+    /// `.common` hunk line. Caller emits it as `.context` (leaf body)
+    /// or `.unchanged` (file-wide gap) — whichever fits the row's
+    /// elision semantics.
+    common: hunk_mod.HunkLine,
+    /// `.left` / `.right` hunk line that did not pair with anything
+    /// in its run. Caller emits as `.removed` / `.added` and attaches
+    /// any side-specific data (line numbers, novels, highlights).
+    plain: hunk_mod.HunkLine,
+    /// A pair of `.left` / `.right` lines collapsed into one inline
+    /// `.changed` row by `tryBuildInlineCollapsedLine`. The line is
+    /// fully formed except for line numbers — those are caller-
+    /// specific (the leaf body has none, the gap path tracks them).
+    collapsed: StyledLine,
+};
+
+/// Walk `hunks` and produce a stream of `RunStep`s that bake in
+/// inline-collapse alignment over consecutive `.left` / `.right`
+/// runs. Common rows pass through; runs are aligned via
+/// `line_align.alignLines`, pair-able lines collapse via
+/// `tryBuildInlineCollapsedLine`, and the rest pass through as
+/// `.plain` for the caller to emit with its own marker / line-number
+/// / highlight mapping.
+pub fn alignHunks(
     arena: std.mem.Allocator,
-    out: *std.ArrayList(StyledLine),
+    hunks: []const hunk_mod.HunkLine,
+    indent: u8,
+) ![]const RunStep {
+    var out: std.ArrayList(RunStep) = .empty;
+    var k: usize = 0;
+    while (k < hunks.len) {
+        const h = hunks[k];
+        if (h.side == .common) {
+            try out.append(arena, .{ .common = h });
+            k += 1;
+            continue;
+        }
+
+        // Gather the entire `.left` / `.right` run starting at `k`.
+        // line_align then aligns lines within the run by char-level
+        // similarity (≥ 50% shared / min_len) and yields an alignment
+        // script that the inline-collapse path consumes pair-wise.
+        const run_start = k;
+        while (k < hunks.len and hunks[k].side != .common) k += 1;
+        try appendAlignedRunSteps(arena, &out, hunks[run_start..k], indent);
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+fn appendAlignedRunSteps(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(RunStep),
     run: []const hunk_mod.HunkLine,
-    ctx: LeafCtx,
+    indent: u8,
 ) !void {
     var lefts_text: std.ArrayList([]const u8) = .empty;
     var rights_text: std.ArrayList([]const u8) = .empty;
@@ -618,24 +656,24 @@ fn emitAlignedRun(
         .pair => |p| {
             const left_h = run[left_hunk_idx.items[p.left_idx]];
             const right_h = run[right_hunk_idx.items[p.right_idx]];
-            if (try tryBuildInlineCollapsedLine(arena, left_h.text, right_h.text, ctx.indent)) |line| {
-                try out.append(arena, line);
+            if (try tryBuildInlineCollapsedLine(arena, left_h.text, right_h.text, indent)) |line| {
+                try out.append(arena, .{ .collapsed = line });
             } else {
                 // Defensive: line_align and tryBuildInlineCollapsedLine
                 // use identical similarity + threshold, so a `.pair` op
                 // should always collapse. If it ever doesn't, fall back
                 // to a plain `.removed` + `.added` pair.
-                try out.append(arena, try emitPlainHunkRow(arena, left_h, ctx));
-                try out.append(arena, try emitPlainHunkRow(arena, right_h, ctx));
+                try out.append(arena, .{ .plain = left_h });
+                try out.append(arena, .{ .plain = right_h });
             }
         },
         .left_only => |idx| try out.append(
             arena,
-            try emitPlainHunkRow(arena, run[left_hunk_idx.items[idx]], ctx),
+            .{ .plain = run[left_hunk_idx.items[idx]] },
         ),
         .right_only => |idx| try out.append(
             arena,
-            try emitPlainHunkRow(arena, run[right_hunk_idx.items[idx]], ctx),
+            .{ .plain = run[right_hunk_idx.items[idx]] },
         ),
     };
 }

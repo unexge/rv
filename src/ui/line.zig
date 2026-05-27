@@ -533,9 +533,20 @@ pub fn buildLeafHunk(
     new_decl: rv.Decl,
     indent: u8,
 ) ![]const StyledLine {
-    const left_start = old_decl.list.byte_range.start;
+    // Extend each side's slice backward to the start of the decl's first
+    // source line. `byte_range.start` lies after the leading whitespace
+    // (e.g. at `pub` rather than the indent before it), so without this
+    // the slice's first line has 0 leading whitespace while subsequent
+    // lines retain their full source-column indent. The renderer then
+    // adds `indent_cols = sl.indent * 2` on top of every row, which
+    // double-counts the source-column indent on every line past the first
+    // for any decl not at column 0 (i.e. nested inside an `impl`, `mod`,
+    // struct, etc.). Extending to the line start makes every line's
+    // leading whitespace match its natural source column, so the
+    // renderer's uniform indent shifts every row by the same amount.
+    const left_start = lineStart(file_diff.left_source, old_decl.list.byte_range.start);
     const left_end = old_decl.list.byte_range.end;
-    const right_start = new_decl.list.byte_range.start;
+    const right_start = lineStart(file_diff.right_source, new_decl.list.byte_range.start);
     const right_end = new_decl.list.byte_range.end;
 
     const left_slice = file_diff.left_source[left_start..left_end];
@@ -946,7 +957,8 @@ fn sourceLinesSlice(
     marker: Marker,
 ) ![]const StyledLine {
     var buf: std.ArrayList(StyledLine) = .empty;
-    const start: u32 = decl_list.byte_range.start;
+    // See `buildLeafHunk` for why we extend backward to the line start.
+    const start: u32 = lineStart(source, decl_list.byte_range.start);
     const end: u32 = decl_list.byte_range.end;
     const slice = source[start..end];
 
@@ -985,6 +997,21 @@ fn sourceLinesSlice(
         } else break;
     }
     return try buf.toOwnedSlice(arena);
+}
+
+/// Walk back from `abs` (an absolute byte offset into `source`) to the
+/// start of the line containing it. Used by `buildLeafHunk` and
+/// `sourceLinesSlice` to widen the body slice so its first line includes
+/// the leading-indent that `byte_range.start` skips past — see those
+/// callers for the motivation. Also used by `file_view.zig::emitGap` to
+/// stop a gap end at a line boundary instead of halfway through the
+/// leading-indent of the next decl.
+pub fn lineStart(source: []const u8, abs: u32) u32 {
+    const head = source[0..abs];
+    return if (std.mem.lastIndexOfScalar(u8, head, '\n')) |p|
+        @intCast(p + 1)
+    else
+        0;
 }
 
 /// Collect absolute byte ranges of all atom-level novels on `side`. List-
@@ -1836,6 +1863,150 @@ test "mapNovelsToLine: novel straddling line end is clipped, never crosses \\n" 
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqual(@as(u32, 2), got[0].start);
     try testing.expectEqual(@as(u32, 5), got[0].end);
+}
+
+test "build: nested changed leaf preserves natural source-column indent on every body row" {
+    // Regression: for a decl not at column 0 (here `pub async fn published`
+    // inside `impl Foo`), the leaf-body slice used to start at the decl's
+    // `byte_range.start` (i.e. at `pub`) which dropped the leading
+    // whitespace from the *first* line only. Subsequent lines kept their
+    // full source-column indent, and the renderer's per-row `indent_cols`
+    // then double-counted that indent. After widening the slice back to the
+    // line start, every emitted source row's `text` carries its natural
+    // source column as leading whitespace.
+    const before =
+        \\impl Foo {
+        \\    pub async fn published(&self) -> Vec<Metric> {
+        \\        self.QQQQQQQQQQ.lock().await.clone()
+        \\    }
+        \\}
+    ;
+    const after =
+        \\impl Foo {
+        \\    pub async fn published(&self) -> Vec<Metric> {
+        \\        self.WWWWWWWWWW.lock().await.clone()
+        \\    }
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_signature = false;
+    var saw_body = false;
+    var saw_close = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (std.mem.indexOf(u8, ln.text, "pub async fn published") != null) {
+            try testing.expectEqual(@as(usize, 4), leadingSpaces(ln.text));
+            saw_signature = true;
+        } else if (std.mem.indexOf(u8, ln.text, "self.") != null) {
+            try testing.expectEqual(@as(usize, 8), leadingSpaces(ln.text));
+            saw_body = true;
+        } else if (std.mem.eql(u8, std.mem.trimStart(u8, ln.text, " "), "}")) {
+            // Match only the inner fn's closing brace (4 leading spaces),
+            // not the outer `impl`'s closing brace (which lives outside
+            // the leaf body).
+            if (leadingSpaces(ln.text) == 4) saw_close = true;
+        }
+    }
+    try testing.expect(saw_signature);
+    try testing.expect(saw_body);
+    try testing.expect(saw_close);
+}
+
+test "build: nested added decl preserves natural source-column indent on every body row" {
+    // Same regression as the `.changed` case but exercising the `.added`
+    // path through `appendSourceLines` / `sourceLinesSlice`.
+    const before =
+        \\impl Foo {
+        \\}
+    ;
+    const after =
+        \\impl Foo {
+        \\    pub async fn published(&self) -> Vec<Metric> {
+        \\        self.published.lock().await.clone()
+        \\    }
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_signature = false;
+    var saw_body = false;
+    var saw_close = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker != .added) continue;
+        if (std.mem.indexOf(u8, ln.text, "pub async fn published") != null) {
+            try testing.expectEqual(@as(usize, 4), leadingSpaces(ln.text));
+            saw_signature = true;
+        } else if (std.mem.indexOf(u8, ln.text, "self.published") != null) {
+            try testing.expectEqual(@as(usize, 8), leadingSpaces(ln.text));
+            saw_body = true;
+        } else if (std.mem.eql(u8, std.mem.trimStart(u8, ln.text, " "), "}")) {
+            if (leadingSpaces(ln.text) == 4) saw_close = true;
+        }
+    }
+    try testing.expect(saw_signature);
+    try testing.expect(saw_body);
+    try testing.expect(saw_close);
+}
+
+test "build: nested removed decl preserves natural source-column indent on every body row" {
+    // Mirror of the `.added` test for the `.removed` path. Same
+    // `appendSourceLines` / `sourceLinesSlice` code path, just driven from
+    // `left_source` instead of `right_source`.
+    const before =
+        \\impl Foo {
+        \\    pub async fn published(&self) -> Vec<Metric> {
+        \\        self.published.lock().await.clone()
+        \\    }
+        \\}
+    ;
+    const after =
+        \\impl Foo {
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_signature = false;
+    var saw_body = false;
+    var saw_close = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker != .removed) continue;
+        if (std.mem.indexOf(u8, ln.text, "pub async fn published") != null) {
+            try testing.expectEqual(@as(usize, 4), leadingSpaces(ln.text));
+            saw_signature = true;
+        } else if (std.mem.indexOf(u8, ln.text, "self.published") != null) {
+            try testing.expectEqual(@as(usize, 8), leadingSpaces(ln.text));
+            saw_body = true;
+        } else if (std.mem.eql(u8, std.mem.trimStart(u8, ln.text, " "), "}")) {
+            if (leadingSpaces(ln.text) == 4) saw_close = true;
+        }
+    }
+    try testing.expect(saw_signature);
+    try testing.expect(saw_body);
+    try testing.expect(saw_close);
+}
+
+fn leadingSpaces(s: []const u8) usize {
+    var n: usize = 0;
+    while (n < s.len and s[n] == ' ') : (n += 1) {}
+    return n;
 }
 
 // ── collapse/expand ─────────────────────────────────────────────────────

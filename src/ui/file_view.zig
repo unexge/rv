@@ -227,11 +227,11 @@ fn projectEntries(
         // a negative range (the surrounding whitespace just gets dropped
         // in that case; v1 doesn't try to cleverly recover).
         const left_gap_end = if (lr) |r|
-            @max(cursors.left_byte, lineStartBefore(file_diff.left_source, r.start))
+            @max(cursors.left_byte, line_mod.lineStart(file_diff.left_source, r.start))
         else
             cursors.left_byte;
         const right_gap_end = if (rr) |r|
-            @max(cursors.right_byte, lineStartBefore(file_diff.right_source, r.start))
+            @max(cursors.right_byte, line_mod.lineStart(file_diff.right_source, r.start))
         else
             cursors.right_byte;
         try emitGap(
@@ -283,18 +283,6 @@ fn projectEntries(
 fn consumeTrailingNewline(source: []const u8, end: u32) u32 {
     if (end < source.len and source[end] == '\n') return end + 1;
     return end;
-}
-
-/// Position of the first byte of the line that contains `pos` (i.e. one
-/// past the previous `\n`, or 0 when `pos` is on the first line). Used
-/// to back up a gap end so it stops at a line boundary instead of
-/// halfway through the leading-indent of the next decl.
-fn lineStartBefore(source: []const u8, pos: u32) u32 {
-    var i: usize = @min(pos, source.len);
-    while (i > 0) : (i -= 1) {
-        if (source[i - 1] == '\n') return @intCast(i);
-    }
-    return 0;
 }
 
 fn leftRangeOf(entry: rv.DeclDiff) ?Range {

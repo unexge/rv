@@ -13,8 +13,17 @@
 //! two raw lines `a` and `b` are considered a pair when
 //! `shared_bytes / min(|a|, |b|) >= 0.5` AND the byte-level diff
 //! produces no more than `max_alternation_runs` non-common runs.
-//! Both gates are duplicated in `line.zig::tryBuildInlineCollapsedLine`
+//! If the full-byte gate fails, we retry on the leading-whitespace-
+//! trimmed views and accept the pair if the trimmed gate passes:
+//! an indent change otherwise piles extra runs onto the alternation
+//! count and a re-indented line cascades into a no-collapse. Both
+//! gates are duplicated in `line.zig::tryBuildInlineCollapsedLine`
 //! so the two pair predicates agree on what collapses.
+//!
+//! The retry is one-way: if the full-byte score already passes we
+//! keep it. Trimming a short line that shares its indent (`    Foo {`
+//! vs `    Bar {`) drops the shared-byte ratio below the threshold
+//! even though the original pair is obviously a 1:1 match.
 //!
 //! Output is an alignment script: a sequence of `.pair`, `.left_only`,
 //! and `.right_only` ops in run order. The caller (`buildLeafHunk`)
@@ -62,6 +71,65 @@ const pair_threshold: f32 = 0.5;
 /// scrambles the text. Same value as `line.zig::max_alternation_runs`
 /// so both pair predicates agree.
 const max_alternation_runs: usize = 4;
+
+/// Stats from running `word_lcs.diff` over two lines: shared bytes,
+/// the shorter input's length, and the number of non-common runs in
+/// the diff. The score may be computed over the raw bytes or over
+/// leading-whitespace-trimmed views; see `scorePair`.
+pub const PairScore = struct {
+    shared: usize,
+    min_len: usize,
+    alternations: usize,
+
+    pub fn passes(self: PairScore) bool {
+        if (self.min_len == 0) return false;
+        if (self.alternations > max_alternation_runs) return false;
+        return self.shared * 2 >= self.min_len;
+    }
+};
+
+/// Score a candidate pair. We try the full bytes first; if that
+/// passes the threshold, we keep it. Otherwise, if either side has
+/// leading ASCII whitespace, we retry on the trimmed views - this
+/// rescues re-indented lines whose indent delta blew past the
+/// alternation cap or drowned out small content matches. The retry
+/// is one-way: trimming can only flip a `false` to `true`, never the
+/// reverse, so short lines like `    Foo {` vs `    Bar {` (which
+/// only pass thanks to the shared indent) keep collapsing. Same
+/// metric is used by `line.zig::tryBuildInlineCollapsedLine` so the
+/// align-pass and the splice-pass agree on what passes.
+pub fn scorePair(arena: Allocator, a: []const u8, b: []const u8) !PairScore {
+    const full = try scoreOnce(arena, a, b);
+    if (full.passes()) return full;
+
+    const at = trimLeadingWs(a);
+    const bt = trimLeadingWs(b);
+    if (at.len == a.len and bt.len == b.len) return full;
+    return scoreOnce(arena, at, bt);
+}
+
+fn scoreOnce(arena: Allocator, a: []const u8, b: []const u8) !PairScore {
+    const min_len = @min(a.len, b.len);
+    if (min_len == 0) return .{ .shared = 0, .min_len = 0, .alternations = 0 };
+
+    const runs = try word_lcs.diff(arena, a, b);
+    var shared: usize = 0;
+    var alternations: usize = 0;
+    for (runs) |r| switch (r.side) {
+        .common => shared += r.bytes.len,
+        .removed, .added => alternations += 1,
+    };
+    return .{ .shared = shared, .min_len = min_len, .alternations = alternations };
+}
+
+fn trimLeadingWs(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c != ' ' and c != '\t') break;
+    }
+    return s[i..];
+}
 
 /// Produce an alignment script for a `.left` / `.right` run.
 ///
@@ -156,24 +224,17 @@ pub fn alignLines(
     return try out.toOwnedSlice(arena);
 }
 
-/// Byte-level similarity in `[0, 1]`: shared bytes (per `word_lcs.diff`)
-/// divided by the shorter input's length. Defined as 0 when either side
-/// is empty so empty/non-empty pairs never cross the threshold. Also
-/// returns 0 when the diff produces more than `max_alternation_runs`
-/// non-common runs; see the module doc for why.
+/// Byte-level similarity in `[0, 1]`: shared bytes (per
+/// `word_lcs.diff`) divided by the shorter input's length. Defined
+/// as 0 when the shorter side is empty so empty/non-empty pairs
+/// never cross the threshold. Also returns 0 when the diff produces
+/// more than `max_alternation_runs` non-common runs. Uses
+/// `scorePair`, so a pair that fails on full bytes but passes on
+/// trimmed views still scores above 0; see the module doc for why.
 fn similarity(arena: Allocator, a: []const u8, b: []const u8) !f32 {
-    const min_len = @min(a.len, b.len);
-    if (min_len == 0) return 0.0;
-
-    const runs = try word_lcs.diff(arena, a, b);
-    var shared: usize = 0;
-    var alternations: usize = 0;
-    for (runs) |r| switch (r.side) {
-        .common => shared += r.bytes.len,
-        .removed, .added => alternations += 1,
-    };
-    if (alternations > max_alternation_runs) return 0.0;
-    return @as(f32, @floatFromInt(shared)) / @as(f32, @floatFromInt(min_len));
+    const score = try scorePair(arena, a, b);
+    if (!score.passes()) return 0.0;
+    return @as(f32, @floatFromInt(score.shared)) / @as(f32, @floatFromInt(score.min_len));
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -477,4 +538,23 @@ test "alignLines: empty inputs → empty output" {
 
     const ops = try alignLines(a, &.{}, &.{});
     try testing.expectEqual(@as(usize, 0), ops.len);
+}
+
+test "alignLines: re-indent rescue - full-byte LCS fails, trimmed pairs them" {
+    // Indent change + a small content edit pushes the full-byte LCS
+    // over the alternation cap (`    `, `    ` added, `foo` removed,
+    // `bar` added, `(); // `, `x` removed, `y` added → 5 alts > 4).
+    // Trimming the leading whitespace drops the indent runs, leaving
+    // 4 alts which sits at the cap, and the pair survives. Without
+    // the rescue path this falls back to two unpaired rows.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const lefts = [_][]const u8{"    foo(); // x"};
+    const rights = [_][]const u8{"        bar(); // y"};
+
+    const ops = try alignLines(a, &lefts, &rights);
+    try testing.expectEqual(@as(usize, 1), ops.len);
+    try expectPair(ops[0], 0, 0);
 }

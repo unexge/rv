@@ -739,12 +739,16 @@ fn emitPlainHunkRow(
 
 /// Attempt to splice `left_text` and `right_text` (raw, pre-tab-expansion
 /// line bytes) into a single `.changed` source line. Returns the line on
-/// success or `null` when:
+/// success or `null` when `line_align.scorePair` rejects the pair, i.e.
+/// when both:
 ///
-///   - the byte-level LCS shares < 50% of the shorter side, or
-///   - the LCS produces more than `max_alternation_runs` non-common runs.
+///   - the LCS over the full bytes shares < 50% of the shorter side or
+///     produces more than `max_alternation_runs` non-common runs, AND
+///   - the same gate over the leading-whitespace-trimmed views also
+///     fails (the rescue path that lets a re-indented line still
+///     collapse - see `line_align.scorePair` for rationale).
 ///
-/// In either case the caller falls back to emitting two rows. The
+/// On rejection the caller falls back to emitting two rows. The
 /// alternation cap catches pathological pairs whose surrounding bytes
 /// score above 50% similarity but whose differing region scrambles
 /// into incomprehensible text once spliced (e.g. two unrelated
@@ -762,18 +766,15 @@ fn tryBuildInlineCollapsedLine(
     right_text: []const u8,
     indent: u8,
 ) !?StyledLine {
-    const min_len = @min(left_text.len, right_text.len);
-    if (min_len == 0) return null;
+    // Gate on the same score `line_align` uses: full bytes first,
+    // and if that fails, retry on the leading-whitespace-trimmed
+    // views so a re-indented line doesn't get pushed past the 0.5 /
+    // 4-run thresholds by its indent delta. The actual splice still
+    // uses the FULL bytes so any indent change surfaces inline.
+    const score = try line_align.scorePair(arena, left_text, right_text);
+    if (!score.passes()) return null;
 
     const runs = try word_lcs.diff(arena, left_text, right_text);
-    var shared: usize = 0;
-    var alternations: usize = 0;
-    for (runs) |r| switch (r.side) {
-        .common => shared += r.bytes.len,
-        .removed, .added => alternations += 1,
-    };
-    if (alternations > max_alternation_runs) return null;
-    if (shared * 2 < min_len) return null;
 
     var buf: std.ArrayList(u8) = .empty;
     var spans: std.ArrayList(HighlightSpan) = .empty;

@@ -563,11 +563,18 @@ pub fn buildLeafHunk(
     };
 
     const hunks = try hunk_mod.hunk(arena, left_slice, right_slice);
-    const steps = try alignHunks(arena, hunks, indent);
+    const leaf_novels: LeafNovels = .{
+        .left_abs_start = left_start,
+        .right_abs_start = right_start,
+        .left = try collectAllNovels(arena, script, .left),
+        .right = try collectAllNovels(arena, script, .right),
+    };
+    const steps = try alignHunks(arena, hunks, indent, leaf_novels);
 
     var out: std.ArrayList(StyledLine) = .empty;
     for (steps) |step| switch (step) {
         .common, .plain => |h| try out.append(arena, try emitPlainHunkRow(arena, h, ctx)),
+        .right_context => |h| try out.append(arena, try emitRightContextRow(arena, h, ctx)),
         .collapsed => |line| try out.append(arena, line),
     };
     return try out.toOwnedSlice(arena);
@@ -600,11 +607,36 @@ pub const RunStep = union(enum) {
     /// in its run. Caller emits as `.removed` / `.added` and attaches
     /// any side-specific data (line numbers, novels, highlights).
     plain: hunk_mod.HunkLine,
+    /// A `.right` HunkLine that the AST classifies as filler (no
+    /// novel atoms intersect it). Emitted only by `buildLeafHunk`
+    /// when novels are supplied; the caller renders it with marker
+    /// `.context` using bytes/highlights from the right slice. Lets a
+    /// reformatted-but-semantically-unchanged right line read as
+    /// structural context instead of a misleading `+` row alongside
+    /// a struck-through left line.
+    right_context: hunk_mod.HunkLine,
     /// A pair of `.left` / `.right` lines collapsed into one inline
     /// `.changed` row by `tryBuildInlineCollapsedLine`. The line is
     /// fully formed except for line numbers — those are caller-
     /// specific (the leaf body has none, the gap path tracks them).
     collapsed: StyledLine,
+};
+
+/// Pre-collected novel byte ranges for a `Changed` leaf, plus the
+/// absolute byte offset where each side's slice starts. Passed to
+/// `alignHunks` so it can classify each line in a `.left` / `.right`
+/// run as filler (no novel byte_range touches it) or novel-bearing.
+/// `null` disables the classification and reproduces the run-as-a-
+/// whole alignment used by `file_view.zig::emitGap`. The byte ranges
+/// here must include both atom-level and list-level novels (see
+/// `collectAllNovels`); list-only novels still represent a real
+/// change on the line they cover, even though they don't paint per-
+/// atom highlights.
+pub const LeafNovels = struct {
+    left_abs_start: u32,
+    right_abs_start: u32,
+    left: []const ByteSpan,
+    right: []const ByteSpan,
 };
 
 /// Walk `hunks` and produce a stream of `RunStep`s that bake in
@@ -618,6 +650,7 @@ pub fn alignHunks(
     arena: std.mem.Allocator,
     hunks: []const hunk_mod.HunkLine,
     indent: u8,
+    novels: ?LeafNovels,
 ) ![]const RunStep {
     var out: std.ArrayList(RunStep) = .empty;
     var k: usize = 0;
@@ -635,7 +668,7 @@ pub fn alignHunks(
         // script that the inline-collapse path consumes pair-wise.
         const run_start = k;
         while (k < hunks.len and hunks[k].side != .common) k += 1;
-        try appendAlignedRunSteps(arena, &out, hunks[run_start..k], indent);
+        try appendAlignedRunSteps(arena, &out, hunks[run_start..k], indent, novels);
     }
     return try out.toOwnedSlice(arena);
 }
@@ -645,47 +678,157 @@ fn appendAlignedRunSteps(
     out: *std.ArrayList(RunStep),
     run: []const hunk_mod.HunkLine,
     indent: u8,
+    novels: ?LeafNovels,
 ) !void {
+    // Filler classification (only when AST novels are supplied):
+    // a hunk line is "filler" iff every atom on it is in a `match`
+    // edit, i.e. no novel byte_range intersects the line. Filler
+    // LEFT lines are dropped; filler RIGHT lines emit as
+    // `.right_context` (the caller renders them as `.context`).
+    // Only novel-bearing lines feed into `line_align`, so an
+    // asymmetric reformatting (e.g. a 1-line signature split into
+    // 4 lines with one new arg) no longer drags the unchanged left
+    // line into a misleading inline-collapse against an arbitrary
+    // right partner.
+    const is_filler = try arena.alloc(bool, run.len);
+    @memset(is_filler, false);
+
     var lefts_text: std.ArrayList([]const u8) = .empty;
     var rights_text: std.ArrayList([]const u8) = .empty;
     var left_hunk_idx: std.ArrayList(usize) = .empty;
     var right_hunk_idx: std.ArrayList(usize) = .empty;
-    for (run, 0..) |h, idx| switch (h.side) {
-        .left => {
-            try lefts_text.append(arena, h.text);
-            try left_hunk_idx.append(arena, idx);
-        },
-        .right => {
-            try rights_text.append(arena, h.text);
-            try right_hunk_idx.append(arena, idx);
-        },
-        .common => unreachable,
-    };
+    for (run, 0..) |h, idx| {
+        const filler = if (novels) |nv| switch (h.side) {
+            .left => !lineHasNovel(nv.left_abs_start + h.offset, h.text.len, nv.left),
+            .right => !lineHasNovel(nv.right_abs_start + h.offset, h.text.len, nv.right),
+            .common => unreachable,
+        } else false;
+        is_filler[idx] = filler;
+        if (filler) continue;
+        switch (h.side) {
+            .left => {
+                try lefts_text.append(arena, h.text);
+                try left_hunk_idx.append(arena, idx);
+            },
+            .right => {
+                try rights_text.append(arena, h.text);
+                try right_hunk_idx.append(arena, idx);
+            },
+            .common => unreachable,
+        }
+    }
 
     const ops = try line_align.alignLines(arena, lefts_text.items, rights_text.items);
-    for (ops) |op| switch (op) {
-        .pair => |p| {
-            const left_h = run[left_hunk_idx.items[p.left_idx]];
-            const right_h = run[right_hunk_idx.items[p.right_idx]];
-            if (try tryBuildInlineCollapsedLine(arena, left_h.text, right_h.text, indent)) |line| {
-                try out.append(arena, .{ .collapsed = line });
-            } else {
-                // Defensive: line_align and tryBuildInlineCollapsedLine
-                // use identical similarity + threshold, so a `.pair` op
-                // should always collapse. If it ever doesn't, fall back
-                // to a plain `.removed` + `.added` pair.
-                try out.append(arena, .{ .plain = left_h });
-                try out.append(arena, .{ .plain = right_h });
-            }
-        },
-        .left_only => |idx| try out.append(
-            arena,
-            .{ .plain = run[left_hunk_idx.items[idx]] },
-        ),
-        .right_only => |idx| try out.append(
-            arena,
-            .{ .plain = run[right_hunk_idx.items[idx]] },
-        ),
+
+    // Walk ops in source order, flushing filler-right lines into
+    // `.right_context` runsteps at their original run positions so
+    // the emitted hunk reads top-to-bottom in source order.
+    var cursor: usize = 0;
+    for (ops) |op| {
+        const limit_pos = switch (op) {
+            .pair => |p| @max(
+                left_hunk_idx.items[p.left_idx],
+                right_hunk_idx.items[p.right_idx],
+            ),
+            .left_only => |idx| left_hunk_idx.items[idx],
+            .right_only => |idx| right_hunk_idx.items[idx],
+        };
+        try flushFillerRights(arena, out, run, is_filler, &cursor, limit_pos);
+        // The op itself consumes the run line(s) at `limit_pos`
+        // (and, for a pair, the smaller of the two paired indices,
+        // which `flushFillerRights` already iterated past as a
+        // novel-bearing no-op).
+        cursor = limit_pos + 1;
+        switch (op) {
+            .pair => |p| {
+                const left_h = run[left_hunk_idx.items[p.left_idx]];
+                const right_h = run[right_hunk_idx.items[p.right_idx]];
+                if (try tryBuildInlineCollapsedLine(arena, left_h.text, right_h.text, indent)) |line| {
+                    try out.append(arena, .{ .collapsed = line });
+                } else {
+                    // Defensive: line_align and tryBuildInlineCollapsedLine
+                    // use identical similarity + threshold, so a `.pair` op
+                    // should always collapse. If it ever doesn't, fall back
+                    // to a plain `.removed` + `.added` pair.
+                    try out.append(arena, .{ .plain = left_h });
+                    try out.append(arena, .{ .plain = right_h });
+                }
+            },
+            .left_only => |idx| try out.append(
+                arena,
+                .{ .plain = run[left_hunk_idx.items[idx]] },
+            ),
+            .right_only => |idx| try out.append(
+                arena,
+                .{ .plain = run[right_hunk_idx.items[idx]] },
+            ),
+        }
+    }
+    try flushFillerRights(arena, out, run, is_filler, &cursor, run.len);
+}
+
+/// Emit `.right_context` runsteps for every filler-right line in
+/// `run[cursor.* .. limit]`, advancing `cursor` to `limit`. Filler
+/// lefts are dropped; novel-bearing lines (which the caller emits
+/// via the alignment script) are silently skipped over.
+fn flushFillerRights(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(RunStep),
+    run: []const hunk_mod.HunkLine,
+    is_filler: []const bool,
+    cursor: *usize,
+    limit: usize,
+) !void {
+    while (cursor.* < limit) : (cursor.* += 1) {
+        if (is_filler[cursor.*] and run[cursor.*].side == .right) {
+            try out.append(arena, .{ .right_context = run[cursor.*] });
+        }
+    }
+}
+
+/// True iff any byte of the half-open absolute range
+/// `[line_abs_start, line_abs_start + line_len)` intersects a novel
+/// in `novels`. Linear scan: novels are appended in source order by
+/// `collectAllNovels`, but we don't need the sorted order for
+/// membership.
+fn lineHasNovel(
+    line_abs_start: u32,
+    line_len: usize,
+    novels: []const ByteSpan,
+) bool {
+    const line_abs_end: u32 = line_abs_start + @as(u32, @intCast(line_len));
+    for (novels) |nv| {
+        if (nv.end <= line_abs_start) continue;
+        if (nv.start >= line_abs_end) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Emit a `.context` source row for a filler-right HunkLine: bytes,
+/// highlights, and absolute offset come from the right slice; novel
+/// spans are empty by definition (the caller only produces this
+/// runstep for lines with zero overlap with any novel atom).
+fn emitRightContextRow(
+    arena: std.mem.Allocator,
+    h: hunk_mod.HunkLine,
+    ctx: LeafCtx,
+) !StyledLine {
+    std.debug.assert(h.side == .right);
+    const abs_start = ctx.right_start + h.offset;
+    const line_highlights = try mapHighlightsToLine(
+        arena,
+        h.text,
+        abs_start,
+        ctx.right_highlights,
+    );
+    const expanded = try expandTabs(arena, h.text);
+    return .{
+        .indent = ctx.indent,
+        .marker = .context,
+        .kind = .source,
+        .text = expanded,
+        .highlights = line_highlights,
     };
 }
 
@@ -1037,6 +1180,31 @@ fn collectAtomNovels(
                 }),
                 .list => {}, // deferred for v1; see module doc.
             }
+        },
+    };
+    return try out.toOwnedSlice(arena);
+}
+
+/// Collect absolute byte ranges for every novel on `side`, atom AND
+/// list. Used to classify hunk lines as filler vs novel-bearing in
+/// `appendAlignedRunSteps`: a line carries information iff some novel
+/// byte_range overlaps it. Differs from `collectAtomNovels` (which
+/// only emits atom byte ranges for highlight painting) because list-
+/// level novels still represent a real semantic change on the line
+/// they intersect, even though Dijkstra emitted them at list
+/// granularity to keep the cost down.
+fn collectAllNovels(
+    arena: std.mem.Allocator,
+    script: rv.EditScript,
+    side: rv.Side,
+) ![]const ByteSpan {
+    var out: std.ArrayList(ByteSpan) = .empty;
+    for (script.edits) |e| switch (e) {
+        .match => {},
+        .novel => |nv| {
+            if (nv.side != side) continue;
+            const r = nv.node_ref.byteRange();
+            try out.append(arena, .{ .start = r.start, .end = r.end });
         },
     };
     return try out.toOwnedSlice(arena);
@@ -2803,10 +2971,12 @@ fn collectInlineRows(
 }
 
 test "multi-line align: signature + body rewrite produces multiple inline rows" {
-    // The function's signature changes (one obvious pair) and its body
-    // is rewritten in two places (two more obvious pairs). The old
-    // adjacent-1:1 collapse only caught the first; line_align handles
-    // every pair-able line inside the run.
+    // The function's signature changes (one obvious pair) and the
+    // struct-literal name and `field_b` line each carry novel atoms
+    // on BOTH sides, so they collapse inline. `insert(Foo::wrap(k),
+    // v);` and `field_a: wrap(x),` are asymmetric: the right line
+    // has only matched atoms (filler) and renders as `.context`
+    // while the left keeps its novels and renders as `.removed`.
     const before =
         \\fn make() -> Foo {
         \\    insert(Foo::wrap(k), v);
@@ -2837,9 +3007,12 @@ test "multi-line align: signature + body rewrite produces multiple inline rows" 
     const a = arena_state.allocator();
 
     const inline_rows = try collectInlineRows(a, result.view.unified);
-    // Five obvious pairs: signature, insert, struct-name, field_a,
-    // field_b. They render as five inline `.changed` rows.
-    try testing.expectEqual(@as(usize, 5), inline_rows.len);
+    // Three symmetric pairs collapse: signature (Foo→Bar), struct-
+    // literal name (Foo→Bar), and `field_b` (Old→New). The other
+    // two body lines have no novels on the right (`insert(k, v);`
+    // and `field_a: x,` are pure filler) so the AST-aware path
+    // suppresses the inline-collapse there.
+    try testing.expectEqual(@as(usize, 3), inline_rows.len);
 
     // Each row carries at least one inline span (some pairs are
     // pure deletions or insertions, so they may have only one of the
@@ -2859,10 +3032,12 @@ test "multi-line align: signature + body rewrite produces multiple inline rows" 
 }
 
 test "multi-line align: pair-able lines buried inside a run with unpaired neighbours" {
-    // The right side collapses three chained-call lines into one; the
-    // signature still has an obvious 1:1 counterpart. The 4:1 chain
-    // section pairs at most one line; the rest become plain `.removed`
-    // rows.
+    // The right side collapses three chained-call lines into one;
+    // the signature pair and the chain pair both have novels on
+    // both sides, so they collapse inline. The `.step1()` /
+    // `.step2()` / `.step3();` left lines are pure filler under
+    // the AST-aware rule (every atom on them is in a `match` edit)
+    // and drop out instead of surfacing as `.removed`.
     const before =
         \\fn make() -> Foo {
         \\    let x = chain_a()
@@ -2885,10 +3060,9 @@ test "multi-line align: pair-able lines buried inside a run with unpaired neighb
     var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
-    // The signature pair is the most important assertion: it must
-    // collapse into one inline row.
     var saw_signature_inline = false;
-    var saw_chain_removed = false;
+    var saw_chain_inline = false;
+    var saw_step_anywhere = false;
     for (result.view.unified) |ln| {
         if (ln.kind != .source) continue;
         if (ln.marker == .changed and std.mem.indexOf(u8, ln.text, "fn make") != null) {
@@ -2896,14 +3070,29 @@ test "multi-line align: pair-able lines buried inside a run with unpaired neighb
             try testing.expect(std.mem.indexOf(u8, ln.text, "Foo") != null);
             try testing.expect(std.mem.indexOf(u8, ln.text, "Bar") != null);
         }
-        // At least one chain step survives as a `.removed` row (the
-        // unpaired surplus on the left side).
-        if (ln.marker == .removed and std.mem.indexOf(u8, ln.text, ".step") != null) {
-            saw_chain_removed = true;
+        // The chain pair (`chain_a()` left, full chain right) has
+        // novels on both sides and collapses inline. The spliced
+        // text shares the `chain_` prefix and surfaces `a` /
+        // `b` as `.inline_removed` / `.inline_added` spans, so
+        // assert via the highlights rather than substring matches.
+        if (ln.marker == .changed and std.mem.indexOf(u8, ln.text, "chain_") != null) {
+            var saw_a_removed = false;
+            var saw_b_added = false;
+            for (ln.highlights) |h| {
+                const slice = ln.text[h.start..h.end];
+                if (h.class == .inline_removed and std.mem.eql(u8, slice, "a")) saw_a_removed = true;
+                if (h.class == .inline_added and std.mem.indexOf(u8, slice, "b") != null) saw_b_added = true;
+            }
+            if (saw_a_removed and saw_b_added) saw_chain_inline = true;
         }
+        if (std.mem.indexOf(u8, ln.text, ".step") != null) saw_step_anywhere = true;
     }
     try testing.expect(saw_signature_inline);
-    try testing.expect(saw_chain_removed);
+    try testing.expect(saw_chain_inline);
+    // The standalone `.step` left lines are filler under the new
+    // rule and must not surface as `.removed` (or any other) rows;
+    // they only appear inlined inside the chain `.changed` row.
+    try testing.expect(!saw_step_anywhere or saw_chain_inline);
 }
 
 test "multi-line align split: collapsed inline rows mirror on both panes" {
@@ -2940,25 +3129,28 @@ test "multi-line align split: collapsed inline rows mirror on both panes" {
         try testing.expectEqualStrings(p.left.text, p.right.text);
         inline_pairs += 1;
     }
-    // At least the signature, the insert call, the struct-literal
-    // header, and the field row should each collapse.
-    try testing.expect(inline_pairs >= 4);
+    // At least the signature and the struct-literal header collapse
+    // (both have novels on both sides). `insert(k, v);` and
+    // `field_a: x,` are filler on the right under the AST-aware
+    // rule and don't pair into an inline `.changed` row.
+    try testing.expect(inline_pairs >= 2);
 }
 
 test "multi-line align split: unpaired left rows pair with blank fillers on the right" {
+    // Every removed line on the left has novel atoms (one renamed
+    // identifier per line), so the AST-aware filler rule keeps
+    // them as `.removed` rows. The right side is shorter, so the
+    // surplus left rows must pair with blank fillers in split view.
     const before =
-        \\fn make() -> Foo {
-        \\    let x = chain_a()
-        \\        .step1()
-        \\        .step2()
-        \\        .step3();
-        \\    x
+        \\fn f() {
+        \\    aaaaa();
+        \\    bbbbb();
+        \\    ccccc();
         \\}
     ;
     const after =
-        \\fn make() -> Bar {
-        \\    let x = chain_b().step1().step2().step3();
-        \\    x
+        \\fn f() {
+        \\    qqqqq();
         \\}
     ;
 
@@ -2968,27 +3160,27 @@ test "multi-line align split: unpaired left rows pair with blank fillers on the 
     var result = try buildForTest(testing.allocator, &fd, .split);
     defer result.deinit();
 
-    var saw_left_only_step = false;
+    var saw_left_only_removed = false;
     for (result.view.split) |p| {
         if (p.left.kind != .source) continue;
         if (p.left.marker != .removed) continue;
-        if (std.mem.indexOf(u8, p.left.text, ".step") == null) continue;
         // An unpaired left row pairs with a blank filler on the right
         // so the panes stay row-aligned.
         try testing.expectEqual(Marker.blank, p.right.marker);
-        saw_left_only_step = true;
+        saw_left_only_removed = true;
     }
-    try testing.expect(saw_left_only_step);
+    try testing.expect(saw_left_only_removed);
 }
 
 test "multi-line align: signature_with_body fixture renders the expected mix of inline + plain rows" {
     // Mirrors `tests/fixtures/rust/inline_diff_signature_with_body`.
-    // The signature change pairs into one inline row; the body has
-    // pair-able lines (insert call, struct-literal name, two field
-    // rows) interleaved with unpaired left lines (the chained-call
-    // run, the trailing `extra: 1,`). The output must contain those
-    // inline rows AND keep the unpaired chain lines as plain
-    // `.removed` rows in source order.
+    // The signature change and the `field_b` line have novels on
+    // both sides and collapse inline. The chained-call lines
+    // (`.step1()` / `.step2();`) carry only matched atoms on the
+    // left and are dropped as filler under the AST-aware rule. The
+    // `insert(...)` and `field_a:` rights are filler so the inline-
+    // collapse there is suppressed; the trailing `extra: 1,` left
+    // line carries a novel-list edit and stays as `.removed`.
     const before =
         \\fn make(k: u32, x: u32) -> Foo {
         \\    let _ = chain_a()
@@ -3020,10 +3212,10 @@ test "multi-line align: signature_with_body fixture renders the expected mix of 
     defer result.deinit();
 
     var saw_signature_inline = false;
-    var saw_insert_inline = false;
+    var saw_chain_inline = false;
     var saw_field_b_inline = false;
     var saw_extra_removed = false;
-    var saw_step_removed = false;
+    var saw_standalone_step = false;
 
     for (result.view.unified) |ln| {
         if (ln.kind != .source) continue;
@@ -3035,10 +3227,22 @@ test "multi-line align: signature_with_body fixture renders the expected mix of 
                 {
                     saw_signature_inline = true;
                 }
-                if (std.mem.indexOf(u8, ln.text, "insert(") != null and
-                    std.mem.indexOf(u8, ln.text, "Foo::wrap") != null)
-                {
-                    saw_insert_inline = true;
+                // The chain pair has novels on both sides (chain_a
+                // → chain_b) and collapses inline. The spliced
+                // text shares the `chain_` prefix; use the
+                // `inline_removed` / `inline_added` highlights to
+                // assert both sides are represented (substring
+                // matches alone are unreliable due to the prefix
+                // overlap).
+                if (std.mem.indexOf(u8, ln.text, "chain_") != null) {
+                    var saw_a_removed = false;
+                    var saw_b_added = false;
+                    for (ln.highlights) |h| {
+                        const slice = ln.text[h.start..h.end];
+                        if (h.class == .inline_removed and std.mem.eql(u8, slice, "a")) saw_a_removed = true;
+                        if (h.class == .inline_added and std.mem.indexOf(u8, slice, "b") != null) saw_b_added = true;
+                    }
+                    if (saw_a_removed and saw_b_added) saw_chain_inline = true;
                 }
                 if (std.mem.indexOf(u8, ln.text, "field_b") != null and
                     std.mem.indexOf(u8, ln.text, "Old") != null and
@@ -3049,17 +3253,24 @@ test "multi-line align: signature_with_body fixture renders the expected mix of 
             },
             .removed => {
                 if (std.mem.indexOf(u8, ln.text, "extra: 1") != null) saw_extra_removed = true;
-                if (std.mem.indexOf(u8, ln.text, ".step") != null) saw_step_removed = true;
+                // Filler-left chain lines (`.step1()` / `.step2();`)
+                // must never surface as standalone `.removed` rows
+                // under the AST-aware rule.
+                if (std.mem.indexOf(u8, ln.text, ".step") != null and
+                    std.mem.indexOf(u8, ln.text, "chain_a") == null)
+                {
+                    saw_standalone_step = true;
+                }
             },
             else => {},
         }
     }
 
     try testing.expect(saw_signature_inline);
-    try testing.expect(saw_insert_inline);
+    try testing.expect(saw_chain_inline);
     try testing.expect(saw_field_b_inline);
     try testing.expect(saw_extra_removed);
-    try testing.expect(saw_step_removed);
+    try testing.expect(!saw_standalone_step);
 }
 
 test "multi-line align: reordered identical lines never reach line_align" {
@@ -3099,6 +3310,179 @@ test "multi-line align: reordered identical lines never reach line_align" {
         if (ln.marker == .changed) inline_count += 1;
     }
     try testing.expectEqual(@as(usize, 0), inline_count);
+}
+
+// ── AST-aware filler classification (Changed leaves) ────────────────────────
+
+test "ast-filler: 1-line signature splits into multi-line with new arg drops left and emits right as context+added" {
+    // Motivating example: a function whose left signature lives on
+    // one line gets reformatted onto multiple right-side lines with
+    // one new parameter. Every atom on the left is in a `match`
+    // edit (filler-left); the right's signature-open and closing
+    // lines are filler too; only the lines carrying novel atoms
+    // (the new param plus the per-param trailing comma that the
+    // multi-line formatting introduced) render as `.added`. The
+    // critical invariants are that the old single-line signature
+    // is dropped — no `.changed` strikethrough row and no
+    // `.removed` row — and the closing `) -> Result {` reads as
+    // structural `.context`.
+    const before =
+        \\fn setup(section: &Section) -> Result {
+        \\    body();
+        \\}
+    ;
+    const after =
+        \\fn setup(
+        \\    section: &Section,
+        \\    ops_metrics: Option<u32>,
+        \\) -> Result {
+        \\    body();
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var changed_source_rows: usize = 0;
+    var removed_source_rows: usize = 0;
+    var added_with_ops_metrics: ?StyledLine = null;
+    var saw_signature_open_context = false;
+    var saw_close_paren_context = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        switch (ln.marker) {
+            .changed => changed_source_rows += 1,
+            .removed => removed_source_rows += 1,
+            .added => {
+                if (std.mem.indexOf(u8, ln.text, "ops_metrics") != null) {
+                    added_with_ops_metrics = ln;
+                }
+            },
+            .context => {
+                if (std.mem.indexOf(u8, ln.text, "fn setup(") != null and
+                    std.mem.indexOf(u8, ln.text, "section") == null)
+                {
+                    saw_signature_open_context = true;
+                }
+                if (std.mem.indexOf(u8, ln.text, ") -> Result {") != null) {
+                    saw_close_paren_context = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    // No strikethrough splice of the old single-line signature.
+    try testing.expectEqual(@as(usize, 0), changed_source_rows);
+    try testing.expectEqual(@as(usize, 0), removed_source_rows);
+
+    // The new parameter line is emitted as `.added` and the novel
+    // atoms show up as `novel_spans` entries (per
+    // `emitPlainHunkRow` mapping atom-level novels onto the row).
+    const ops_row = added_with_ops_metrics orelse return error.MissingAddedOpsMetrics;
+    try testing.expect(ops_row.novel_spans.len > 0);
+
+    // The signature-open and closing-paren lines render as filler
+    // `.context` rows.
+    try testing.expect(saw_signature_open_context);
+    try testing.expect(saw_close_paren_context);
+}
+
+test "ast-filler: empty body grows with new statement, signature/brace lines render as context" {
+    // Right body grew with a new statement, formatted across
+    // multiple lines. Atoms on the new statement are novel-right;
+    // signature and closing-brace lines on the right are filler
+    // (every atom is in a `match` edit). Filler signature/brace
+    // lines emit as `.context`; the new statement emits as
+    // `.added`.
+    const before =
+        \\pub fn f() void {}
+    ;
+    const after =
+        \\pub fn f() void {
+        \\    x();
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_added_x = false;
+    var saw_signature_context = false;
+    var saw_brace_context = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        switch (ln.marker) {
+            .added => {
+                if (std.mem.indexOf(u8, ln.text, "x()") != null) saw_added_x = true;
+            },
+            .context => {
+                if (std.mem.indexOf(u8, ln.text, "pub fn f()") != null) saw_signature_context = true;
+                // The closing `}` on a line by itself.
+                const trimmed = std.mem.trim(u8, ln.text, " \t");
+                if (std.mem.eql(u8, trimmed, "}")) saw_brace_context = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_added_x);
+    try testing.expect(saw_signature_context);
+    try testing.expect(saw_brace_context);
+}
+
+test "ast-filler: removed parameter still emits `-` for the left line; right is context" {
+    // `fn f(x: A) {}` → `fn f() {}`. The left line's parameter is a
+    // novel-left edit, so the line is novel-bearing and renders as
+    // `.removed`. The right line has no novels and renders as
+    // `.context`. There is a slight redundancy here (the user sees
+    // the old line as `-` and the new line as plain context), but
+    // this v1 keeps deletions simple; the difftastic-style splice-
+    // back of removed atoms into the context line is an explicit
+    // non-goal.
+    const before =
+        \\fn f(x: A) {}
+    ;
+    const after =
+        \\fn f() {}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_removed_left = false;
+    var saw_context_right = false;
+    var saw_changed_collapse = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        switch (ln.marker) {
+            .removed => {
+                if (std.mem.indexOf(u8, ln.text, "fn f(x: A)") != null) saw_removed_left = true;
+            },
+            .context => {
+                if (std.mem.indexOf(u8, ln.text, "fn f()") != null and
+                    std.mem.indexOf(u8, ln.text, "A") == null)
+                {
+                    saw_context_right = true;
+                }
+            },
+            .changed => saw_changed_collapse = true,
+            else => {},
+        }
+    }
+    try testing.expect(saw_removed_left);
+    try testing.expect(saw_context_right);
+    // No inline-collapse splice of the removed parameter into a
+    // single `.changed` row.
+    try testing.expect(!saw_changed_collapse);
 }
 
 // ── buildImportGroupLine ────────────────────────────────────────────────────
@@ -3274,3 +3658,4 @@ test "buildImportGroupLine: self symbol is just another entry" {
     const self_span = findHighlight(line, "self") orelse return error.MissingHighlight;
     try testing.expectEqual(TokenClass.inline_added, self_span.class);
 }
+

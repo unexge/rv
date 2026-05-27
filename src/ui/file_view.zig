@@ -217,12 +217,14 @@ fn projectEntries(
         const rr = rightRangeOf(entry, file_diff, cursors.right_byte);
 
         // Pre-decl gap: from current cursor up to the start of the line
-        // that contains the decl. The bytes between the line start and
-        // `r.start` (i.e. the decl's leading indentation) are dropped:
-        // SST byte ranges for nested decls start at the keyword, so
-        // emitting them as part of the gap produces a phantom partial-line
-        // row with the wrong line number on top of an `.added` /
-        // `.removed` marker for the indent of an added/removed child.
+        // that contains the decl. SST byte ranges for nested decls start
+        // at the keyword, so emitting the bytes between the line start
+        // and `r.start` as part of the gap would produce a phantom
+        // partial-line row with the wrong line number on top of an
+        // `.added` / `.removed` marker for the indent of an added/removed
+        // child. Those leading-indent bytes belong to the decl slice
+        // instead - `projectAdded` / `projectRemoved` / `projectUnchanged`
+        // extend their slice back to `lineStart(r.start)` to pick them up.
         // `@max` is defensive against moves that would otherwise produce
         // a negative range (the surrounding whitespace just gets dropped
         // in that case; v1 doesn't try to cleverly recover).
@@ -374,13 +376,14 @@ fn projectUnchanged(
 
     const annotation = try formatDeclAnnotation(arena, u.decl, u.moved);
     const lr = u.decl.list.byte_range;
+    const slice_start = line_mod.lineStart(file_diff.left_source, lr.start);
     try emitSourceLines(
         arena,
         out,
         file_diff,
         indent,
-        file_diff.left_source[lr.start..lr.end],
-        lr.start,
+        file_diff.left_source[slice_start..lr.end],
+        slice_start,
         u.decl.list,
         .unchanged,
         id,
@@ -416,13 +419,14 @@ fn projectAdded(
 
     const annotation = try formatDeclAnnotation(arena, a.decl, null);
     const rr = a.decl.list.byte_range;
+    const slice_start = line_mod.lineStart(file_diff.right_source, rr.start);
     try emitSourceLines(
         arena,
         out,
         file_diff,
         indent,
-        file_diff.right_source[rr.start..rr.end],
-        rr.start,
+        file_diff.right_source[slice_start..rr.end],
+        slice_start,
         a.decl.list,
         .added,
         id,
@@ -458,13 +462,14 @@ fn projectRemoved(
 
     const annotation = try formatDeclAnnotation(arena, r.decl, null);
     const lr = r.decl.list.byte_range;
+    const slice_start = line_mod.lineStart(file_diff.left_source, lr.start);
     try emitSourceLines(
         arena,
         out,
         file_diff,
         indent,
-        file_diff.left_source[lr.start..lr.end],
-        lr.start,
+        file_diff.left_source[slice_start..lr.end],
+        slice_start,
         r.decl.list,
         .removed,
         id,
@@ -813,7 +818,7 @@ fn emitGap(
     const left_slice = file_diff.left_source[left_start..left_end];
     const right_slice = file_diff.right_source[right_start..right_end];
     const hunks = try hunk_mod.hunk(arena, left_slice, right_slice);
-    const steps = try line_mod.alignHunks(arena, hunks, indent);
+    const steps = try line_mod.alignHunks(arena, hunks, indent, null);
     for (steps) |step| switch (step) {
         .common => |h| {
             const expanded = try line_mod.expandTabs(arena, h.text);
@@ -866,6 +871,9 @@ fn emitGap(
             cursors.right_line += 1;
             try out.append(arena, styled);
         },
+        // Only produced by `alignHunks` when novels are supplied; the
+        // gap path passes `null`, so the variant never appears here.
+        .right_context => unreachable,
     };
 }
 
@@ -1514,6 +1522,52 @@ test "build: nested container decl emits correct per-side line numbers" {
     }
     try testing.expect(saw_one);
     try testing.expect(saw_two);
+}
+
+test "build: nested decl's first source line preserves source-column indent" {
+    // Regression: tree-sitter's `byte_range.start` for a nested decl
+    // points at the first non-whitespace token (e.g. `async` / `fn`),
+    // so slicing `source[rr.start..rr.end]` drops the leading indent on
+    // the first physical line. The pre-decl gap deliberately stops at
+    // `lineStart(decl.start)`, leaving those indent bytes in no-man's-
+    // land. The fix is to extend the decl slice back to `lineStart`,
+    // mirroring what `sourceLinesSlice` does on the leaf-body path.
+    const before =
+        \\mod tests {
+        \\    fn existing() {}
+        \\}
+    ;
+    const after =
+        \\mod tests {
+        \\    fn existing() {}
+        \\
+        \\    #[tokio::test]
+        \\    async fn snapshot_empty_queue() {
+        \\        let tmp = 0;
+        \\    }
+        \\}
+    ;
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_async_fn = false;
+    var saw_existing = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (std.mem.indexOf(u8, ln.text, "async fn snapshot_empty_queue") != null) {
+            try testing.expect(std.mem.startsWith(u8, ln.text, "    "));
+            saw_async_fn = true;
+        }
+        if (std.mem.indexOf(u8, ln.text, "fn existing") != null) {
+            try testing.expect(std.mem.startsWith(u8, ln.text, "    "));
+            saw_existing = true;
+        }
+    }
+    try testing.expect(saw_async_fn);
+    try testing.expect(saw_existing);
 }
 
 // ── inline decl annotation ────────────────────────────────────────────

@@ -737,8 +737,14 @@ fn appendAlignedRunSteps(
         // The op itself consumes the run line(s) at `limit_pos`
         // (and, for a pair, the smaller of the two paired indices,
         // which `flushFillerRights` already iterated past as a
-        // novel-bearing no-op).
-        cursor = limit_pos + 1;
+        // novel-bearing no-op). `@max` prevents cursor from moving
+        // backwards: a `pair` op advances cursor past its right-side
+        // run idx; a subsequent `left_only` op has a smaller
+        // `limit_pos` (lefts always precede rights in run order, see
+        // `hunk.zig`), and resetting cursor to that smaller value
+        // would replay any filler-right between them on the next
+        // flush.
+        cursor = @max(cursor, limit_pos + 1);
         switch (op) {
             .pair => |p| {
                 const left_h = run[left_hunk_idx.items[p.left_idx]];
@@ -3062,7 +3068,7 @@ test "multi-line align: pair-able lines buried inside a run with unpaired neighb
 
     var saw_signature_inline = false;
     var saw_chain_inline = false;
-    var saw_step_anywhere = false;
+    var saw_standalone_step = false;
     for (result.view.unified) |ln| {
         if (ln.kind != .source) continue;
         if (ln.marker == .changed and std.mem.indexOf(u8, ln.text, "fn make") != null) {
@@ -3085,14 +3091,21 @@ test "multi-line align: pair-able lines buried inside a run with unpaired neighb
             }
             if (saw_a_removed and saw_b_added) saw_chain_inline = true;
         }
-        if (std.mem.indexOf(u8, ln.text, ".step") != null) saw_step_anywhere = true;
+        // Filler-left `.step1()` / `.step2()` / `.step3();` rows
+        // (every atom is in a `match` edit) must not surface as
+        // standalone `.removed` rows. The inlined chain `.changed`
+        // row also contains `.step`, so gate on marker + the
+        // absence of `chain_` to exclude that row from the check.
+        if (ln.marker == .removed and
+            std.mem.indexOf(u8, ln.text, ".step") != null and
+            std.mem.indexOf(u8, ln.text, "chain_") == null)
+        {
+            saw_standalone_step = true;
+        }
     }
     try testing.expect(saw_signature_inline);
     try testing.expect(saw_chain_inline);
-    // The standalone `.step` left lines are filler under the new
-    // rule and must not surface as `.removed` (or any other) rows;
-    // they only appear inlined inside the chain `.changed` row.
-    try testing.expect(!saw_step_anywhere or saw_chain_inline);
+    try testing.expect(!saw_standalone_step);
 }
 
 test "multi-line align split: collapsed inline rows mirror on both panes" {
@@ -3483,6 +3496,52 @@ test "ast-filler: removed parameter still emits `-` for the left line; right is 
     // No inline-collapse splice of the removed parameter into a
     // single `.changed` row.
     try testing.expect(!saw_changed_collapse);
+}
+
+test "ast-filler: cursor never replays filler-rights when left_only follows a pair" {
+    // Regression for a cursor-backtrack bug in
+    // `appendAlignedRunSteps`. Run shape: [L0, L1, R-filler,
+    // R-paired]. L0 pairs with R-paired by similarity; L1 has no
+    // pair; R-filler has only matched atoms. The pair op's flush
+    // emits R-filler at run idx 2; the next op is `left_only(L1)`
+    // whose `limit_pos` is the L1 run idx, smaller than the cursor
+    // we just advanced past R-paired. Without
+    // `cursor = @max(cursor, limit_pos + 1)` the cursor rewinds
+    // and the trailing flush re-emits the same filler-right.
+    //
+    // Drives `alignHunks` with synthetic `HunkLine`s and `LeafNovels`
+    // because constructing a real source fixture that produces this
+    // exact run order + filler classification is fragile (the run
+    // shape depends on tree-sitter's atom matching).
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const hunks = [_]hunk_mod.HunkLine{
+        .{ .side = .left, .text = "foo_old", .offset = 0 },
+        .{ .side = .left, .text = "baz qux", .offset = 8 },
+        .{ .side = .right, .text = "filler!", .offset = 0 },
+        .{ .side = .right, .text = "foo_new", .offset = 8 },
+    };
+    const left_novels = [_]ByteSpan{
+        .{ .start = 0, .end = 7 },
+        .{ .start = 8, .end = 15 },
+    };
+    const right_novels = [_]ByteSpan{
+        .{ .start = 8, .end = 15 },
+    };
+    const novels: LeafNovels = .{
+        .left_abs_start = 0,
+        .right_abs_start = 0,
+        .left = &left_novels,
+        .right = &right_novels,
+    };
+    const steps = try alignHunks(arena, &hunks, 0, novels);
+    var rc_count: usize = 0;
+    for (steps) |s| if (s == .right_context) {
+        rc_count += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), rc_count);
 }
 
 // ── buildImportGroupLine ────────────────────────────────────────────────────

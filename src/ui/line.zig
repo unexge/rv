@@ -690,8 +690,16 @@ fn emitPlainHunkRow(
 
 /// Attempt to splice `left_text` and `right_text` (raw, pre-tab-expansion
 /// line bytes) into a single `.changed` source line. Returns the line on
-/// success or `null` when the byte-level LCS shares < 50% of the shorter
-/// side - in that case the caller falls back to emitting two rows.
+/// success or `null` when:
+///
+///   - the byte-level LCS shares < 50% of the shorter side, or
+///   - the LCS produces more than `max_alternation_runs` non-common runs.
+///
+/// In either case the caller falls back to emitting two rows. The
+/// alternation cap catches pathological pairs whose surrounding bytes
+/// score above 50% similarity but whose differing region scrambles
+/// into incomprehensible text once spliced (e.g. two unrelated
+/// identifiers nestled inside a long shared prefix and suffix).
 ///
 /// The output's `text` is built byte-by-byte with tabs expanded inline
 /// so highlight offsets land on display columns directly, avoiding a
@@ -710,9 +718,12 @@ fn tryBuildInlineCollapsedLine(
 
     const runs = try word_lcs.diff(arena, left_text, right_text);
     var shared: usize = 0;
-    for (runs) |r| if (r.side == .common) {
-        shared += r.bytes.len;
+    var alternations: usize = 0;
+    for (runs) |r| switch (r.side) {
+        .common => shared += r.bytes.len,
+        .removed, .added => alternations += 1,
     };
+    if (alternations > max_alternation_runs) return null;
     if (shared * 2 < min_len) return null;
 
     var buf: std.ArrayList(u8) = .empty;
@@ -1106,6 +1117,15 @@ fn rawToDisplay(raw_line: []const u8, raw_offset: usize) usize {
 }
 
 const tab_width: usize = 4;
+
+/// Reject inline collapse when the word-LCS produces more than this
+/// many non-common (removed + added) runs. A clean rename is 2 runs;
+/// a two-spot edit is 4. Above the cap, the byte-level LCS is
+/// finding spurious single-byte matches inside otherwise unrelated
+/// regions and the spliced output reads as scrambled text - better
+/// to fall back to plain `-` / `+` rows. Same cap lives in
+/// `line_align.zig::similarity` so both pair predicates agree.
+const max_alternation_runs: usize = 4;
 
 pub fn expandTabs(arena: std.mem.Allocator, line: []const u8) ![]const u8 {
     const tab_count = std.mem.count(u8, line, "\t");
@@ -2447,6 +2467,113 @@ test "inline collapse: imports splice removed names inline (no `removed:` suffix
     try testing.expectEqual(TokenClass.inline_removed, old_span.class);
     const new_span = findHighlightOnLine(row, "New") orelse return error.MissingNewSpan;
     try testing.expectEqual(TokenClass.inline_added, new_span.class);
+}
+
+test "inline collapse: alternation cap rejects pathological identifier swap" {
+    // Repro from the bug report: `BaseProducerDocument` vs
+    // `MetricDocument` are different identifiers but share spurious
+    // single-byte matches (`e`, `r`, `c`) inside, plus a long common
+    // prefix `    let _: &` and suffix `Document = todo!();`. The
+    // byte-level similarity hits ~92% (well above 50%) but the LCS
+    // produces 6 non-common runs - splicing them inline scrambles
+    // the identifiers. The alternation cap (> 4 → reject) must
+    // suppress the collapse and fall back to plain `-` / `+` rows.
+    const before =
+        \\fn outer() {
+        \\    let _: &BaseProducerDocument = todo!();
+        \\}
+    ;
+    const after =
+        \\fn outer() {
+        \\    let _: &MetricDocument = todo!();
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_collapsed = false;
+    var saw_removed = false;
+    var saw_added = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker == .changed and
+            std.mem.indexOf(u8, ln.text, "BaseProducer") != null and
+            std.mem.indexOf(u8, ln.text, "Metric") != null)
+        {
+            saw_collapsed = true;
+        }
+        if (ln.marker == .removed and
+            std.mem.indexOf(u8, ln.text, "BaseProducerDocument") != null)
+        {
+            saw_removed = true;
+        }
+        if (ln.marker == .added and
+            std.mem.indexOf(u8, ln.text, "MetricDocument") != null)
+        {
+            saw_added = true;
+        }
+    }
+    try testing.expect(!saw_collapsed);
+    try testing.expect(saw_removed);
+    try testing.expect(saw_added);
+}
+
+test "inline collapse: clean rename in long line still collapses (alternation = 2)" {
+    // One identifier swap inside an otherwise-shared line: the LCS
+    // produces exactly two non-common runs (one removed, one added),
+    // well under the cap. Collapse must fire so a clean rename still
+    // renders as a single inline row.
+    const before =
+        \\fn outer() {
+        \\    let _: Foo = todo!();
+        \\}
+    ;
+    const after =
+        \\fn outer() {
+        \\    let _: Bar = todo!();
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const row = findInlineCollapsedRow(result.view.unified) orelse return error.MissingCollapsedRow;
+    try testing.expect(std.mem.indexOf(u8, row.text, "Foo") != null);
+    try testing.expect(std.mem.indexOf(u8, row.text, "Bar") != null);
+}
+
+test "inline collapse: two-spot edit still collapses (alternation = 4)" {
+    // Two disjoint substitutions on one line - `x`→`y` and
+    // `foo`→`bar` - produce four non-common runs, which sits exactly
+    // on the cap (> 4 → reject; == 4 → keep). Collapse must still
+    // fire so the whole edit reads on one row.
+    const before =
+        \\fn outer() {
+        \\    let x = foo();
+        \\}
+    ;
+    const after =
+        \\fn outer() {
+        \\    let y = bar();
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    const row = findInlineCollapsedRow(result.view.unified) orelse return error.MissingCollapsedRow;
+    try testing.expect(std.mem.indexOf(u8, row.text, "foo") != null);
+    try testing.expect(std.mem.indexOf(u8, row.text, "bar") != null);
 }
 
 // ── multi-line alignment within a run ────────────────────────────

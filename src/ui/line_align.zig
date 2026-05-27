@@ -11,8 +11,10 @@
 //! This module runs a second LCS DP over the run, this time using
 //! byte-level similarity (not byte equality) as the match relation:
 //! two raw lines `a` and `b` are considered a pair when
-//! `shared_bytes / min(|a|, |b|) >= 0.5` - the same threshold the
-//! 1:1 collapse uses.
+//! `shared_bytes / min(|a|, |b|) >= 0.5` AND the byte-level diff
+//! produces no more than `max_alternation_runs` non-common runs.
+//! Both gates are duplicated in `line.zig::tryBuildInlineCollapsedLine`
+//! so the two pair predicates agree on what collapses.
 //!
 //! Output is an alignment script: a sequence of `.pair`, `.left_only`,
 //! and `.right_only` ops in run order. The caller (`buildLeafHunk`)
@@ -52,6 +54,14 @@ pub const AlignOp = union(enum) {
 /// (i.e. similarity >= 0.5). Same value as the 1:1 collapse path so
 /// the two alignment passes agree on what constitutes a pair.
 const pair_threshold: f32 = 0.5;
+
+/// Reject pairs whose word-LCS has more than this many non-common
+/// (removed + added) runs. A clean rename is 2 runs; a two-spot edit
+/// is 4. Above the cap, the byte LCS is finding spurious single-byte
+/// matches inside otherwise unrelated regions and the resulting splice
+/// scrambles the text. Same value as `line.zig::max_alternation_runs`
+/// so both pair predicates agree.
+const max_alternation_runs: usize = 4;
 
 /// Produce an alignment script for a `.left` / `.right` run.
 ///
@@ -148,16 +158,21 @@ pub fn alignLines(
 
 /// Byte-level similarity in `[0, 1]`: shared bytes (per `word_lcs.diff`)
 /// divided by the shorter input's length. Defined as 0 when either side
-/// is empty so empty/non-empty pairs never cross the threshold.
+/// is empty so empty/non-empty pairs never cross the threshold. Also
+/// returns 0 when the diff produces more than `max_alternation_runs`
+/// non-common runs; see the module doc for why.
 fn similarity(arena: Allocator, a: []const u8, b: []const u8) !f32 {
     const min_len = @min(a.len, b.len);
     if (min_len == 0) return 0.0;
 
     const runs = try word_lcs.diff(arena, a, b);
     var shared: usize = 0;
-    for (runs) |r| if (r.side == .common) {
-        shared += r.bytes.len;
+    var alternations: usize = 0;
+    for (runs) |r| switch (r.side) {
+        .common => shared += r.bytes.len,
+        .removed, .added => alternations += 1,
     };
+    if (alternations > max_alternation_runs) return 0.0;
     return @as(f32, @floatFromInt(shared)) / @as(f32, @floatFromInt(min_len));
 }
 

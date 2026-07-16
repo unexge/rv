@@ -28,6 +28,12 @@ const cost_descend_both: u64 = 1;
 const cost_descend_single: u64 = 2;
 const cost_pop: u64 = 0;
 
+/// Larger leaf products fall back to a whole-subtree replacement. The UI still
+/// performs a line diff, while the graph search remains bounded for large
+/// generated functions and minified input.
+const max_search_node_product: u64 = 65_536;
+const max_search_states: usize = 10_000;
+
 /// Produce the lowest-cost `EditScript` transforming `left` into `right`.
 ///
 /// Relies on `hash` having been filled on all nodes (see `sst/hash.zig`);
@@ -47,20 +53,33 @@ pub fn diffNodes(
         return .{ .edits = edits, .total_cost = 0 };
     }
 
+    const left_size = sizeOfNode(left.*);
+    const right_size = sizeOfNode(right.*);
+    if (left_size *| right_size > max_search_node_product) {
+        return replaceWholeSubtrees(arena, left, right, left_size, right_size);
+    }
+
+    // Search records, stack frames, and queue storage are transient. Keeping
+    // them outside the FileDiff arena prevents every discarded path from
+    // living for the lifetime of the rendered file.
+    var scratch_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
     // Wrap each root in a virtual outer List so every cursor is always
     // positioned inside *some* List. The virtual list's `children` slice
     // aliases the caller's node memory (via pointer cast), so node
     // references emitted as edits remain pointer-equal to the inputs.
-    const virt_l = try wrapRoot(arena, left);
-    const virt_r = try wrapRoot(arena, right);
+    const virt_l = try wrapRoot(scratch, left);
+    const virt_r = try wrapRoot(scratch, right);
 
     var visited: std.AutoHashMapUnmanaged(StateKey, void) = .empty;
-    defer visited.deinit(arena);
+    defer visited.deinit(scratch);
 
     var pq: PQ = .empty;
-    defer pq.deinit(arena);
+    defer pq.deinit(scratch);
 
-    const start = try arena.create(Record);
+    const start = try scratch.create(Record);
     start.* = .{
         .cost = 0,
         .prev = null,
@@ -72,19 +91,22 @@ pub fn diffNodes(
             .stack_right = null,
         },
     };
-    try pq.push(arena, .{ .cost = 0, .record = start });
+    try pq.push(scratch, .{ .cost = 0, .record = start });
 
     var goal: ?*const Record = null;
     while (pq.pop()) |item| {
         const rec = item.record;
         const key = keyOf(rec.state);
-        const gop = try visited.getOrPut(arena, key);
+        const gop = try visited.getOrPut(scratch, key);
         if (gop.found_existing) continue;
+        if (visited.count() >= max_search_states) {
+            return replaceWholeSubtrees(arena, left, right, left_size, right_size);
+        }
         if (isGoal(rec.state)) {
             goal = rec;
             break;
         }
-        try expand(arena, &pq, rec);
+        try expand(scratch, &pq, rec);
     }
 
     // Goal is always reachable: all-novel is a finite-cost fallback path.
@@ -101,6 +123,22 @@ pub fn diffNodes(
 
     const edits = try edits_list.toOwnedSlice(arena);
     return .{ .edits = edits, .total_cost = g.cost };
+}
+
+fn replaceWholeSubtrees(
+    arena: std.mem.Allocator,
+    left: *const node.Node,
+    right: *const node.Node,
+    left_size: u64,
+    right_size: u64,
+) DiffError!edit.EditScript {
+    const edits = try arena.alloc(edit.Edit, 2);
+    edits[0] = .{ .novel = .{ .side = .left, .node_ref = left } };
+    edits[1] = .{ .novel = .{ .side = .right, .node_ref = right } };
+    return .{
+        .edits = edits,
+        .total_cost = left_size +| 1 +| right_size +| 1,
+    };
 }
 
 // ── internals ──────────────────────────────────────────────────────────────
@@ -451,6 +489,28 @@ fn countNovelBySide(script: edit.EditScript, side: edit.Side) usize {
 }
 
 // ── Unit tests ─────────────────────────────────────────────────────────────
+
+test "diffNodes: large search space falls back to bounded subtree replacement" {
+    var input_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer input_arena.deinit();
+    const ia = input_arena.allocator();
+
+    const left_children = try ia.alloc(node.Node, 256);
+    const right_children = try ia.alloc(node.Node, 256);
+    for (0..256) |i| {
+        left_children[i] = atomN(.code, if (i % 2 == 0) "left" else "item");
+        right_children[i] = atomN(.code, if (i % 2 == 0) "right" else "item");
+    }
+    const lt = try hashed(ia, try listN(ia, "root", "", "", left_children));
+    const rt = try hashed(ia, try listN(ia, "root", "", "", right_children));
+
+    var output_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer output_arena.deinit();
+    const script = try diffNodes(output_arena.allocator(), &lt.root, &rt.root);
+    try testing.expectEqual(@as(usize, 2), script.edits.len);
+    try testing.expectEqual(@as(usize, 1), countNovelBySide(script, .left));
+    try testing.expectEqual(@as(usize, 1), countNovelBySide(script, .right));
+}
 
 test "diffNodes: identical atoms yield single match, zero cost" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);

@@ -552,7 +552,7 @@ fn dumpSst(n: node.Node, depth: usize) void {
         }),
         .list => |l| {
             std.debug.print("list[{s}] open={s} close={s} lt={d} tt={d}\n", .{
-                l.ts_kind, l.open_delim, l.close_delim,
+                l.ts_kind,            l.open_delim,          l.close_delim,
                 l.leading_trivia.len, l.trailing_trivia.len,
             });
             for (l.leading_trivia) |t| {

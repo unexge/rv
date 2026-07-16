@@ -143,8 +143,7 @@ pub fn alignDecls(
             } else {
                 const body: result.DeclBody = blk: {
                     if (containerListOf(cfg, ld.list)) |ld_inner| {
-                        const rd_inner = containerListOf(cfg, rd.list) orelse break :blk
-                            try leafDiff(arena, ld, rd);
+                        const rd_inner = containerListOf(cfg, rd.list) orelse break :blk try leafDiff(arena, ld, rd);
                         break :blk .{ .container = try alignDecls(
                             arena,
                             cfg,
@@ -232,7 +231,10 @@ fn extractDecls(
                     null;
                 const identity_name: ?[]const u8 = ig_key orelse display_name;
                 const is_ig_identity = ig_key != null;
-                const decl_kind = cfg.classify(l.ts_kind);
+                const decl_kind = if (cfg.classify_decl) |classify_decl|
+                    classify_decl(list_ptr)
+                else
+                    cfg.classify(l.ts_kind);
 
                 // Compute nth_occurrence of (ts_kind, identity_name,
                 // import_group) among already-extracted decls on this
@@ -742,10 +744,10 @@ test "align: duplicate identity keys — two `impl Foo` blocks each side pair by
     const arena = arena_state.allocator();
 
     // Different body so each impl has a distinct hash, forcing Pass 2.
-    const impl_l1 = try declN(arena, "impl", "Foo", &.{ try declN(arena, "fn", "a", &.{atomN(.code, "1")}) });
-    const impl_l2 = try declN(arena, "impl", "Foo", &.{ try declN(arena, "fn", "b", &.{atomN(.code, "2")}) });
-    const impl_r1 = try declN(arena, "impl", "Foo", &.{ try declN(arena, "fn", "a", &.{atomN(.code, "9")}) });
-    const impl_r2 = try declN(arena, "impl", "Foo", &.{ try declN(arena, "fn", "b", &.{atomN(.code, "8")}) });
+    const impl_l1 = try declN(arena, "impl", "Foo", &.{try declN(arena, "fn", "a", &.{atomN(.code, "1")})});
+    const impl_l2 = try declN(arena, "impl", "Foo", &.{try declN(arena, "fn", "b", &.{atomN(.code, "2")})});
+    const impl_r1 = try declN(arena, "impl", "Foo", &.{try declN(arena, "fn", "a", &.{atomN(.code, "9")})});
+    const impl_r2 = try declN(arena, "impl", "Foo", &.{try declN(arena, "fn", "b", &.{atomN(.code, "8")})});
 
     const l = try listN(arena, "source_file", &.{ impl_l1, impl_l2 });
     const r = try listN(arena, "source_file", &.{ impl_r1, impl_r2 });

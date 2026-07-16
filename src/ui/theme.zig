@@ -164,86 +164,88 @@ fn contains(haystack: []const []const u8, needle: []const u8) bool {
 
 // Zig keywords (ziglang.org/documentation/master/#Keyword-Reference).
 const zig_keywords = [_][]const u8{
-    "align",     "allowzero", "and",      "anyframe", "anytype",     "asm",
-    "async",     "await",     "break",    "callconv", "catch",       "comptime",
-    "const",     "continue",  "defer",    "else",     "enum",        "errdefer",
-    "error",     "export",    "extern",   "fn",       "for",         "if",
-    "inline",    "linksection", "noalias","noinline", "nosuspend",   "opaque",
-    "or",        "orelse",    "packed",   "pub",      "resume",      "return",
-    "struct",    "suspend",   "switch",   "test",     "threadlocal", "try",
-    "union",     "unreachable", "usingnamespace",      "var",        "volatile",
-    "while",     "true",      "false",    "null",     "undefined",
+    "align",  "allowzero",   "and",            "anyframe",  "anytype",     "asm",
+    "async",  "await",       "break",          "callconv",  "catch",       "comptime",
+    "const",  "continue",    "defer",          "else",      "enum",        "errdefer",
+    "error",  "export",      "extern",         "fn",        "for",         "if",
+    "inline", "linksection", "noalias",        "noinline",  "nosuspend",   "opaque",
+    "or",     "orelse",      "packed",         "pub",       "resume",      "return",
+    "struct", "suspend",     "switch",         "test",      "threadlocal", "try",
+    "union",  "unreachable", "usingnamespace", "var",       "volatile",    "while",
+    "true",   "false",       "null",           "undefined",
 };
 const zig_primitives = [_][]const u8{
-    "void",  "bool",   "noreturn", "type",     "anyerror", "anyopaque",
-    "u8",    "u16",    "u32",      "u64",      "u128",     "usize",
-    "i8",    "i16",    "i32",      "i64",      "i128",     "isize",
-    "f16",   "f32",    "f64",      "f80",      "f128",     "c_char",
-    "c_int", "c_uint", "c_long",   "c_ulong",  "c_short",  "c_ushort",
-    "c_longlong", "c_ulonglong", "c_longdouble",
-    "comptime_int", "comptime_float",
+    "void",       "bool",        "noreturn",     "type",         "anyerror",       "anyopaque",
+    "u8",         "u16",         "u32",          "u64",          "u128",           "usize",
+    "i8",         "i16",         "i32",          "i64",          "i128",           "isize",
+    "f16",        "f32",         "f64",          "f80",          "f128",           "c_char",
+    "c_int",      "c_uint",      "c_long",       "c_ulong",      "c_short",        "c_ushort",
+    "c_longlong", "c_ulonglong", "c_longdouble", "comptime_int", "comptime_float",
 };
 
 const rust_keywords = [_][]const u8{
-    "as",     "async", "await",  "break",    "const", "continue", "crate",
-    "dyn",    "else",  "enum",   "extern",   "false", "fn",       "for",
-    "if",     "impl",  "in",     "let",      "loop",  "match",    "mod",
-    "move",   "mut",   "pub",    "ref",      "return","self",     "Self",
-    "static", "struct","super",  "trait",    "true",  "type",     "unsafe",
-    "use",    "where", "while",  "yield",    "macro_rules",
+    "as",     "async",  "await", "break",  "const",       "continue", "crate",
+    "dyn",    "else",   "enum",  "extern", "false",       "fn",       "for",
+    "if",     "impl",   "in",    "let",    "loop",        "match",    "mod",
+    "move",   "mut",    "pub",   "ref",    "return",      "self",     "Self",
+    "static", "struct", "super", "trait",  "true",        "type",     "unsafe",
+    "use",    "where",  "while", "yield",  "macro_rules",
 };
 const rust_primitives = [_][]const u8{
-    "bool", "char", "str",   "u8",  "u16", "u32", "u64", "u128", "usize",
-    "i8",   "i16",  "i32",   "i64", "i128", "isize", "f32", "f64", "()",
+    "bool", "char", "str", "u8",  "u16",  "u32",   "u64", "u128", "usize",
+    "i8",   "i16",  "i32", "i64", "i128", "isize", "f32", "f64",  "()",
 };
 
 const go_keywords = [_][]const u8{
-    "break",    "case",     "chan",     "const",    "continue",
-    "default",  "defer",    "else",     "fallthrough", "for",
-    "func",     "go",       "goto",     "if",       "import",
-    "interface","map",      "package",  "range",    "return",
-    "select",   "struct",   "switch",   "type",     "var",
-    "true",     "false",    "nil",      "iota",
+    "break",     "case",   "chan",    "const",       "continue",
+    "default",   "defer",  "else",    "fallthrough", "for",
+    "func",      "go",     "goto",    "if",          "import",
+    "interface", "map",    "package", "range",       "return",
+    "select",    "struct", "switch",  "type",        "var",
+    "true",      "false",  "nil",     "iota",
 };
 const go_primitives = [_][]const u8{
-    "bool",    "byte",    "rune",     "string",
-    "int",     "int8",    "int16",    "int32",   "int64",
-    "uint",    "uint8",   "uint16",   "uint32",  "uint64", "uintptr",
-    "float32", "float64", "complex64","complex128", "error", "any",
+    "bool",    "byte",      "rune",       "string",
+    "int",     "int8",      "int16",      "int32",
+    "int64",   "uint",      "uint8",      "uint16",
+    "uint32",  "uint64",    "uintptr",    "float32",
+    "float64", "complex64", "complex128", "error",
+    "any",
 };
 
 const python_keywords = [_][]const u8{
-    "False",   "None",    "True",    "and",    "as",     "assert",
-    "async",   "await",   "break",   "class",  "continue","def",
-    "del",     "elif",    "else",    "except", "finally","for",
-    "from",    "global",  "if",      "import", "in",     "is",
-    "lambda",  "nonlocal","not",     "or",     "pass",   "raise",
-    "return",  "try",     "while",   "with",   "yield",  "match",
-    "case",    "self",    "cls",
+    "False",  "None",     "True",  "and",    "as",       "assert",
+    "async",  "await",    "break", "class",  "continue", "def",
+    "del",    "elif",     "else",  "except", "finally",  "for",
+    "from",   "global",   "if",    "import", "in",       "is",
+    "lambda", "nonlocal", "not",   "or",     "pass",     "raise",
+    "return", "try",      "while", "with",   "yield",    "match",
+    "case",   "self",     "cls",
 };
 const python_primitives = [_][]const u8{
-    "int", "float", "bool", "str", "bytes", "list", "tuple", "dict",
+    "int", "float",     "bool",    "str",    "bytes", "list", "tuple", "dict",
     "set", "frozenset", "complex", "object", "type",
 };
 
 const typescript_keywords = [_][]const u8{
-    "abstract", "as",       "async",    "await",    "break",
-    "case",     "catch",    "class",    "const",    "continue",
-    "debugger", "declare",  "default",  "delete",   "do",
-    "else",     "enum",     "export",   "extends",  "false",
-    "finally",  "for",      "from",     "function", "get",
-    "if",       "implements","import",  "in",       "instanceof",
-    "interface","is",       "keyof",    "let",      "namespace",
-    "new",      "null",     "of",       "package",  "private",
-    "protected","public",   "readonly", "return",   "satisfies",
-    "set",      "static",   "super",    "switch",   "this",
-    "throw",    "true",     "try",      "type",     "typeof",
-    "undefined","var",      "void",     "while",    "with",
-    "yield",    "module",   "override", "asserts",
+    "abstract",  "as",         "async",    "await",    "break",
+    "case",      "catch",      "class",    "const",    "continue",
+    "debugger",  "declare",    "default",  "delete",   "do",
+    "else",      "enum",       "export",   "extends",  "false",
+    "finally",   "for",        "from",     "function", "get",
+    "if",        "implements", "import",   "in",       "instanceof",
+    "interface", "is",         "keyof",    "let",      "namespace",
+    "new",       "null",       "of",       "package",  "private",
+    "protected", "public",     "readonly", "return",   "satisfies",
+    "set",       "static",     "super",    "switch",   "this",
+    "throw",     "true",       "try",      "type",     "typeof",
+    "undefined", "var",        "void",     "while",    "with",
+    "yield",     "module",     "override", "asserts",
 };
 const typescript_primitives = [_][]const u8{
     "any",    "unknown", "never",   "object",
-    "string", "number",  "boolean", "bigint", "symbol",
+    "string", "number",  "boolean", "bigint",
+    "symbol",
 };
 
 // ── tests ──────────────────────────────────────────────────────────────────

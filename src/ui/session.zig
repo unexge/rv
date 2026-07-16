@@ -143,7 +143,7 @@ pub const Session = struct {
 
         if (state.diff != null) return;
         switch (entry.change.kind) {
-            .binary, .unsupported => return,
+            .binary, .unsupported, .unavailable => return,
             else => {},
         }
 
@@ -193,6 +193,7 @@ pub const Session = struct {
         return switch (entry.change.kind) {
             .binary => .{ .placeholder = "Binary file, not shown" },
             .unsupported => .{ .placeholder = self.unsupportedMessage(entry.change) },
+            .unavailable => .{ .placeholder = "Git file state is not reviewable" },
             .modified, .renamed => if (state.diff) |*d|
                 .{ .diff = d }
             else
@@ -243,8 +244,7 @@ fn summarize(entries: []const rv.DeclDiff) file_list.DeclSummary {
 /// drift from the initial build.
 fn buildFnForView(view: PaneView) ?app.BuildFn {
     return switch (view) {
-        .diff => &file_view.build,
-        .summary => &line_mod.build,
+        .diff, .summary => &file_view.build,
         .placeholder => null,
     };
 }
@@ -308,7 +308,9 @@ pub fn run(
         switch (event) {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) break;
-                if (key.matches('q', .{})) break;
+                const search_editing = session.focus == .diff and
+                    session.states[session.list.cursor].app_state.search_editing;
+                if (key.matches('q', .{}) and !search_editing) break;
                 if (key.matches(vaxis.Key.tab, .{})) {
                     session.focus = switch (session.focus) {
                         .file_list => .diff,
@@ -349,9 +351,9 @@ pub fn run(
         // `built.* == null` guard) and diff-pane keys can't mutate
         // invisible cursor state behind a placeholder.
         //
-        // `.summary` reuses the decl-axis builder (with every decl
-        // pre-collapsed in `ensureLoaded`); `.diff` (modified files)
-        // uses the file-wide builder. `buildForView` picks.
+        // `.summary` and `.diff` both use the file-wide builder; added and
+        // deleted files start with declarations collapsed but retain all
+        // top-level source. `buildForView` picks.
         if (built == null) {
             built = try buildForView(
                 gpa,
@@ -400,9 +402,13 @@ fn handleDiffKey(
     built_idx: usize,
     viewport: u16,
 ) !void {
-    if (key.matches(vaxis.Key.left, .{}) or
-        key.matches('h', .{}) or
-        key.matches(vaxis.Key.escape, .{}))
+    if (built_idx >= session.states.len) return;
+    const search_editing = session.states[built_idx].app_state.search_editing;
+    const search_active = session.states[built_idx].app_state.search_query.items.len > 0;
+    if (!search_editing and
+        (key.matches(vaxis.Key.left, .{}) or
+            key.matches('h', .{}) or
+            (key.matches(vaxis.Key.escape, .{}) and !search_active)))
     {
         session.focus = .file_list;
         return;
@@ -485,7 +491,12 @@ fn draw(
         .width = layout.sidebar_w,
         .height = win.height,
     });
-    file_list.draw(sidebar, &session.list, session.focus == .file_list);
+    try file_list.draw(
+        sidebar,
+        &session.list,
+        session.focus == .file_list,
+        frame_alloc,
+    );
 
     drawSeparator(win, layout);
 
@@ -603,6 +614,10 @@ fn summaryHeader(
 
 const testing = std.testing;
 
+fn keyCp(cp: u21) vaxis.Key {
+    return .{ .codepoint = cp, .base_layout_codepoint = cp, .shifted_codepoint = cp, .text = null, .mods = .{} };
+}
+
 test "summarize: counts added / removed / changed, skips unchanged" {
     // Synthetic FileDiff built from `diffSources` on two tiny Zig
     // snippets. Exercises one entry per top-level variant.
@@ -705,6 +720,36 @@ fn emptyStubSession(gpa: Allocator, changes: []const vcs.FileChange) !Session {
     };
 }
 
+test "handleDiffKey: Escape cancels search before leaving the repo diff pane" {
+    const before = "pub fn a() u32 { return 1; }\n";
+    const after = "pub fn a() u32 { return 2; }\n";
+    const fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    const change: vcs.FileChange = .{
+        .kind = .modified,
+        .old_path = "a.zig",
+        .new_path = "a.zig",
+        .line_stat = .{ .added = 1, .removed = 1 },
+    };
+    var session = try stubSession(testing.allocator, change, fd);
+    defer freeStub(&session);
+    session.focus = .diff;
+
+    var built: ?line_mod.BuildResult = try file_view.build(
+        testing.allocator,
+        &session.states[0].diff.?,
+        .unified,
+        &session.states[0].app_state,
+    );
+    defer if (built) |*value| value.deinit();
+
+    try handleDiffKey(testing.allocator, &session, keyCp('/'), &built, 0, 30);
+    try testing.expect(session.states[0].app_state.search_editing);
+    try handleDiffKey(testing.allocator, &session, keyCp(vaxis.Key.escape), &built, 0, 30);
+
+    try testing.expectEqual(Focus.diff, session.focus);
+    try testing.expect(!session.states[0].app_state.search_editing);
+}
+
 test "ensureLoaded: idempotent when diff is already populated" {
     const src = "pub fn a() void {}\n";
     const fd = try rv.diffSources(testing.allocator, .zig, src, src);
@@ -728,7 +773,7 @@ test "ensureLoaded: idempotent when diff is already populated" {
     try testing.expect(session.states[0].new_source == null);
 }
 
-test "ensureLoaded: binary and unsupported are silent no-ops" {
+test "ensureLoaded: binary, unsupported, and unavailable are silent no-ops" {
     // No pre-populated FileDiff; ensureLoaded must not try to call git.
     var session = try emptyStubSession(testing.allocator, &.{
         .{
@@ -743,13 +788,21 @@ test "ensureLoaded: binary and unsupported are silent no-ops" {
             .new_path = "notes.xyz",
             .line_stat = .{ .added = 0, .removed = 0 },
         },
+        .{
+            .kind = .unavailable,
+            .old_path = "conflict.zig",
+            .new_path = "conflict.zig",
+            .line_stat = .{ .added = 0, .removed = 0 },
+        },
     });
     defer freeStub(&session);
 
     try session.ensureLoaded(0);
     try session.ensureLoaded(1);
+    try session.ensureLoaded(2);
     try testing.expect(session.states[0].diff == null);
     try testing.expect(session.states[1].diff == null);
+    try testing.expect(session.states[2].diff == null);
 }
 
 test "classify: modified → diff variant" {
@@ -789,8 +842,36 @@ test "classify: added → summary direction=added" {
     try testing.expectEqual(SummaryDirection.added, view.summary.direction);
 }
 
-test "classify: deleted → summary direction=removed" {
-    const src = "pub fn a() void {}\n";
+test "classify: added file view includes non-declaration source" {
+    const src = "// package note\npub fn a() void {}\n";
+    const fd = try rv.diffSources(testing.allocator, .zig, "", src);
+    const change: vcs.FileChange = .{
+        .kind = .added,
+        .old_path = null,
+        .new_path = "a.zig",
+        .line_stat = .{ .added = 2, .removed = 0 },
+    };
+    var session = try stubSession(testing.allocator, change, fd);
+    defer freeStub(&session);
+
+    const pane = session.classify(0);
+    var built = try buildFnForView(pane).?(
+        testing.allocator,
+        &session.states[0].diff.?,
+        .unified,
+        &session.states[0].app_state,
+    );
+    defer built.deinit();
+
+    var saw_note = false;
+    for (built.view.unified) |line| {
+        if (std.mem.eql(u8, line.text, "// package note")) saw_note = true;
+    }
+    try testing.expect(saw_note);
+}
+
+test "classify: deleted → summary direction=removed and includes non-declaration source" {
+    const src = "// package note\npub fn a() void {}\n";
     const fd = try rv.diffSources(testing.allocator, .zig, src, "");
 
     const change: vcs.FileChange = .{
@@ -806,6 +887,19 @@ test "classify: deleted → summary direction=removed" {
     const view = session.classify(0);
     try testing.expect(view == .summary);
     try testing.expectEqual(SummaryDirection.removed, view.summary.direction);
+
+    var built = try buildFnForView(view).?(
+        testing.allocator,
+        &session.states[0].diff.?,
+        .unified,
+        &session.states[0].app_state,
+    );
+    defer built.deinit();
+    var saw_note = false;
+    for (built.view.unified) |line| {
+        if (std.mem.eql(u8, line.text, "// package note")) saw_note = true;
+    }
+    try testing.expect(saw_note);
 }
 
 test "classify: binary → placeholder 'Binary file, not shown'" {
@@ -834,6 +928,20 @@ test "classify: unsupported → placeholder carries extension" {
     const view = session.classify(0);
     try testing.expect(view == .placeholder);
     try testing.expectEqualStrings("No language support for .xyz", view.placeholder);
+}
+
+test "classify: unavailable → reviewable-state placeholder" {
+    var session = try emptyStubSession(testing.allocator, &.{.{
+        .kind = .unavailable,
+        .old_path = "conflict.zig",
+        .new_path = "conflict.zig",
+        .line_stat = .{ .added = 0, .removed = 0 },
+    }});
+    defer freeStub(&session);
+
+    const view = session.classify(0);
+    try testing.expect(view == .placeholder);
+    try testing.expectEqualStrings("Git file state is not reviewable", view.placeholder);
 }
 
 test "paneLayout: sidebar width capped at 40 and at (width * 3) / 10" {
@@ -924,4 +1032,3 @@ test "fileHeader: modified file renders English summary, not '+N -M ~K =U'" {
     try testing.expect(std.mem.indexOfScalar(u8, header.stats, '+') == null);
     try testing.expect(std.mem.indexOfScalar(u8, header.stats, '~') == null);
 }
-

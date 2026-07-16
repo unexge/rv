@@ -72,6 +72,11 @@ const pair_threshold: f32 = 0.5;
 /// so both pair predicates agree.
 const max_alternation_runs: usize = 4;
 
+/// Above this many candidate pairs, inline alignment is skipped and the run
+/// stays as ordinary removed/added lines. This bounds the nested
+/// line-pair-by-codepoint LCS work for large rewrites.
+const max_alignment_cells: usize = 4096;
+
 /// Stats from running `word_lcs.diff` over two lines: shared bytes,
 /// the shorter input's length, and the number of non-common runs in
 /// the diff. The score may be computed over the raw bytes or over
@@ -98,14 +103,20 @@ pub const PairScore = struct {
 /// only pass thanks to the shared indent) keep collapsing. Same
 /// metric is used by `line.zig::tryBuildInlineCollapsedLine` so the
 /// align-pass and the splice-pass agree on what passes.
-pub fn scorePair(arena: Allocator, a: []const u8, b: []const u8) !PairScore {
-    const full = try scoreOnce(arena, a, b);
+pub fn scorePair(_: Allocator, a: []const u8, b: []const u8) !PairScore {
+    var scratch_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch_state.deinit();
+    return scorePairUsing(scratch_state.allocator(), a, b);
+}
+
+fn scorePairUsing(scratch: Allocator, a: []const u8, b: []const u8) !PairScore {
+    const full = try scoreOnce(scratch, a, b);
     if (full.passes()) return full;
 
     const at = trimLeadingWs(a);
     const bt = trimLeadingWs(b);
     if (at.len == a.len and bt.len == b.len) return full;
-    return scoreOnce(arena, at, bt);
+    return scoreOnce(scratch, at, bt);
 }
 
 fn scoreOnce(arena: Allocator, a: []const u8, b: []const u8) !PairScore {
@@ -156,16 +167,27 @@ pub fn alignLines(
 
     const m = lefts.len;
     const n = rights.len;
+    const cell_count = std.math.mul(usize, m, n) catch
+        return unalignedRun(arena, lefts.len, rights.len);
+    if (cell_count > max_alignment_cells) {
+        return unalignedRun(arena, lefts.len, rights.len);
+    }
 
-    // Pre-compute per-cell similarity. `sim[i*n + j]` is the similarity
-    // of `lefts[i]` and `rights[j]`; values < threshold are clamped to
-    // 0 so the DP doesn't accumulate sub-threshold pairs.
-    const sim = try arena.alloc(f32, m * n);
-    defer arena.free(sim);
+    // Pre-compute per-cell similarity. The matrix and each pair's LCS are
+    // scratch data, not part of the returned view.
+    const sim = try std.heap.page_allocator.alloc(f32, cell_count);
+    defer std.heap.page_allocator.free(sim);
+    var score_scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer score_scratch.deinit();
     for (lefts, 0..) |l, i| {
         for (rights, 0..) |r, j| {
-            const s = try similarity(arena, l, r);
+            const score = try scorePairUsing(score_scratch.allocator(), l, r);
+            const s = if (score.passes())
+                @as(f32, @floatFromInt(score.shared)) / @as(f32, @floatFromInt(score.min_len))
+            else
+                0.0;
             sim[i * n + j] = if (s >= pair_threshold) s else 0.0;
+            _ = score_scratch.reset(.retain_capacity);
         }
     }
 
@@ -175,8 +197,10 @@ pub fn alignLines(
     // count, which gives us a natural tie-break: among equal-count
     // alignments the one with stronger pair-wise matches wins.
     const stride = n + 1;
-    const dp = try arena.alloc(f32, (m + 1) * stride);
-    defer arena.free(dp);
+    const dp_len = std.math.mul(usize, m + 1, stride) catch
+        return unalignedRun(arena, lefts.len, rights.len);
+    const dp = try std.heap.page_allocator.alloc(f32, dp_len);
+    defer std.heap.page_allocator.free(dp);
     @memset(dp, 0.0);
 
     var i: usize = 1;
@@ -222,6 +246,13 @@ pub fn alignLines(
     }
     std.mem.reverse(AlignOp, out.items);
     return try out.toOwnedSlice(arena);
+}
+
+fn unalignedRun(arena: Allocator, left_len: usize, right_len: usize) ![]const AlignOp {
+    const out = try arena.alloc(AlignOp, left_len + right_len);
+    for (0..left_len) |i| out[i] = .{ .left_only = i };
+    for (0..right_len) |i| out[left_len + i] = .{ .right_only = i };
+    return out;
 }
 
 /// Byte-level similarity in `[0, 1]`: shared bytes (per
@@ -505,6 +536,22 @@ test "alignLines: prefers higher-similarity pair over weaker first match" {
     // Output order: right_only(0) before pair(0, 1).
     try expectRightOnly(ops[0], 0);
     try expectPair(ops[1], 0, 1);
+}
+
+test "alignLines: oversized candidate matrix returns bounded unaligned run" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const left = try arena.alloc([]const u8, 65);
+    const right = try arena.alloc([]const u8, 65);
+    @memset(left, "const left = 1;");
+    @memset(right, "const right = 2;");
+
+    const ops = try alignLines(arena, left, right);
+    try testing.expectEqual(@as(usize, 130), ops.len);
+    for (ops[0..65]) |op| try testing.expect(op == .left_only);
+    for (ops[65..]) |op| try testing.expect(op == .right_only);
 }
 
 test "alignLines: empty lefts → all right_only" {

@@ -18,11 +18,8 @@
 //! Callers that highlight matches at render time can treat the span as a
 //! direct slice into `StyledLine.text`.
 //!
-//! Status: these primitives are not yet consumed by `app.zig` - the `/`
-//! prompt, render-time overlay, and collapse snapshot/restore on
-//! `/`/Esc are not implemented. Wiring them up is the remaining work
-//! for the "Search within diff" subtask; this module ships the pure
-//! scanning primitives on their own.
+//! `app.zig` owns the prompt, match overlay, navigation, and temporary
+//! expansion/restoration of collapsed rows; this module stays tty-free.
 
 const std = @import("std");
 const line_mod = @import("line.zig");
@@ -122,6 +119,55 @@ pub fn firstMatchAtOrAfter(matches: []const Match, from_row: usize) ?usize {
     // Nothing at or after; wrap to the first match so the cursor still
     // lands on a real hit rather than staying put.
     return 0;
+}
+
+/// Row-only navigation used by the TUI. It scans the view directly instead
+/// of materialising every occurrence, so a repetitive file cannot allocate
+/// one `Match` per byte.
+pub fn matchingRow(
+    view: View,
+    query: []const u8,
+    from_row: usize,
+    direction: enum { initial, next, previous },
+) ?usize {
+    const row_count = switch (view) {
+        .unified => |lines| lines.len,
+        .split => |pairs| pairs.len,
+    };
+    if (query.len == 0 or row_count == 0) return null;
+    const cursor = @min(from_row, row_count - 1);
+
+    switch (direction) {
+        .initial => {
+            for (cursor..row_count) |row| if (rowMatches(view, row, query)) return row;
+            for (0..cursor) |row| if (rowMatches(view, row, query)) return row;
+        },
+        .next => {
+            for (cursor + 1..row_count) |row| if (rowMatches(view, row, query)) return row;
+            for (0..cursor + 1) |row| if (rowMatches(view, row, query)) return row;
+        },
+        .previous => {
+            var row = cursor;
+            while (row > 0) {
+                row -= 1;
+                if (rowMatches(view, row, query)) return row;
+            }
+            row = row_count;
+            while (row > cursor) {
+                row -= 1;
+                if (rowMatches(view, row, query)) return row;
+            }
+        },
+    }
+    return null;
+}
+
+fn rowMatches(view: View, row: usize, query: []const u8) bool {
+    return switch (view) {
+        .unified => |lines| std.mem.indexOf(u8, lines[row].text, query) != null,
+        .split => |pairs| std.mem.indexOf(u8, pairs[row].left.text, query) != null or
+            std.mem.indexOf(u8, pairs[row].right.text, query) != null,
+    };
 }
 
 // ── internals ──────────────────────────────────────────────────────────────
@@ -257,6 +303,20 @@ test "findMatches: split view matches if either pane hits" {
     try testing.expectEqual(@as(usize, 2), matches.len);
     try testing.expectEqual(@as(usize, 0), matches[0].row);
     try testing.expectEqual(@as(usize, 1), matches[1].row);
+}
+
+test "matchingRow: scans rows directly and wraps in both directions" {
+    const lines = [_]StyledLine{
+        mkLine("first hit"),
+        mkLine("none"),
+        mkLine("last hit"),
+    };
+    const view: View = .{ .unified = lines[0..] };
+
+    try testing.expectEqual(@as(?usize, 2), matchingRow(view, "hit", 1, .initial));
+    try testing.expectEqual(@as(?usize, 0), matchingRow(view, "hit", 2, .next));
+    try testing.expectEqual(@as(?usize, 2), matchingRow(view, "hit", 0, .previous));
+    try testing.expectEqual(@as(?usize, null), matchingRow(view, "missing", 0, .next));
 }
 
 test "matchesOnLine: empty query, empty result" {

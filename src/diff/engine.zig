@@ -14,8 +14,11 @@ const result = @import("../diff/result.zig");
 const node = @import("../sst/node.zig");
 const edit = @import("edit.zig");
 
+pub const max_source_bytes: usize = 16 * 1024 * 1024;
+
 pub const EngineError = error{
     OutOfMemory,
+    InputTooLarge,
     /// Tree-sitter grammar for the requested language could not be loaded,
     /// or parsing failed for other non-data reasons (version mismatch, etc).
     /// Parse errors in the input itself are NOT signalled this way - they
@@ -37,6 +40,10 @@ pub fn diffSources(
     left_source: []const u8,
     right_source: []const u8,
 ) EngineError!result.FileDiff {
+    if (left_source.len >= max_source_bytes or right_source.len >= max_source_bytes) {
+        return error.InputTooLarge;
+    }
+
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -205,6 +212,35 @@ test "diffSources: parse errors from both sides keep their side labels" {
     }
     try testing.expect(saw_left);
     try testing.expect(saw_right);
+}
+
+test "diffSources: rejects source at the configured size limit" {
+    const oversized = try testing.allocator.alloc(u8, max_source_bytes);
+    defer testing.allocator.free(oversized);
+    @memset(oversized, ' ');
+    try testing.expectError(error.InputTooLarge, diffSources(testing.allocator, .zig, oversized, ""));
+}
+
+test "diffSources: decorated Python function keeps function classification" {
+    const before = "@decorator\ndef work():\n    return 1\n";
+    const after = "@decorator\ndef work():\n    return 2\n";
+    var fd = try diffSources(testing.allocator, .python, before, after);
+    defer fd.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fd.entries.len);
+    try testing.expect(fd.entries[0] == .changed);
+    try testing.expectEqual(result.DeclKind.function, fd.entries[0].changed.new.kind);
+}
+
+test "diffSources: exported TypeScript function keeps function classification" {
+    const before = "export function work(): number { return 1; }\n";
+    const after = "export function work(): number { return 2; }\n";
+    var fd = try diffSources(testing.allocator, .typescript, before, after);
+    defer fd.deinit();
+
+    try testing.expectEqual(@as(usize, 1), fd.entries.len);
+    try testing.expect(fd.entries[0] == .changed);
+    try testing.expectEqual(result.DeclKind.function, fd.entries[0].changed.new.kind);
 }
 
 test "diffSources: rename function → Removed + Added" {

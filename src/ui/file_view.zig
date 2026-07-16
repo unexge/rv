@@ -161,6 +161,21 @@ fn projectFile(
     var out: std.ArrayList(line_mod.StyledLine) = .empty;
     var cursors: Cursors = .{};
 
+    if (entriesContainReordering(file_diff.entries)) {
+        try emitGap(
+            arena,
+            &out,
+            file_diff,
+            0,
+            &cursors,
+            0,
+            @intCast(file_diff.left_source.len),
+            0,
+            @intCast(file_diff.right_source.len),
+        );
+        return try out.toOwnedSlice(arena);
+    }
+
     const left_bound: Range = .{ .start = 0, .end = @intCast(file_diff.left_source.len) };
     const right_bound: Range = .{ .start = 0, .end = @intCast(file_diff.right_source.len) };
 
@@ -177,6 +192,25 @@ fn projectFile(
     );
 
     return try out.toOwnedSlice(arena);
+}
+
+fn entriesContainReordering(entries: []const rv.DeclDiff) bool {
+    var previous_moved_from: ?usize = null;
+    for (entries) |entry| switch (entry) {
+        .unchanged => |u| if (u.moved) |m| {
+            if (previous_moved_from) |previous| if (m.from_idx < previous) return true;
+            previous_moved_from = m.from_idx;
+        },
+        .changed => |c| {
+            if (c.moved) |m| {
+                if (previous_moved_from) |previous| if (m.from_idx < previous) return true;
+                previous_moved_from = m.from_idx;
+            }
+            if (c.body == .container and entriesContainReordering(c.body.container)) return true;
+        },
+        .added, .removed => {},
+    };
+    return false;
 }
 
 /// Inferred error sets blow up because `projectEntries` ↔ `projectDecl`
@@ -283,7 +317,11 @@ fn projectEntries(
 }
 
 fn consumeTrailingNewline(source: []const u8, end: u32) u32 {
-    if (end < source.len and source[end] == '\n') return end + 1;
+    if (end >= source.len) return end;
+    if (source[end] == '\n') return end + 1;
+    if (source[end] == '\r' and end + 1 < source.len and source[end + 1] == '\n') {
+        return end + 2;
+    }
     return end;
 }
 
@@ -740,9 +778,10 @@ fn emitSourceLines(
     while (true) {
         const rest = slice[cursor_in_slice..];
         const nl_rel = std.mem.indexOfScalar(u8, rest, '\n');
-        const raw_line = if (nl_rel) |p| rest[0..p] else rest;
-        if (raw_line.len == 0 and nl_rel == null and !first) break;
+        const raw_with_cr = if (nl_rel) |p| rest[0..p] else rest;
+        if (raw_with_cr.len == 0 and nl_rel == null and !first) break;
         first = false;
+        const raw_line = line_mod.stripCarriageReturn(raw_with_cr);
 
         const expanded = try line_mod.expandTabs(arena, raw_line);
         const line_highlights = try line_mod.mapHighlightsToLine(arena, raw_line, line_abs_start, highlights);
@@ -909,6 +948,7 @@ fn emitCollapsedBody(
         .marker = .blank,
         .kind = .elided,
         .text = text,
+        .decl_id = decl_id,
         .gap_id = collapsedBodyGapId(decl_id),
     });
 }
@@ -1030,6 +1070,65 @@ fn buildForTest(
     var state = state_mod.AppState.init(gpa);
     defer state.deinit();
     return build(gpa, file_diff, mode, &state);
+}
+
+fn expectProjectedSources(
+    lines: []const line_mod.StyledLine,
+    expected_left: []const u8,
+    expected_right: []const u8,
+) !void {
+    var left: std.ArrayList(u8) = .empty;
+    defer left.deinit(testing.allocator);
+    var right: std.ArrayList(u8) = .empty;
+    defer right.deinit(testing.allocator);
+
+    for (lines) |line| {
+        if (line.line_no_left != null) {
+            try left.appendSlice(testing.allocator, line.text);
+            try left.append(testing.allocator, '\n');
+        }
+        if (line.line_no_right != null) {
+            try right.appendSlice(testing.allocator, line.text);
+            try right.append(testing.allocator, '\n');
+        }
+    }
+    try testing.expectEqualStrings(
+        std.mem.trimEnd(u8, expected_left, "\n"),
+        std.mem.trimEnd(u8, left.items, "\n"),
+    );
+    try testing.expectEqualStrings(
+        std.mem.trimEnd(u8, expected_right, "\n"),
+        std.mem.trimEnd(u8, right.items, "\n"),
+    );
+}
+
+test "consumeTrailingNewline consumes a complete CRLF sequence" {
+    try testing.expectEqual(@as(u32, 3), consumeTrailingNewline("a\r\n", 1));
+}
+
+test "build: hundred-line rewritten function stays bounded" {
+    var before: std.ArrayList(u8) = .empty;
+    defer before.deinit(testing.allocator);
+    var after: std.ArrayList(u8) = .empty;
+    defer after.deinit(testing.allocator);
+    try before.appendSlice(testing.allocator, "pub fn stress() void {\n");
+    try after.appendSlice(testing.allocator, "pub fn stress() void {\n");
+    for (0..100) |i| {
+        var buffer: [96]u8 = undefined;
+        const old_line = try std.fmt.bufPrint(&buffer, "    const old_{d} = {d};\n", .{ i, i });
+        try before.appendSlice(testing.allocator, old_line);
+        const new_line = try std.fmt.bufPrint(&buffer, "    const new_{d} = {d};\n", .{ i, i + 1000 });
+        try after.appendSlice(testing.allocator, new_line);
+    }
+    try before.appendSlice(testing.allocator, "}\n");
+    try after.appendSlice(testing.allocator, "}\n");
+
+    var fd = try rv.diffSources(testing.allocator, .zig, before.items, after.items);
+    defer fd.deinit();
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    try testing.expect(result.view.unified.len >= 100);
 }
 
 test "build: identical sources collapse the whole file to a single elided row" {
@@ -1343,7 +1442,7 @@ test "build: cross-decl context windows merge when changes are within 2*context 
 
     // No `.elided` row between the two changed decls.
     var middle_elided: usize = 0;
-    for (lines[first_changed.?..last_changed.? + 1]) |ln| if (ln.kind == .elided) {
+    for (lines[first_changed.? .. last_changed.? + 1]) |ln| if (ln.kind == .elided) {
         middle_elided += 1;
     };
     try testing.expectEqual(@as(usize, 0), middle_elided);
@@ -1743,7 +1842,7 @@ test "build: jump index targets first-source rows for expanded decls and anchors
     try testing.expect(saw_expanded_source);
 }
 
-test "build: moved decl annotation includes `moved N → M`" {
+test "build: reordered declarations preserve both source projections" {
     const before =
         \\pub fn a() void {}
         \\pub fn b() void {}
@@ -1758,17 +1857,7 @@ test "build: moved decl annotation includes `moved N → M`" {
     var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
-    var saw_moved_annotation = false;
-    for (result.view.unified) |ln| {
-        if (ln.kind != .source) continue;
-        const ann = ln.decl_annotation orelse continue;
-        if (std.mem.indexOf(u8, ann, "moved ") != null and
-            std.mem.indexOf(u8, ann, " → ") != null)
-        {
-            saw_moved_annotation = true;
-        }
-    }
-    try testing.expect(saw_moved_annotation);
+    try expectProjectedSources(result.view.unified, before, after);
 }
 
 test "formatDeclAnnotation: shape matches `(name, ts_kind)` with optional move suffix" {
@@ -2062,11 +2151,7 @@ test "build split: import-group emits the same merged line on both panes" {
     try testing.expect(saw_mirrored);
 }
 
-test "build: moved import-group decl annotation includes `moved N → M`" {
-    // Same body change, but the use decl moves position relative to a
-    // sibling top-level decl. The `moved` info must propagate into the
-    // inline annotation so N/P navigation can land on a row that still
-    // identifies which decl moved.
+test "build: reordered changed import group preserves both source projections" {
     const before = "use serde::Serialize;\nfn x() {}\n";
     const after = "fn x() {}\nuse serde::{Deserialize, Serialize};\n";
 
@@ -2076,12 +2161,7 @@ test "build: moved import-group decl annotation includes `moved N → M`" {
     var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
-    const row = findImportGroupRow(result.view.unified) orelse return error.MissingImportGroupRow;
-    const annotation = row.decl_annotation orelse return error.MissingAnnotation;
-    try testing.expect(std.mem.indexOf(u8, annotation, "use_group") != null);
-    try testing.expect(std.mem.indexOf(u8, annotation, "serde") != null);
-    try testing.expect(std.mem.indexOf(u8, annotation, "moved ") != null);
-    try testing.expect(std.mem.indexOf(u8, annotation, " → ") != null);
+    try expectProjectedSources(result.view.unified, before, after);
 }
 
 test "build: doc-comment rename in gap before a changed decl collapses to inline `~` rows" {

@@ -81,10 +81,20 @@ fn runPathMode(
         return error.UnknownLanguage;
     };
 
-    const before = try std.Io.Dir.cwd().readFileAlloc(io, before_path, gpa, .unlimited);
+    const before = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        before_path,
+        gpa,
+        .limited(rv.max_source_bytes),
+    );
     defer gpa.free(before);
 
-    const after = try std.Io.Dir.cwd().readFileAlloc(io, after_path, gpa, .unlimited);
+    const after = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        after_path,
+        gpa,
+        .limited(rv.max_source_bytes),
+    );
     defer gpa.free(after);
 
     var diff = try rv.diffSources(gpa, lang, before, after);

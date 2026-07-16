@@ -11,10 +11,11 @@
 //!   expands everything, `v` toggles split vs unified,
 //!   `n`/`p` jumps to the next/previous decl header (any kind),
 //!   `N`/`P` jumps between *changed* decls (skipping unchanged ones),
-//!   `g`/`G` jumps to the first/last decl, q / Ctrl-C quit.
-//!   `n`/`p`/`N`/`P` wrap around the file; all decl jumps center the
-//!   target in the top third of the viewport so the decl body stays
-//!   visible below.
+//!   `g`/`G` jumps to the first/last decl, `/` starts substring search,
+//!   search-mode `n`/`N` selects the next/previous match, Esc clears the
+//!   query and restores the pre-search folds, and q / Ctrl-C quit.
+//!   Decl and search jumps wrap around the file and center the target in
+//!   the top third of the viewport.
 //! - Mouse handling: wheel scroll + click-to-focus. Terminals without
 //!   mouse support simply never deliver mouse events, so keyboard
 //!   navigation stays intact. Drag-select is deferred because our mouse
@@ -31,6 +32,7 @@ const vaxis = @import("vaxis");
 const rv = @import("rv");
 const file_view_mod = @import("file_view.zig");
 const line_mod = @import("line.zig");
+const search = @import("search.zig");
 const summary = @import("summary.zig");
 const theme = @import("theme.zig");
 
@@ -145,7 +147,7 @@ pub fn run(
         switch (event) {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) break;
-                if (key.matches('q', .{})) break;
+                if (key.matches('q', .{}) and !state.search_editing) break;
                 try handleDiffPaneKey(gpa, key, &current, file_diff, &state, &mode, viewport, build_fn);
             },
             .mouse => |m| handleDiffPaneMouse(&state, m, viewport, current.rowCount()),
@@ -176,7 +178,7 @@ pub fn run(
                 // `DiffHeader.title` can't represent that layout. The session
                 // UI draws its own header either way, so `drawDiffPane`
                 // doesn't need to know about this case.
-                drawSplitLegacyHeader(win, pane, before_path, after_path, stats_text);
+                drawSplitLegacyHeader(win, pane, before_path, after_path, stats_text, &state);
                 drawDiffPane(win, pane, current, &state, mode, true, null);
             },
         }
@@ -215,7 +217,7 @@ pub fn drawDiffPane(
         .width = size.width,
         .height = size.height,
     });
-    if (header) |h| drawHeader(pane, h.title, h.stats, focused);
+    if (header) |h| drawHeader(pane, h.title, h.stats, focused, state);
     switch (mode) {
         .unified => drawUnifiedBody(pane, built, state, focused),
         .split => drawSplitBody(pane, built, state, focused),
@@ -250,6 +252,36 @@ pub fn handleDiffPaneKey(
     viewport: u16,
     build_fn: BuildFn,
 ) !void {
+    if (state.search_editing) {
+        try handleSearchEditing(
+            gpa,
+            key,
+            built,
+            file_diff,
+            state,
+            mode.*,
+            viewport,
+            build_fn,
+        );
+        return;
+    }
+    if (key.matches('/', .{})) {
+        try startSearch(gpa, built, file_diff, state, mode.*, viewport, build_fn);
+        return;
+    }
+    if (key.matches(vaxis.Key.escape, .{}) and state.search_query.items.len > 0) {
+        try cancelSearch(gpa, built, file_diff, state, mode.*, viewport, build_fn);
+        return;
+    }
+    if (state.search_query.items.len > 0 and key.matches('n', .{})) {
+        jumpSearch(state, built.view, .next, viewport, built.rowCount());
+        return;
+    }
+    if (state.search_query.items.len > 0 and key.matches('N', .{})) {
+        jumpSearch(state, built.view, .previous, viewport, built.rowCount());
+        return;
+    }
+
     if (key.matches('v', .{})) {
         const anchor = focusedDeclId(built.view, state.cursor_y);
         mode.* = if (mode.* == .unified) .split else .unified;
@@ -259,7 +291,13 @@ pub fn handleDiffPaneKey(
         // Elided rows expand/collapse via the gap-id channel; everything
         // else falls through to the existing decl collapse-toggle path.
         if (focusedRowKind(built.view, state.cursor_y) == .elided) {
-            try toggleFocusedGap(gpa, built, file_diff, state, mode.*, viewport, build_fn);
+            if (focusedRowDeclId(built.view, state.cursor_y)) |id| {
+                _ = try state.toggle(id);
+                try rebuild(gpa, built, file_diff, mode.*, state, build_fn);
+                relocateCursor(state, built.view, id, viewport);
+            } else {
+                try toggleFocusedGap(gpa, built, file_diff, state, mode.*, viewport, build_fn);
+            }
         } else if (focusedDeclId(built.view, state.cursor_y)) |id| {
             _ = try state.toggle(id);
             try rebuild(gpa, built, file_diff, mode.*, state, build_fn);
@@ -304,6 +342,99 @@ pub fn handleDiffPaneMouse(
     total: usize,
 ) void {
     applyMouse(state, mouse, viewport, total);
+}
+
+fn startSearch(
+    gpa: Allocator,
+    built: *BuildResult,
+    file_diff: *const rv.FileDiff,
+    state: *AppState,
+    mode: Mode,
+    viewport: u16,
+    build_fn: BuildFn,
+) !void {
+    const anchor = focusedDeclId(built.view, state.cursor_y);
+    try state.beginSearch(built.view);
+    try rebuild(gpa, built, file_diff, mode, state, build_fn);
+    // The first rebuild can reveal contextual gaps that were hidden inside
+    // collapsed declarations. Expand those too so search scans all rows.
+    try state.expandAllGaps(built.view);
+    try rebuild(gpa, built, file_diff, mode, state, build_fn);
+    relocateCursor(state, built.view, anchor, viewport);
+}
+
+fn cancelSearch(
+    gpa: Allocator,
+    built: *BuildResult,
+    file_diff: *const rv.FileDiff,
+    state: *AppState,
+    mode: Mode,
+    viewport: u16,
+    build_fn: BuildFn,
+) !void {
+    const anchor = focusedDeclId(built.view, state.cursor_y);
+    if (!state.restoreSearch()) return;
+    try rebuild(gpa, built, file_diff, mode, state, build_fn);
+    relocateCursor(state, built.view, anchor, viewport);
+}
+
+const SearchDirection = enum { initial, next, previous };
+const max_search_query_bytes: usize = 1024;
+
+fn handleSearchEditing(
+    gpa: Allocator,
+    key: vaxis.Key,
+    built: *BuildResult,
+    file_diff: *const rv.FileDiff,
+    state: *AppState,
+    mode: Mode,
+    viewport: u16,
+    build_fn: BuildFn,
+) !void {
+    if (key.matches(vaxis.Key.escape, .{})) {
+        try cancelSearch(gpa, built, file_diff, state, mode, viewport, build_fn);
+        return;
+    }
+    if (key.matches(vaxis.Key.enter, .{})) {
+        if (state.search_query.items.len == 0) {
+            try cancelSearch(gpa, built, file_diff, state, mode, viewport, build_fn);
+            return;
+        }
+        state.search_editing = false;
+        jumpSearch(state, built.view, .initial, viewport, built.rowCount());
+        return;
+    }
+    if (key.matches(vaxis.Key.backspace, .{})) {
+        removeLastCodepoint(&state.search_query);
+        return;
+    }
+    if (key.mods.ctrl or key.mods.alt or key.mods.super or key.mods.meta) return;
+    const text = key.text orelse return;
+    if (text.len == 0 or std.mem.indexOfAny(u8, text, "\r\n\x00") != null) return;
+    if (state.search_query.items.len + text.len > max_search_query_bytes) return;
+    try state.search_query.appendSlice(state.gpa, text);
+}
+
+fn removeLastCodepoint(query: *std.ArrayList(u8)) void {
+    if (query.items.len == 0) return;
+    var start = query.items.len - 1;
+    while (start > 0 and query.items[start] & 0xC0 == 0x80) start -= 1;
+    query.shrinkRetainingCapacity(start);
+}
+
+fn jumpSearch(
+    state: *AppState,
+    view: View,
+    direction: SearchDirection,
+    viewport: u16,
+    total: usize,
+) void {
+    const row = switch (direction) {
+        .initial => search.matchingRow(view, state.search_query.items, state.cursor_y, .initial),
+        .next => search.matchingRow(view, state.search_query.items, state.cursor_y, .next),
+        .previous => search.matchingRow(view, state.search_query.items, state.cursor_y, .previous),
+    } orelse return;
+    centerOnRow(state, row, viewport, total);
 }
 
 fn rebuild(
@@ -523,6 +654,17 @@ fn focusedRowKind(view: View, cursor_y: usize) ?LineKind {
 /// `null`. Split mode mirrors `.elided` rows on both sides; either side's
 /// id is fine, but we prefer the right (post-image) for symmetry with
 /// `focusedRowKind`.
+fn focusedRowDeclId(view: View, cursor_y: usize) ?DeclId {
+    return switch (view) {
+        .unified => |lines| if (cursor_y < lines.len) lines[cursor_y].decl_id else null,
+        .split => |pairs| if (cursor_y < pairs.len) blk: {
+            const p = pairs[cursor_y];
+            if (p.right.decl_id) |id| break :blk id;
+            break :blk p.left.decl_id;
+        } else null,
+    };
+}
+
 fn focusedGapId(view: View, cursor_y: usize) ?GapId {
     return switch (view) {
         .unified => |lines| if (cursor_y < lines.len) lines[cursor_y].gap_id else null,
@@ -811,7 +953,15 @@ fn drawUnifiedBody(
     var row: u16 = 0;
     var i: usize = state.scroll_y;
     while (i < end) : (i += 1) {
-        drawLine(body, row, lines[i], gutter, focused and i == state.cursor_y, focused);
+        drawLine(
+            body,
+            row,
+            lines[i],
+            gutter,
+            focused and i == state.cursor_y,
+            focused,
+            state.search_query.items,
+        );
         row += 1;
     }
 
@@ -820,12 +970,35 @@ fn drawUnifiedBody(
     }
 }
 
-fn drawHeader(win: vaxis.Window, title: []const u8, stats_text: []const u8, focused: bool) void {
+fn drawHeader(
+    win: vaxis.Window,
+    title: []const u8,
+    stats_text: []const u8,
+    focused: bool,
+    state: *const AppState,
+) void {
     _ = win.print(&.{.{
         .text = title,
         .style = dimUnlessFocused(.{ .bold = true }, focused),
     }}, .{ .row_offset = 0, .wrap = .none });
 
+    drawStatusLine(win, stats_text, focused, state);
+}
+
+fn drawStatusLine(
+    win: vaxis.Window,
+    stats_text: []const u8,
+    focused: bool,
+    state: *const AppState,
+) void {
+    if (state.search_editing or state.search_query.items.len > 0) {
+        _ = win.print(&.{
+            .{ .text = "/", .style = dimUnlessFocused(.{ .bold = true }, focused) },
+            .{ .text = state.search_query.items, .style = dimUnlessFocused(.{}, focused) },
+            .{ .text = if (state.search_editing) "_" else "", .style = dimUnlessFocused(.{ .bold = true }, focused) },
+        }, .{ .row_offset = 1, .wrap = .none });
+        return;
+    }
     _ = win.print(&.{.{
         .text = stats_text,
         .style = dimUnlessFocused(.{ .dim = true }, focused),
@@ -842,6 +1015,7 @@ fn drawSplitLegacyHeader(
     before_path: []const u8,
     after_path: []const u8,
     stats_text: []const u8,
+    state: *const AppState,
 ) void {
     const pane = win.child(.{
         .x_off = size.x_off,
@@ -857,10 +1031,7 @@ fn drawSplitLegacyHeader(
     _ = left_header.print(&.{.{ .text = before_path, .style = .{ .bold = true } }}, .{ .wrap = .none });
     _ = right_header.print(&.{.{ .text = after_path, .style = .{ .bold = true } }}, .{ .wrap = .none });
 
-    _ = pane.print(
-        &.{.{ .text = stats_text, .style = .{ .dim = true } }},
-        .{ .row_offset = 1, .wrap = .none },
-    );
+    drawStatusLine(pane, stats_text, true, state);
 }
 
 // ── draw: split ────────────────────────────────────────────────────────────
@@ -928,8 +1099,24 @@ fn drawSplitBody(
         const is_cursor = focused and i == state.cursor_y;
         // Cursor marker is only drawn on the left pane so the right pane's
         // gutter stays readable.
-        drawLine(left_body, row, pairs[i].left, left_gutter, is_cursor, focused);
-        drawLine(right_body, row, pairs[i].right, right_gutter, false, focused);
+        drawLine(
+            left_body,
+            row,
+            pairs[i].left,
+            left_gutter,
+            is_cursor,
+            focused,
+            state.search_query.items,
+        );
+        drawLine(
+            right_body,
+            row,
+            pairs[i].right,
+            right_gutter,
+            false,
+            focused,
+            state.search_query.items,
+        );
         row += 1;
     }
 
@@ -1085,6 +1272,7 @@ fn drawLine(
     gutter: LineNumberGutter,
     cursor: bool,
     focused: bool,
+    search_query: []const u8,
 ) void {
     const ln_prefix = drawLineNumberGutter(body, row, sl, gutter, focused);
 
@@ -1121,7 +1309,7 @@ fn drawLine(
     const indent_cols: u16 = @as(u16, @intCast(sl.indent)) * 2;
     const text_col: u16 = ln_prefix + 2 + indent_cols;
 
-    drawStyledText(body, row, text_col, sl, base_style, focused);
+    drawStyledText(body, row, text_col, sl, base_style, focused, search_query);
 }
 
 /// Render a `… N unchanged lines …` row. Centred dim italic text with a
@@ -1212,11 +1400,12 @@ fn drawStyledText(
     sl: StyledLine,
     base_style: vaxis.Style,
     focused: bool,
+    search_query: []const u8,
 ) void {
     if (sl.text.len == 0) return;
 
     // Fast path: no decoration → single print.
-    if (sl.highlights.len == 0 and sl.novel_spans.len == 0) {
+    if (sl.highlights.len == 0 and sl.novel_spans.len == 0 and search_query.len == 0) {
         _ = body.print(&.{.{ .text = sl.text, .style = dimUnlessFocused(base_style, focused) }}, .{
             .row_offset = row,
             .col_offset = text_col,
@@ -1227,22 +1416,33 @@ fn drawStyledText(
 
     var hl_i: usize = 0;
     var nv_i: usize = 0;
+    var search_sweep = SearchSweep.init(sl.text, search_query);
     var pos: usize = 0;
     var run_start: usize = 0;
-    var run_style: vaxis.Style = effectiveStyle(sl, base_style, pos, &hl_i, &nv_i);
+    var run_col = text_col;
+    var run_style: vaxis.Style = effectiveStyle(
+        sl,
+        base_style,
+        pos,
+        &hl_i,
+        &nv_i,
+        &search_sweep,
+    );
 
     pos = 1;
     while (pos < sl.text.len) : (pos += 1) {
-        const s = effectiveStyle(sl, base_style, pos, &hl_i, &nv_i);
+        const s = effectiveStyle(sl, base_style, pos, &hl_i, &nv_i, &search_sweep);
         if (!s.eql(run_style)) {
+            const segment = sl.text[run_start..pos];
             _ = body.print(&.{.{
-                .text = sl.text[run_start..pos],
+                .text = segment,
                 .style = dimUnlessFocused(run_style, focused),
             }}, .{
                 .row_offset = row,
-                .col_offset = text_col + @as(u16, @intCast(run_start)),
+                .col_offset = run_col,
                 .wrap = .none,
             });
+            run_col = textColumnAfter(run_col, segment);
             run_start = pos;
             run_style = s;
         }
@@ -1252,7 +1452,7 @@ fn drawStyledText(
         .style = dimUnlessFocused(run_style, focused),
     }}, .{
         .row_offset = row,
-        .col_offset = text_col + @as(u16, @intCast(run_start)),
+        .col_offset = run_col,
         .wrap = .none,
     });
 }
@@ -1266,6 +1466,7 @@ fn effectiveStyle(
     pos: usize,
     hl_i: *usize,
     nv_i: *usize,
+    search_sweep: *SearchSweep,
 ) vaxis.Style {
     while (hl_i.* < sl.highlights.len and sl.highlights[hl_i.*].end <= pos) hl_i.* += 1;
     while (nv_i.* < sl.novel_spans.len and sl.novel_spans[nv_i.*].end <= pos) nv_i.* += 1;
@@ -1283,7 +1484,40 @@ fn effectiveStyle(
             style = novelStyleFor(style);
         }
     }
+    if (search_sweep.contains(pos)) {
+        style.bg = .{ .index = 3 };
+        style.fg = .{ .index = 0 };
+        style.dim = false;
+    }
     return style;
+}
+
+const SearchSweep = struct {
+    text: []const u8,
+    query: []const u8,
+    next_start: ?usize,
+    covered_end: usize = 0,
+
+    fn init(text: []const u8, query: []const u8) SearchSweep {
+        const next_start = if (query.len == 0 or query.len > text.len)
+            null
+        else
+            std.mem.indexOf(u8, text, query);
+        return .{ .text = text, .query = query, .next_start = next_start };
+    }
+
+    fn contains(self: *SearchSweep, pos: usize) bool {
+        while (self.next_start) |start| {
+            if (start > pos) break;
+            self.covered_end = @max(self.covered_end, start + self.query.len);
+            self.next_start = std.mem.indexOfPos(u8, self.text, start + 1, self.query);
+        }
+        return pos < self.covered_end;
+    }
+};
+
+fn textColumnAfter(col: u16, text: []const u8) u16 {
+    return col +| vaxis.gwidth.gwidth(text, .unicode);
 }
 
 /// Stronger variant of `base` for atom-level novel ranges. Reverse video
@@ -1340,6 +1574,10 @@ fn makeState(scroll: usize, cursor: usize) AppState {
 
 fn keyCp(cp: u21) vaxis.Key {
     return .{ .codepoint = cp, .base_layout_codepoint = cp, .shifted_codepoint = cp, .text = null, .mods = .{} };
+}
+
+fn textKey(text: []const u8) vaxis.Key {
+    return .{ .codepoint = text[0], .text = text, .mods = .{} };
 }
 
 fn mouseEvent(
@@ -2090,6 +2328,69 @@ test "nextDeclRow / prevDeclRow: jump across decl rows in file-wide view" {
     try testing.expectEqual(@as(?usize, r2), prevDeclRow(built.decl_index, r0, false));
 }
 
+test "textColumnAfter uses display width instead of UTF-8 byte offsets" {
+    try testing.expectEqual(@as(u16, 8), textColumnAfter(5, "é界"));
+}
+
+test "SearchSweep covers every byte in overlapping matches" {
+    var sweep = SearchSweep.init("aaa", "aa");
+    try testing.expect(sweep.contains(0));
+    try testing.expect(sweep.contains(1));
+    try testing.expect(sweep.contains(2));
+
+    var missing = SearchSweep.init("aaa", "z");
+    try testing.expect(!missing.contains(1));
+}
+
+test "handleDiffPaneKey: search expands folds and Escape restores them" {
+    const before = "pub fn a() u32 { return 1; }\npub fn b() void {}\n";
+    const after = "pub fn a() u32 { return 2; }\npub fn b() void {}\n";
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    const changed_id = line_mod.declId(fd.entries[0].changed.new);
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    _ = try state.toggle(changed_id);
+    const original_gap: GapId = 0xA11CE;
+    _ = try state.toggleGap(original_gap);
+
+    var built = try buildFileViewForTest(&fd, &state);
+    defer built.deinit();
+    var mode: Mode = .unified;
+
+    try handleDiffPaneKey(testing.allocator, keyCp('/'), &built, &fd, &state, &mode, 30, &file_view_mod.build);
+    try testing.expect(state.search_editing);
+    try testing.expect(!state.isCollapsed(changed_id));
+
+    try handleDiffPaneKey(testing.allocator, keyCp(vaxis.Key.escape), &built, &fd, &state, &mode, 30, &file_view_mod.build);
+    try testing.expect(!state.search_editing);
+    try testing.expect(state.isCollapsed(changed_id));
+    try testing.expect(state.isGapExpanded(original_gap));
+}
+
+test "handleDiffPaneKey: committed search navigates with n" {
+    const before = "const needle_a = 1;\nconst middle = 1;\nconst needle_b = 1;\n";
+    const after = "const needle_a = 2;\nconst middle = 1;\nconst needle_b = 2;\n";
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    var built = try buildFileViewForTest(&fd, &state);
+    defer built.deinit();
+    var mode: Mode = .unified;
+
+    try handleDiffPaneKey(testing.allocator, keyCp('/'), &built, &fd, &state, &mode, 30, &file_view_mod.build);
+    try handleDiffPaneKey(testing.allocator, textKey("needle"), &built, &fd, &state, &mode, 30, &file_view_mod.build);
+    try handleDiffPaneKey(testing.allocator, keyCp(vaxis.Key.enter), &built, &fd, &state, &mode, 30, &file_view_mod.build);
+    const first = state.cursor_y;
+    try testing.expectEqualStrings("needle", state.search_query.items);
+
+    try handleDiffPaneKey(testing.allocator, keyCp('n'), &built, &fd, &state, &mode, 30, &file_view_mod.build);
+    try testing.expect(state.cursor_y > first);
+}
+
 test "handleDiffPaneKey: space on `.elided` row toggles state.expanded_gaps" {
     // Long file with one tiny change in the middle so `elide.zig` emits
     // both leading and trailing `.elided` rows.
@@ -2135,6 +2436,30 @@ test "handleDiffPaneKey: space on `.elided` row toggles state.expanded_gaps" {
 
     // Post-condition: gap is now expanded.
     try testing.expect(state.isGapExpanded(elided_gap));
+}
+
+test "handleDiffPaneKey: collapsed-body elision toggles its declaration" {
+    const before = "pub fn a() u32 {\n    return 1;\n}\n";
+    const after = "pub fn a() u32 {\n    return 2;\n}\n";
+    var fd = try rv.diffSources(testing.allocator, .zig, before, after);
+    defer fd.deinit();
+
+    const id = line_mod.declId(fd.entries[0].changed.new);
+    var state = AppState.init(testing.allocator);
+    defer state.deinit();
+    _ = try state.toggle(id);
+    var built = try buildFileViewForTest(&fd, &state);
+    defer built.deinit();
+
+    const row = firstElidedRow(built.view.unified) orelse return error.MissingElided;
+    try testing.expectEqual(id, built.view.unified[row].decl_id.?);
+    const gap_id = built.view.unified[row].gap_id.?;
+    state.cursor_y = row;
+
+    var mode: Mode = .unified;
+    try handleDiffPaneKey(testing.allocator, keyCp(vaxis.Key.space), &built, &fd, &state, &mode, 30, &file_view_mod.build);
+    try testing.expect(!state.isCollapsed(id));
+    try testing.expect(!state.isGapExpanded(gap_id));
 }
 
 test "handleDiffPaneKey: `[` clears state.expanded_gaps in addition to collapsing decls" {

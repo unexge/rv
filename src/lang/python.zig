@@ -102,6 +102,7 @@ pub const config: config_mod.LangConfig = .{
     // route through `container_list_of`.
     .container_ts_kinds = &.{},
     .classify = classify,
+    .classify_decl = classifyDecl,
     .extract_name = extractName,
     .container_list_of = containerListOf,
 };
@@ -365,7 +366,8 @@ test "classifyDecl: decorated_definition unwraps to inner .function" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
 
-    var fx = try convertPython(arena_state.allocator(),
+    var fx = try convertPython(
+        arena_state.allocator(),
         "@decorator\ndef foo():\n    pass\n",
     );
     defer fx.deinit();
@@ -379,7 +381,8 @@ test "classifyDecl: decorated_definition unwraps to inner .container" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
 
-    var fx = try convertPython(arena_state.allocator(),
+    var fx = try convertPython(
+        arena_state.allocator(),
         "@register\nclass Thing:\n    pass\n",
     );
     defer fx.deinit();
@@ -434,7 +437,8 @@ test "extractName: decorated_definition unwraps to inner function name" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
 
-    var fx = try convertPython(arena_state.allocator(),
+    var fx = try convertPython(
+        arena_state.allocator(),
         "@decorator\ndef foo():\n    pass\n",
     );
     defer fx.deinit();
@@ -449,7 +453,8 @@ test "extractName: decorated_definition with multiple decorators unwraps to inne
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
 
-    var fx = try convertPython(arena_state.allocator(),
+    var fx = try convertPython(
+        arena_state.allocator(),
         "@a\n@b\nclass Thing:\n    pass\n",
     );
     defer fx.deinit();
@@ -505,7 +510,8 @@ test "extractName: future_import_statement returns __future__" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
 
-    var fx = try convertPython(arena_state.allocator(),
+    var fx = try convertPython(
+        arena_state.allocator(),
         "from __future__ import annotations\n",
     );
     defer fx.deinit();
@@ -575,7 +581,8 @@ test "extractName: if_statement at module level is anonymous" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
 
-    var fx = try convertPython(arena_state.allocator(),
+    var fx = try convertPython(
+        arena_state.allocator(),
         "if __name__ == \"__main__\":\n    pass\n",
     );
     defer fx.deinit();
@@ -591,7 +598,8 @@ test "containerListOf: class_definition returns its block" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
 
-    var fx = try convertPython(arena_state.allocator(),
+    var fx = try convertPython(
+        arena_state.allocator(),
         "class Thing:\n    def m(self):\n        pass\n",
     );
     defer fx.deinit();
@@ -606,7 +614,8 @@ test "containerListOf: decorated class returns inner block" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
 
-    var fx = try convertPython(arena_state.allocator(),
+    var fx = try convertPython(
+        arena_state.allocator(),
         "@dec\nclass Thing:\n    def m(self):\n        pass\n",
     );
     defer fx.deinit();

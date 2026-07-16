@@ -1124,11 +1124,12 @@ fn sourceLinesSlice(
     while (true) {
         const rest = slice[cursor..];
         const nl_rel = std.mem.indexOfScalar(u8, rest, '\n');
-        const raw_line = if (nl_rel) |p| rest[0..p] else rest;
+        const raw_with_cr = if (nl_rel) |p| rest[0..p] else rest;
 
-        // Drop a final empty token that comes from a trailing '\n'.
-        if (raw_line.len == 0 and nl_rel == null and !first) break;
+        // Drop a final empty token that comes from a trailing newline.
+        if (raw_with_cr.len == 0 and nl_rel == null and !first) break;
         first = false;
+        const raw_line = stripCarriageReturn(raw_with_cr);
 
         const expanded = try expandTabs(arena, raw_line);
         const line_highlights = try mapHighlightsToLine(arena, raw_line, line_abs_start, highlights);
@@ -1357,6 +1358,11 @@ fn rawToDisplay(raw_line: []const u8, raw_offset: usize) usize {
 }
 
 const tab_width: usize = 4;
+
+pub fn stripCarriageReturn(line: []const u8) []const u8 {
+    if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+    return line;
+}
 
 /// Reject inline collapse when the word-LCS produces more than this
 /// many non-common (removed + added) runs. A clean rename is 2 runs;
@@ -3717,4 +3723,3 @@ test "buildImportGroupLine: self symbol is just another entry" {
     const self_span = findHighlight(line, "self") orelse return error.MissingHighlight;
     try testing.expectEqual(TokenClass.inline_added, self_span.class);
 }
-

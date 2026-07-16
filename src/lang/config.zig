@@ -47,6 +47,11 @@ pub const LangConfig = struct {
     /// language-specific logic.
     classify: *const fn (ts_kind: []const u8) result.DeclKind,
 
+    /// Optional list-aware classification for wrapper declarations whose
+    /// outer tree-sitter kind does not describe the declaration inside it
+    /// (for example Python decorators and TypeScript exports).
+    classify_decl: ?*const fn (list: *const node.List) result.DeclKind = null,
+
     /// Extract the human-readable name of a Decl as a slice into `source`.
     /// Returns null for anonymous Decls (bare statements, comptime blocks).
     /// Used to build identity keys for alignment.

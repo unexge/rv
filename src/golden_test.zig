@@ -202,14 +202,12 @@ pub fn runAll(gpa: std.mem.Allocator, io: Io, root_path: []const u8) !void {
     const regen = regenRequested();
 
     var root_dir = Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => {
-            std.log.warn("golden: fixtures root not found: {s}", .{root_path});
-            return;
-        },
+        error.FileNotFound => return error.MissingFixtures,
         else => return err,
     };
     defer root_dir.close(io);
 
+    var fixture_count: usize = 0;
     var lang_iter = root_dir.iterate();
     while (try lang_iter.next(io)) |lang_entry| {
         if (lang_entry.kind != .directory) continue;
@@ -224,9 +222,11 @@ pub fn runAll(gpa: std.mem.Allocator, io: Io, root_path: []const u8) !void {
         var scen_iter = lang_dir.iterate();
         while (try scen_iter.next(io)) |scen_entry| {
             if (scen_entry.kind != .directory) continue;
+            fixture_count += 1;
             try runFixture(gpa, io, lang_dir, lang_entry.name, scen_entry.name, lang, regen);
         }
     }
+    if (fixture_count == 0) return error.MissingFixtures;
 }
 
 fn runFixture(
@@ -246,19 +246,13 @@ fn runFixture(
     const after_name = try std.fmt.allocPrint(gpa, "after{s}", .{lang.ext});
     defer gpa.free(after_name);
 
-    const before = fx_dir.readFileAlloc(io, before_name, gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => {
-            std.log.warn("golden: {s}/{s}: missing {s}", .{ lang_name, scenario, before_name });
-            return;
-        },
+    const before = fx_dir.readFileAlloc(io, before_name, gpa, .limited(rv.max_source_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return error.MissingFixtureInput,
         else => return err,
     };
     defer gpa.free(before);
-    const after = fx_dir.readFileAlloc(io, after_name, gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => {
-            std.log.warn("golden: {s}/{s}: missing {s}", .{ lang_name, scenario, after_name });
-            return;
-        },
+    const after = fx_dir.readFileAlloc(io, after_name, gpa, .limited(rv.max_source_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return error.MissingFixtureInput,
         else => return err,
     };
     defer gpa.free(after);
@@ -531,6 +525,31 @@ test "discovery: iterate mock fixtures root" {
 
     try testing.expectEqual(@as(usize, 2), found_langs);
     try testing.expectEqual(@as(usize, 3), found_scenarios);
+}
+
+test "runAll: empty fixture root fails instead of silently passing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
+
+    try testing.expectError(
+        error.MissingFixtures,
+        runAll(testing.allocator, testing.io, path_buf[0..path_len]),
+    );
+}
+
+test "runAll: fixture with missing source input fails" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "zig/missing-input");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &path_buf);
+
+    try testing.expectError(
+        error.MissingFixtureInput,
+        runAll(testing.allocator, testing.io, path_buf[0..path_len]),
+    );
 }
 
 test "compareOrRegen: missing expected.json yields MissingExpected" {

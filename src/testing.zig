@@ -162,10 +162,12 @@ test "expectAdded and expectRemoved" {
 }
 
 test "expectChanged inspector returns leaf EditScript" {
-    const e1 = rv.Edit{ .novel = .{
-        .side = .right,
-        .node_ref = undefined, // pointer not dereferenced in this test
-    } };
+    const e1 = rv.Edit{
+        .novel = .{
+            .side = .right,
+            .node_ref = undefined, // pointer not dereferenced in this test
+        },
+    };
     const edits = [_]rv.Edit{e1};
     const script = rv.EditScript{ .edits = &edits, .total_cost = 5 };
 

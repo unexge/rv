@@ -28,8 +28,11 @@ pub const ListError = error{
 pub const LoadError = error{
     GitFailed,
     NotFound,
+    TooLarge,
     OutOfMemory,
 };
+
+const max_git_metadata_bytes: usize = 64 * 1024 * 1024;
 
 /// Repository handle. Discovered from the current working directory; used
 /// for the lifetime of a repo-mode session.
@@ -50,6 +53,8 @@ pub const GitRepo = struct {
 
         const result = std.process.run(gpa, io, .{
             .argv = &.{ "git", "rev-parse", "--show-toplevel" },
+            .stdout_limit = .limited(std.fs.max_path_bytes),
+            .stderr_limit = .limited(1024 * 1024),
         }) catch |err| return mapDiscoverRunError(err);
         defer gpa.free(result.stdout);
         defer gpa.free(result.stderr);
@@ -105,13 +110,7 @@ pub const GitRepo = struct {
 
         var it: NameStatusIter = .{ .data = name_status.stdout, .pos = 0 };
         while (try it.next()) |entry| {
-            const initial_kind: vcs.ChangeKind = switch (entry.status[0]) {
-                'M' => .modified,
-                'A' => .added,
-                'D' => .deleted,
-                'R' => .renamed,
-                else => return error.ParseFailed,
-            };
+            const initial_kind = changeKindForStatus(entry.status[0]);
 
             const old_raw: ?[]const u8 = if (initial_kind == .added) null else entry.p1;
             const new_raw: ?[]const u8 = switch (initial_kind) {
@@ -127,14 +126,14 @@ pub const GitRepo = struct {
             var kind = initial_kind;
             var stat = vcs.LineStat{ .added = 0, .removed = 0 };
             if (numstat_map.get(lookup_key)) |ne| {
-                if (ne.is_binary) {
+                if (ne.is_binary and kind != .unavailable) {
                     kind = .binary;
-                } else {
+                } else if (!ne.is_binary) {
                     stat = .{ .added = ne.added, .removed = ne.removed };
                 }
             }
 
-            if (kind != .binary) {
+            if (kind != .binary and kind != .unavailable) {
                 const probe_path = new_raw orelse old_raw.?;
                 if (rv.languageFromPath(probe_path) == null) {
                     kind = .unsupported;
@@ -164,7 +163,11 @@ pub const GitRepo = struct {
         const spec = try std.fmt.allocPrint(self.gpa, ":{s}", .{old});
         defer self.gpa.free(spec);
 
-        const result = self.runGit(gpa, &.{ "show", spec }) catch |err| return mapLoadRunError(err);
+        const result = self.runGitLimited(
+            gpa,
+            &.{ "show", spec },
+            .limited(rv.max_source_bytes),
+        ) catch |err| return mapLoadRunError(err);
         defer gpa.free(result.stderr);
         errdefer gpa.free(result.stdout);
 
@@ -182,9 +185,13 @@ pub const GitRepo = struct {
         };
         defer root_dir.close(self.io);
 
-        return root_dir.readFileAlloc(self.io, new, gpa, .unlimited) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.FileNotFound => error.NotFound,
+        const stat = root_dir.statFile(self.io, new, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return error.NotFound,
+            else => return error.GitFailed,
+        };
+        return switch (stat.kind) {
+            .sym_link => readLinkAlloc(root_dir, self.io, new, gpa),
+            .file => readRegularFile(root_dir, self.io, new, gpa),
             else => error.GitFailed,
         };
     }
@@ -198,6 +205,15 @@ pub const GitRepo = struct {
     }
 
     fn runGit(self: *GitRepo, gpa: Allocator, argv: []const []const u8) !std.process.RunResult {
+        return self.runGitLimited(gpa, argv, .limited(max_git_metadata_bytes));
+    }
+
+    fn runGitLimited(
+        self: *GitRepo,
+        gpa: Allocator,
+        argv: []const []const u8,
+        stdout_limit: Io.Limit,
+    ) !std.process.RunResult {
         var full: std.ArrayList([]const u8) = .empty;
         defer full.deinit(self.gpa);
         try full.ensureTotalCapacity(self.gpa, argv.len + 1);
@@ -207,9 +223,49 @@ pub const GitRepo = struct {
         return std.process.run(gpa, self.io, .{
             .argv = full.items,
             .cwd = .{ .path = self.root },
+            .stdout_limit = stdout_limit,
+            .stderr_limit = .limited(1024 * 1024),
         });
     }
 };
+
+fn readLinkAlloc(
+    dir: Io.Dir,
+    io: Io,
+    path: []const u8,
+    gpa: Allocator,
+) LoadError![]u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = dir.readLink(io, path, &buffer) catch |err| switch (err) {
+        error.FileNotFound => return error.NotFound,
+        else => return error.GitFailed,
+    };
+    return gpa.dupe(u8, buffer[0..len]);
+}
+
+fn readRegularFile(
+    dir: Io.Dir,
+    io: Io,
+    path: []const u8,
+    gpa: Allocator,
+) LoadError![]u8 {
+    var file = dir.openFile(io, path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.NotFound,
+        else => return error.GitFailed,
+    };
+    defer file.close(io);
+
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(gpa, .limited(rv.max_source_bytes)) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.TooLarge,
+        else => error.GitFailed,
+    };
+}
 
 fn termOk(term: std.process.Child.Term) bool {
     return switch (term) {
@@ -236,7 +292,19 @@ fn mapListRunError(err: anyerror) ListError {
 fn mapLoadRunError(err: anyerror) LoadError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.TooLarge,
         else => error.GitFailed,
+    };
+}
+
+fn changeKindForStatus(status: u8) vcs.ChangeKind {
+    return switch (status) {
+        'M' => .modified,
+        'A' => .added,
+        'D' => .deleted,
+        'R', 'C' => .renamed,
+        'T', 'U', 'X', 'B' => .unavailable,
+        else => .unavailable,
     };
 }
 
@@ -504,6 +572,11 @@ test "listChanges: deleted file" {
     try testing.expectError(error.NotFound, repo.loadNew(gpa, c));
 }
 
+test "changeKindForStatus: type changes and conflicts remain listable" {
+    try testing.expectEqual(vcs.ChangeKind.unavailable, changeKindForStatus('T'));
+    try testing.expectEqual(vcs.ChangeKind.unavailable, changeKindForStatus('U'));
+}
+
 test "NameStatusIter: parses R (rename) entries with two paths" {
     // Plain `git diff` (index vs worktree) can't actually produce R
     // entries — the untracked "added" side is invisible to `git diff` —
@@ -552,6 +625,46 @@ test "listChanges: binary file" {
     const new_bytes = try repo.loadNew(gpa, c);
     defer gpa.free(new_bytes);
     try testing.expectEqualSlices(u8, after_png, new_bytes);
+}
+
+test "listChanges: type change is unavailable instead of a parse failure" {
+    const gpa = testing.allocator;
+    var tr = try TestRepo.init(gpa);
+    defer tr.deinit(gpa);
+
+    try tr.writeFile("kind.zig", "const x = 1;\n");
+    try tr.commitAll(gpa, "init");
+    try tr.deleteFile("kind.zig");
+    try tr.tmp.dir.symLink(testing.io, "elsewhere.zig", "kind.zig", .{});
+
+    var repo = try tr.discover(gpa);
+    defer repo.deinit();
+
+    const changes = try repo.listChanges();
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    try testing.expectEqual(vcs.ChangeKind.unavailable, changes[0].kind);
+}
+
+test "loadNew: changed symlink returns its target without following it" {
+    const gpa = testing.allocator;
+    var tr = try TestRepo.init(gpa);
+    defer tr.deinit(gpa);
+
+    try tr.tmp.dir.symLink(testing.io, "inside.zig", "link.zig", .{});
+    try tr.commitAll(gpa, "init");
+    try tr.deleteFile("link.zig");
+    try tr.tmp.dir.symLink(testing.io, "/etc/passwd", "link.zig", .{});
+
+    var repo = try tr.discover(gpa);
+    defer repo.deinit();
+
+    const changes = try repo.listChanges();
+    try testing.expectEqual(@as(usize, 1), changes.len);
+    try testing.expectEqual(vcs.ChangeKind.modified, changes[0].kind);
+
+    const bytes = try repo.loadNew(gpa, changes[0]);
+    defer gpa.free(bytes);
+    try testing.expectEqualStrings("/etc/passwd", bytes);
 }
 
 test "listChanges: unsupported extension" {

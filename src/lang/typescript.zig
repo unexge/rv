@@ -98,6 +98,7 @@ pub const config: config_mod.LangConfig = .{
     // the Decl list itself as the container.
     .container_ts_kinds = &.{},
     .classify = classify,
+    .classify_decl = classifyDecl,
     .extract_name = extractName,
     .container_list_of = containerListOf,
 };
@@ -120,6 +121,21 @@ fn classify(ts_kind: []const u8) result.DeclKind {
     if (std.mem.eql(u8, ts_kind, "import_statement")) return .import;
     if (std.mem.eql(u8, ts_kind, "export_statement")) return .import;
     return .other;
+}
+
+fn classifyDecl(list: *const node.List) result.DeclKind {
+    if (!std.mem.eql(u8, list.ts_kind, "export_statement")) {
+        return classify(list.ts_kind);
+    }
+    for (list.children) |child| switch (child) {
+        .list => |inner| {
+            if (isUnwrappableExportKind(inner.ts_kind)) {
+                return classify(inner.ts_kind);
+            }
+        },
+        .atom => {},
+    };
+    return .import;
 }
 
 /// Modifier keywords and punctuation we skip when scanning direct atom
@@ -213,7 +229,6 @@ fn extractName(list: *const node.List, source: []const u8) ?[]const u8 {
 /// NOTE: `variable_declaration` / `lexical_declaration` use
 /// `firstDeclaratorName` instead - they need per-declarator inspection
 /// to detect destructuring patterns, which this helper does not model.
-
 fn firstNonKeywordAtom(list: *const node.List) ?[]const u8 {
     for (list.children) |c| switch (c) {
         .atom => |a| {

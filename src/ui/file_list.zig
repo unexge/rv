@@ -81,22 +81,17 @@ fn followCursor(state: *ListState, viewport: u16) void {
 
 const header_rows: u16 = 1;
 
-/// Scratch storage for row text that must survive the draw→render
-/// boundary. vaxis stores cell graphemes by reference, so any formatted
-/// row label has to live until the render pass that reads it. A module-
-/// level buffer is the simplest thing that spans both calls: draw
-/// overwrites it from scratch each frame, and render between draws sees
-/// a stable slice. The UI is single-threaded, so there's only ever one
-/// in-flight `draw`.
-var scratch_buf: [8192]u8 = undefined;
-
-pub fn draw(win: vaxis.Window, state: *const ListState, focused: bool) void {
+/// `arena` must remain alive through the frame's render call because vaxis
+/// stores formatted grapheme slices by reference.
+pub fn draw(
+    win: vaxis.Window,
+    state: *const ListState,
+    focused: bool,
+    arena: std.mem.Allocator,
+) !void {
     if (win.width == 0 or win.height == 0) return;
 
-    var fba = std.heap.FixedBufferAllocator.init(&scratch_buf);
-    const a = fba.allocator();
-
-    const header_text = std.fmt.allocPrint(a, "Files ({d})", .{state.entries.len}) catch "Files";
+    const header_text = try std.fmt.allocPrint(arena, "Files ({d})", .{state.entries.len});
     const header_style: vaxis.Style = if (focused)
         .{ .bold = true }
     else
@@ -113,7 +108,14 @@ pub fn draw(win: vaxis.Window, state: *const ListState, focused: bool) void {
     var row: u16 = 0;
     var i: usize = state.scroll;
     while (i < end) : (i += 1) {
-        drawRow(win, header_rows + row, state.entries[i], i == state.cursor, focused, a);
+        try drawRow(
+            win,
+            header_rows + row,
+            state.entries[i],
+            i == state.cursor,
+            focused,
+            arena,
+        );
         row += 1;
     }
 }
@@ -125,8 +127,8 @@ fn drawRow(
     selected_row: bool,
     focused: bool,
     a: std.mem.Allocator,
-) void {
-    const text = formatRow(a, entry) catch "";
+) !void {
+    const text = try formatRow(a, entry);
     const base: vaxis.Style = if (selected_row) .{ .reverse = true } else .{};
     const style = dimUnlessFocused(base, focused);
 
@@ -175,6 +177,7 @@ fn markerFor(kind: vcs.ChangeKind) []const u8 {
         .renamed => "R",
         .binary => "×",
         .unsupported => "?",
+        .unavailable => "!",
     };
 }
 
@@ -196,6 +199,7 @@ fn formatStat(a: std.mem.Allocator, entry: Entry) ![]u8 {
     return switch (entry.change.kind) {
         .binary => a.dupe(u8, "(binary)"),
         .unsupported => a.dupe(u8, "(unsupported)"),
+        .unavailable => a.dupe(u8, "(unavailable)"),
         else => std.fmt.allocPrint(a, "+{d} -{d}", .{
             entry.change.line_stat.added,
             entry.change.line_stat.removed,

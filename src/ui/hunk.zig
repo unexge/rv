@@ -6,9 +6,9 @@
 //! sides collapse into `.common` entries and only the actual changes
 //! surface as `.left` (removed) / `.right` (added) entries.
 //!
-//! Algorithm: standard O(m*n) dynamic programming. Inputs are at most a
-//! function body (≤ a few hundred lines) so the quadratic table is fine
-//! and not worth the complexity of Myers or Hunt-McIlroy.
+//! Algorithm: standard O(m*n) dynamic programming. Large line products
+//! fall back to an ordinary removed-then-added run before allocating the
+//! quadratic table.
 //!
 //! `text` on each `HunkLine` is a raw slice (no trailing `\n`) into the
 //! caller's `left_slice` / `right_slice`; common lines are taken from the
@@ -18,6 +18,8 @@
 //! novel-span / highlight ranges back to absolute source coordinates.
 
 const std = @import("std");
+
+const max_dp_cells: usize = 1_000_000;
 
 pub const Side = enum { common, left, right };
 
@@ -50,9 +52,13 @@ fn splitLines(arena: std.mem.Allocator, slice: []const u8) ![]const SourceLine {
     while (true) {
         const rest = slice[cursor..];
         const nl_rel = std.mem.indexOfScalar(u8, rest, '\n');
-        const raw = if (nl_rel) |p| rest[0..p] else rest;
-        if (raw.len == 0 and nl_rel == null and !first) break;
+        const raw_with_cr = if (nl_rel) |p| rest[0..p] else rest;
+        if (raw_with_cr.len == 0 and nl_rel == null and !first) break;
         first = false;
+        const raw = if (raw_with_cr.len > 0 and raw_with_cr[raw_with_cr.len - 1] == '\r')
+            raw_with_cr[0 .. raw_with_cr.len - 1]
+        else
+            raw_with_cr;
         try out.append(arena, .{ .text = raw, .offset = @intCast(cursor) });
         if (nl_rel) |p| {
             cursor += p + 1;
@@ -70,9 +76,13 @@ fn computeLcs(
     const n = right_lines.len;
     const stride = n + 1;
 
-    // dp[i * stride + j] = LCS length of left[..i] and right[..j].
-    const dp = try arena.alloc(u32, (m + 1) * stride);
-    defer arena.free(dp);
+    // Keep the quadratic backtracking table out of the long-lived view arena.
+    // It is scratch data and must be released as soon as this hunk is built.
+    const dp_len = std.math.mul(usize, m + 1, stride) catch
+        return unmatchedLines(arena, left_lines, right_lines);
+    if (dp_len > max_dp_cells) return unmatchedLines(arena, left_lines, right_lines);
+    const dp = try std.heap.page_allocator.alloc(u32, dp_len);
+    defer std.heap.page_allocator.free(dp);
     @memset(dp, 0);
 
     var i: usize = 1;
@@ -117,9 +127,44 @@ fn computeLcs(
     return try out.toOwnedSlice(arena);
 }
 
+fn unmatchedLines(
+    arena: std.mem.Allocator,
+    left: []const SourceLine,
+    right: []const SourceLine,
+) ![]const HunkLine {
+    const out = try arena.alloc(HunkLine, left.len + right.len);
+    for (left, 0..) |line, i| out[i] = .{
+        .side = .left,
+        .text = line.text,
+        .offset = line.offset,
+    };
+    for (right, 0..) |line, i| out[left.len + i] = .{
+        .side = .right,
+        .text = line.text,
+        .offset = line.offset,
+    };
+    return out;
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "computeLcs: oversized line grid falls back to unmatched lines" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const left = try arena.alloc(SourceLine, 1000);
+    const right = try arena.alloc(SourceLine, 1000);
+    @memset(left, .{ .text = "left", .offset = 0 });
+    @memset(right, .{ .text = "right", .offset = 0 });
+
+    const hs = try computeLcs(arena, left, right);
+    try testing.expectEqual(@as(usize, 2000), hs.len);
+    try testing.expectEqual(Side.left, hs[0].side);
+    try testing.expectEqual(Side.right, hs[1000].side);
+}
 
 test "hunk: identical slices → every line is .common" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -237,6 +282,16 @@ test "hunk: offset points at the line's start inside its source slice" {
     try testing.expectEqual(@as(u32, 0), out[0].offset);
     try testing.expectEqual(@as(u32, 4), out[1].offset);
     try testing.expectEqual(@as(u32, 7), out[2].offset);
+}
+
+test "hunk: CRLF is stripped from display text" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    const hs = try hunk(arena_state.allocator(), "a\r\nb\r\n", "a\r\nc\r\n");
+    for (hs) |entry| {
+        try testing.expect(std.mem.indexOfScalar(u8, entry.text, '\r') == null);
+    }
 }
 
 test "hunk: trailing newline does not yield a phantom empty line" {

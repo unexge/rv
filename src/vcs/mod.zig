@@ -21,6 +21,7 @@ pub const ChangeKind = enum {
     renamed,
     binary,
     unsupported,
+    unavailable,
 };
 
 /// Added / removed line counts as reported by `git diff --numstat`.

@@ -30,6 +30,7 @@ pub const EditScript = @import("diff/edit.zig").EditScript;
 
 pub const diffSources = @import("diff/engine.zig").diffSources;
 pub const EngineError = @import("diff/engine.zig").EngineError;
+pub const max_source_bytes = @import("diff/engine.zig").max_source_bytes;
 
 // Ensure submodule tests are picked up by `zig build test`.
 comptime {

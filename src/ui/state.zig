@@ -26,6 +26,7 @@ pub fn declId(decl: rv.Decl) DeclId {
 }
 
 pub const AppState = struct {
+    gpa: std.mem.Allocator,
     scroll_y: usize = 0,
     /// Absolute row (in the current view's coordinates) that the cursor
     /// sits on. Starts at the first line. Clamped to the view's row count
@@ -41,9 +42,16 @@ pub const AppState = struct {
     /// Default is collapsed because the file-wide builder always emits
     /// gaps in their collapsed form first.
     expanded_gaps: std.AutoHashMap(GapId, void),
+    /// Active search query. While `search_editing` is true, key text updates
+    /// this buffer incrementally; after Enter it remains active for n/N.
+    search_query: std.ArrayList(u8) = .empty,
+    search_editing: bool = false,
+    search_collapsed_snapshot: ?std.AutoHashMap(DeclId, void) = null,
+    search_gaps_snapshot: ?std.AutoHashMap(GapId, void) = null,
 
     pub fn init(gpa: std.mem.Allocator) AppState {
         return .{
+            .gpa = gpa,
             .collapsed = .init(gpa),
             .expanded_gaps = .init(gpa),
         };
@@ -52,6 +60,44 @@ pub const AppState = struct {
     pub fn deinit(self: *AppState) void {
         self.collapsed.deinit();
         self.expanded_gaps.deinit();
+        self.search_query.deinit(self.gpa);
+        if (self.search_collapsed_snapshot) |*snapshot| snapshot.deinit();
+        if (self.search_gaps_snapshot) |*snapshot| snapshot.deinit();
+    }
+
+    pub fn beginSearch(self: *AppState, view: anytype) !void {
+        if (self.search_collapsed_snapshot == null) {
+            var collapsed_snapshot = try self.collapsed.clone();
+            const gaps_snapshot = self.expanded_gaps.clone() catch |err| {
+                collapsed_snapshot.deinit();
+                return err;
+            };
+            self.search_collapsed_snapshot = collapsed_snapshot;
+            self.search_gaps_snapshot = gaps_snapshot;
+        }
+        self.search_query.clearRetainingCapacity();
+        self.search_editing = true;
+        self.expandAll();
+        self.expandAllGaps(view) catch |err| {
+            _ = self.restoreSearch();
+            return err;
+        };
+    }
+
+    /// Restore the exact fold state from before `/` was pressed. Returns
+    /// false when no search snapshot is active.
+    pub fn restoreSearch(self: *AppState) bool {
+        const collapsed = self.search_collapsed_snapshot orelse return false;
+        const gaps = self.search_gaps_snapshot.?;
+        self.collapsed.deinit();
+        self.expanded_gaps.deinit();
+        self.collapsed = collapsed;
+        self.expanded_gaps = gaps;
+        self.search_collapsed_snapshot = null;
+        self.search_gaps_snapshot = null;
+        self.search_query.clearRetainingCapacity();
+        self.search_editing = false;
+        return true;
     }
 
     pub fn isCollapsed(self: *const AppState, id: DeclId) bool {

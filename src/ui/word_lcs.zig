@@ -11,8 +11,8 @@
 //! never lands mid-codepoint and the renderer can never emit a broken
 //! char. Match cells store byte ranges, so the output `Run.bytes`
 //! still slices into the original input buffers verbatim. Inputs are
-//! at most one source line (≤ a few hundred bytes after tab expansion
-//! is still small) so the quadratic table is fine.
+//! at most one source line. Large line products fall back to whole-line
+//! removed/added runs before allocating the quadratic table.
 //!
 //! Invalid UTF-8: if either side fails to validate we fall back to a
 //! byte-level DP. This keeps the function total even if upstream feeds
@@ -26,6 +26,8 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+
+const max_dp_cells: usize = 262_144;
 
 pub const Side = enum { common, removed, added };
 
@@ -52,6 +54,18 @@ pub fn diff(arena: Allocator, left: []const u8, right: []const u8) ![]const Run 
         return try out.toOwnedSlice(arena);
     }
 
+    // UTF-8 uses at most four bytes per codepoint. If even that best case
+    // cannot fit the bounded grid, avoid decoding the same huge line for
+    // every candidate pair in line alignment.
+    const max_utf8_cell_bytes = max_dp_cells * 16;
+    const left_cells = std.math.add(usize, left.len, 1) catch
+        return replacementRuns(arena, left, right);
+    const right_cells = std.math.add(usize, right.len, 1) catch
+        return replacementRuns(arena, left, right);
+    const byte_cells = std.math.mul(usize, left_cells, right_cells) catch
+        return replacementRuns(arena, left, right);
+    if (byte_cells > max_utf8_cell_bytes) return replacementRuns(arena, left, right);
+
     // Walk each input as codepoints. If either side fails to validate,
     // fall back to a byte-level grid (preserves the previous behaviour
     // for malformed inputs, which never appear in real source code).
@@ -59,9 +73,13 @@ pub fn diff(arena: Allocator, left: []const u8, right: []const u8) ![]const Run 
         return diffBytes(arena, left, right);
     }
 
-    const left_units = try buildUnits(arena, left);
-    const right_units = try buildUnits(arena, right);
-    return diffUnits(arena, left, right, left_units, right_units);
+    var scratch_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    const left_units = try buildUnits(scratch, left);
+    const right_units = try buildUnits(scratch, right);
+    return diffUnits(arena, scratch, left, right, left_units, right_units);
 }
 
 /// Byte range of one codepoint inside its source buffer. `len` is the
@@ -88,6 +106,7 @@ fn unitBytes(buf: []const u8, u: Unit) []const u8 {
 
 fn diffUnits(
     arena: Allocator,
+    scratch: Allocator,
     left: []const u8,
     right: []const u8,
     lu: []const Unit,
@@ -99,8 +118,10 @@ fn diffUnits(
 
     // dp[i * stride + j] = LCS length (in codepoints) of lu[..i] and
     // ru[..j].
-    const dp = try arena.alloc(u32, (m + 1) * stride);
-    defer arena.free(dp);
+    const dp_len = std.math.mul(usize, m + 1, stride) catch
+        return replacementRuns(arena, left, right);
+    if (dp_len > max_dp_cells) return replacementRuns(arena, left, right);
+    const dp = try scratch.alloc(u32, dp_len);
     @memset(dp, 0);
 
     var i: usize = 1;
@@ -162,12 +183,18 @@ fn diffUnits(
 }
 
 fn diffBytes(arena: Allocator, left: []const u8, right: []const u8) ![]const Run {
+    var scratch_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
     const m = left.len;
     const n = right.len;
     const stride = n + 1;
 
-    const dp = try arena.alloc(u32, (m + 1) * stride);
-    defer arena.free(dp);
+    const dp_len = std.math.mul(usize, m + 1, stride) catch
+        return replacementRuns(arena, left, right);
+    if (dp_len > max_dp_cells) return replacementRuns(arena, left, right);
+    const dp = try scratch.alloc(u32, dp_len);
     @memset(dp, 0);
 
     var i: usize = 1;
@@ -221,6 +248,13 @@ fn diffBytes(arena: Allocator, left: []const u8, right: []const u8) ![]const Run
     return try out.toOwnedSlice(arena);
 }
 
+fn replacementRuns(arena: Allocator, left: []const u8, right: []const u8) ![]const Run {
+    var out: std.ArrayList(Run) = .empty;
+    if (left.len > 0) try out.append(arena, .{ .side = .removed, .bytes = left });
+    if (right.len > 0) try out.append(arena, .{ .side = .added, .bytes = right });
+    return out.toOwnedSlice(arena);
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -234,6 +268,19 @@ test "diff: identical inputs → one common run" {
     try testing.expectEqual(@as(usize, 1), out.len);
     try testing.expectEqual(Side.common, out[0].side);
     try testing.expectEqualStrings("hello", out[0].bytes);
+}
+
+test "diff: oversized codepoint grid falls back to whole-line runs" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const left = "a" ** 512;
+    const right = "b" ** 512;
+    const out = try diff(a, left, right);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(Side.removed, out[0].side);
+    try testing.expectEqual(Side.added, out[1].side);
 }
 
 test "diff: disjoint inputs → one removed run + one added run" {

@@ -584,7 +584,7 @@ fn projectChanged(
                 c.old,
                 c.new,
                 id,
-                indent + 1,
+                indent,
                 cursors,
                 ig_annotation,
             );
@@ -646,7 +646,9 @@ fn projectChangedLeaf(
 /// Render a paired import-group `Changed` decl as one synthetic
 /// `.changed` source row via `line_mod.buildImportGroupLine`, stamping
 /// it with the decl's id and inline annotation so it shows up in
-/// `decl_index` like any other navigable decl row.
+/// `decl_index` like any other navigable decl row. The builder synthesizes
+/// text from `use` onward, so prepend the right declaration's source indent
+/// and shift its highlight spans to keep it aligned with sibling rows.
 ///
 /// The single emitted line stands in for whatever physical line range
 /// each side spanned, so per-side line cursors advance by
@@ -667,6 +669,22 @@ fn projectChangedImportGroup(
     annotation: ?[]const u8,
 ) !void {
     var line = try line_mod.buildImportGroupLine(arena, group, indent);
+
+    const new_range = new_decl.list.byte_range;
+    const source_line_start = line_mod.lineStart(file_diff.right_source, new_range.start);
+    const raw_source_indent = file_diff.right_source[source_line_start..new_range.start];
+    const source_indent = try line_mod.expandTabs(arena, raw_source_indent);
+    line.text = try std.fmt.allocPrint(arena, "{s}{s}", .{ source_indent, line.text });
+
+    const shifted_highlights = try arena.alloc(line_mod.HighlightSpan, line.highlights.len);
+    const indent_width: u32 = @intCast(source_indent.len);
+    for (line.highlights, shifted_highlights) |highlight, *shifted| {
+        shifted.* = highlight;
+        shifted.start += indent_width;
+        shifted.end += indent_width;
+    }
+    line.highlights = shifted_highlights;
+
     line.decl_id = decl_id;
     line.decl_annotation = annotation;
     line.line_no_left = cursors.left_line;
@@ -674,7 +692,6 @@ fn projectChangedImportGroup(
     try out.append(arena, line);
 
     const old_range = old_decl.list.byte_range;
-    const new_range = new_decl.list.byte_range;
     cursors.left_line += countLines(file_diff.left_source[old_range.start..old_range.end]);
     cursors.right_line += countLines(file_diff.right_source[new_range.start..new_range.end]);
 }
@@ -2020,6 +2037,58 @@ test "build: serde import-group renders as one .changed row with `Deserialize` t
         saw_added = true;
     }
     try testing.expect(saw_added);
+}
+
+test "build: nested import-group aligns with surrounding use declarations" {
+    const before =
+        \\mod example {
+        \\    use crate::alpha::alpha;
+        \\    use crate::beta::{Bravo, Charlie, delta, echo};
+        \\    use crate::*;
+        \\}
+    ;
+    const after =
+        \\mod example {
+        \\    use crate::alpha::alpha;
+        \\    use crate::beta::{Bravo, Charlie, delta, echo, foxtrot};
+        \\    use crate::*;
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var context_col: ?usize = null;
+    var changed_col: ?usize = null;
+    var saw_added_highlight = false;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        const source_col = @as(usize, ln.indent) * 2 +
+            (std.mem.indexOf(u8, ln.text, "use ") orelse continue);
+        if (std.mem.indexOf(u8, ln.text, "alpha::alpha") != null) {
+            context_col = source_col;
+        }
+        if (std.mem.indexOf(u8, ln.text, "foxtrot") != null) {
+            changed_col = source_col;
+            for (ln.highlights) |highlight| {
+                const highlighted = ln.text[highlight.start..highlight.end];
+                if (highlight.class == .inline_added and
+                    std.mem.eql(u8, highlighted, "foxtrot"))
+                {
+                    saw_added_highlight = true;
+                }
+            }
+        }
+    }
+
+    try testing.expectEqual(
+        context_col orelse return error.MissingContextUse,
+        changed_col orelse return error.MissingChangedUse,
+    );
+    try testing.expect(saw_added_highlight);
 }
 
 test "build: rumqttc multi-line vs single-line import-group collapses to one row" {

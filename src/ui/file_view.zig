@@ -554,7 +554,7 @@ fn projectChanged(
                 file_diff,
                 state,
                 children,
-                indent + 1,
+                indent,
                 left_range,
                 right_range,
                 cursors,
@@ -1705,30 +1705,30 @@ test "build: adding a trait method keeps existing signatures unchanged" {
     var result = try buildForTest(testing.allocator, &fd, .unified);
     defer result.deinit();
 
-    var saw_trait = false;
-    var saw_alpha = false;
-    var saw_beta = false;
+    var trait_col: ?usize = null;
+    var alpha_col: ?usize = null;
+    var beta_col: ?usize = null;
     var removed_rows: usize = 0;
     for (result.view.unified) |ln| {
         if (ln.kind != .source) continue;
         if (ln.marker == .removed) removed_rows += 1;
-        if (std.mem.indexOf(u8, ln.text, "trait Example") != null) {
+        if (std.mem.indexOf(u8, ln.text, "pub trait Example")) |text_col| {
             try testing.expect(ln.marker != .added and ln.marker != .removed);
-            saw_trait = true;
+            trait_col = @as(usize, ln.indent) * 2 + text_col;
         }
-        if (std.mem.indexOf(u8, ln.text, "fn alpha") != null) {
+        if (std.mem.indexOf(u8, ln.text, "fn alpha")) |text_col| {
             try testing.expect(ln.marker != .added and ln.marker != .removed);
-            saw_alpha = true;
+            alpha_col = @as(usize, ln.indent) * 2 + text_col;
         }
-        if (std.mem.indexOf(u8, ln.text, "fn beta") != null) {
+        if (std.mem.indexOf(u8, ln.text, "fn beta")) |text_col| {
             try testing.expectEqual(line_mod.Marker.added, ln.marker);
-            saw_beta = true;
+            beta_col = @as(usize, ln.indent) * 2 + text_col;
         }
     }
 
-    try testing.expect(saw_trait);
-    try testing.expect(saw_alpha);
-    try testing.expect(saw_beta);
+    try testing.expectEqual(@as(usize, 0), trait_col orelse return error.MissingTrait);
+    try testing.expectEqual(@as(usize, 4), alpha_col orelse return error.MissingAlpha);
+    try testing.expectEqual(@as(usize, 4), beta_col orelse return error.MissingBeta);
     try testing.expectEqual(@as(usize, 0), removed_rows);
 }
 

@@ -39,8 +39,15 @@ pub fn elide(
     defer arena.free(kept);
     @memset(kept, false);
 
-    // 2. Extend anchors by ±context_lines into a "kept" mask.
+    // 2. Keep explicit landmarks with only their preceding context; extend
+    // actual change anchors by ±context_lines into the same mask.
     for (lines, 0..) |ln, i| {
+        if (ln.elision_anchor) {
+            const lo = i -| context_lines;
+            var k = lo;
+            while (k <= i) : (k += 1) kept[k] = true;
+            continue;
+        }
         if (!isChangeAnchor(ln)) continue;
         const lo = i -| context_lines;
         const hi_excl = @min(lines.len, i + context_lines + 1);
@@ -79,10 +86,10 @@ pub fn elide(
     return try out.toOwnedSlice(arena);
 }
 
-/// A row anchors the context window iff its marker reflects a real
-/// change, OR it's a `.decl_anchor` for a non-unchanged decl. Plain
-/// `.unchanged` / `.context` / `.blank` rows are eligible for elision,
-/// as are decl anchors whose decl is itself unchanged.
+/// A row anchors a context window when its marker reflects a real change or
+/// when it is a `.decl_anchor` for a non-unchanged decl. Explicit container
+/// landmarks are handled separately because they retain preceding context
+/// but no following unchanged rows.
 fn isChangeAnchor(line: line_mod.StyledLine) bool {
     return switch (line.marker) {
         .added, .removed, .changed => true,

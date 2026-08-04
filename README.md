@@ -44,7 +44,8 @@ Both inputs must use a supported extension. Source files are limited to less tha
 | `PgUp`, `PgDn`           | Move by one viewport                                             |
 | `Home`, `End`            | Move to first or last row                                        |
 | `Space`, `Enter`         | Expand or collapse the focused declaration or context gap       |
-| `[`, `]`                 | Collapse or expand all                                           |
+| `[`                      | Collapse all declarations and context gaps                      |
+| `]`                      | Expand all declarations while keeping context gaps compact      |
 | `v`                      | Toggle unified and split views                                   |
 | `n`, `p`                 | Next or previous declaration                                     |
 | `N`, `P`                 | Next or previous changed declaration                             |

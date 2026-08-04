@@ -8,7 +8,8 @@
 //! - Key handling: j/k/arrows move the cursor (scroll follows), PgUp/PgDn
 //!   page the cursor, Home/End jump to ends, space/enter toggles collapse
 //!   on the focused decl, `[` collapses every decl with a body, `]`
-//!   expands everything, `v` toggles split vs unified,
+//!   expands declarations while keeping context gaps compact, `v` toggles
+//!   split vs unified,
 //!   `n`/`p` jumps to the next/previous decl header (any kind),
 //!   `N`/`P` jumps between *changed* decls (skipping unchanged ones),
 //!   `g`/`G` jumps to the first/last decl, `/` starts substring search,
@@ -312,7 +313,7 @@ pub fn handleDiffPaneKey(
     } else if (key.matches(']', .{})) {
         const anchor = focusedDeclId(built.view, state.cursor_y);
         state.expandAll();
-        try state.expandAllGaps(built.view);
+        state.collapseAllGaps();
         try rebuild(gpa, built, file_diff, mode.*, state, build_fn);
         relocateCursor(state, built.view, anchor, viewport);
     } else if (key.matches('n', .{})) {
@@ -2483,50 +2484,46 @@ test "handleDiffPaneKey: `[` clears state.expanded_gaps in addition to collapsin
     try testing.expect(any_collapsed);
 }
 
-test "handleDiffPaneKey: `]` expands every gap currently in the view" {
+test "handleDiffPaneKey: `]` expands declarations but keeps context gaps compact" {
     const before =
-        \\pub fn a() void {}
-        \\pub fn b() void {}
-        \\pub fn c() void {}
-        \\pub fn d() void {}
-        \\pub fn e() u32 { return 1; }
-        \\pub fn f() void {}
-        \\pub fn g() void {}
-        \\pub fn h() void {}
-        \\pub fn i() void {}
+        \\pub fn alpha() void {}
+        \\pub fn bravo() void {}
+        \\pub fn charlie() void {}
+        \\pub fn delta() void {}
+        \\pub fn echo() u32 { return 1; }
+        \\pub fn foxtrot() void {}
+        \\pub fn golf() void {}
+        \\pub fn hotel() void {}
+        \\pub fn india() void {}
     ;
     const after =
-        \\pub fn a() void {}
-        \\pub fn b() void {}
-        \\pub fn c() void {}
-        \\pub fn d() void {}
-        \\pub fn e() u32 { return 2; }
-        \\pub fn f() void {}
-        \\pub fn g() void {}
-        \\pub fn h() void {}
-        \\pub fn i() void {}
+        \\pub fn alpha() void {}
+        \\pub fn bravo() void {}
+        \\pub fn charlie() void {}
+        \\pub fn delta() void {}
+        \\pub fn echo() u32 { return 2; }
+        \\pub fn foxtrot() void {}
+        \\pub fn golf() void {}
+        \\pub fn hotel() void {}
+        \\pub fn india() void {}
     ;
     var fd = try rv.diffSources(testing.allocator, .zig, before, after);
     defer fd.deinit();
 
+    const changed_id = line_mod.declId(fd.entries[4].changed.new);
     var state = AppState.init(testing.allocator);
     defer state.deinit();
+    _ = try state.toggle(changed_id);
+    _ = try state.toggleGap(0xAA);
     var built = try buildFileViewForTest(&fd, &state);
     defer built.deinit();
-
-    // Collect every gap_id currently in the (collapsed) view.
-    var gap_ids: std.ArrayList(GapId) = .empty;
-    defer gap_ids.deinit(testing.allocator);
-    for (built.view.unified) |ln| if (ln.kind == .elided) {
-        if (ln.gap_id) |id| try gap_ids.append(testing.allocator, id);
-    };
-    try testing.expect(gap_ids.items.len >= 1);
 
     var mode: Mode = .unified;
     try handleDiffPaneKey(testing.allocator, keyCp(']'), &built, &fd, &state, &mode, 30, &file_view_mod.build);
 
-    // Every gap that was in the original view is now flagged expanded.
-    for (gap_ids.items) |id| try testing.expect(state.isGapExpanded(id));
+    try testing.expect(!state.isCollapsed(changed_id));
+    try testing.expectEqual(@as(usize, 0), state.expanded_gaps.count());
+    try testing.expect(firstElidedRow(built.view.unified) != null);
 }
 
 test "toggleFocusedGap: cursor on non-elided row is a no-op" {

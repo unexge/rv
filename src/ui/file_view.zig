@@ -600,7 +600,8 @@ fn projectChanged(
 /// `annotation` is stamped onto the first emitted hunk row so the
 /// expanded changed leaf still carries the `(name, ts_kind[, moved
 /// N → M])` annotation that the dropped `.decl_anchor` row used to
-/// surface.
+/// surface. Leaf-backed container declarations such as Rust enums also
+/// preserve that opening row as an elision landmark.
 fn projectChangedLeaf(
     arena: Allocator,
     out: *std.ArrayList(line_mod.StyledLine),
@@ -637,6 +638,7 @@ fn projectChangedLeaf(
         }
         if (!stamped) {
             sl.decl_annotation = annotation;
+            sl.elision_anchor = new_decl.kind == .container;
             stamped = true;
         }
         try out.append(arena, sl);
@@ -739,16 +741,13 @@ fn formatDeclAnnotation(
     return std.fmt.allocPrint(arena, "({s}, {s})", .{ name, decl.ts_kind });
 }
 
-/// Stamp `annotation` onto the first unowned `.source` row in `slice`
-/// and tag that row with `decl_id`. "Unowned" means `decl_id == null`,
-/// i.e. the row was emitted by `emitGap` rather than by a child decl's
-/// projection. Used by the changed-container case where the container's
-/// signature line surfaces inside the recursion as a gap row that
-/// doesn't otherwise belong to any decl. No-op when `annotation` is
-/// null or no unowned source row exists (e.g. when the container and
-/// its first child share a line and the leading gap is empty); in that
-/// degenerate case the container is left un-navigable rather than
-/// hijacking a child decl's row.
+/// Stamp `annotation` onto the first unowned `.source` row in `slice`, tag
+/// that row with `decl_id`, and preserve it as the changed container's opening
+/// landmark. "Unowned" means `decl_id == null`, i.e. the row was emitted by
+/// `emitGap` rather than by a child decl's projection. No-op when `annotation`
+/// is null or no unowned source row exists (e.g. when the container and its
+/// first child share a line); in that degenerate case the container is left
+/// un-navigable rather than hijacking a child decl's row.
 fn stampDeclAnnotationOnFirstSource(
     slice: []line_mod.StyledLine,
     annotation: ?[]const u8,
@@ -760,6 +759,7 @@ fn stampDeclAnnotationOnFirstSource(
         if (sl.decl_id != null) return;
         sl.decl_annotation = ann;
         sl.decl_id = decl_id;
+        sl.elision_anchor = true;
         return;
     }
 }
@@ -1730,6 +1730,132 @@ test "build: adding a trait method keeps existing signatures unchanged" {
     try testing.expectEqual(@as(usize, 4), alpha_col orelse return error.MissingAlpha);
     try testing.expectEqual(@as(usize, 4), beta_col orelse return error.MissingBeta);
     try testing.expectEqual(@as(usize, 0), removed_rows);
+}
+
+test "build: changed trait keeps its container start around an added method" {
+    const before =
+        \\/// Example transport.
+        \\///
+        \\/// Implementations own their lifecycle.
+        \\pub trait Example {
+        \\    /// Returns alpha.
+        \\    fn alpha(&self) -> u32;
+        \\
+        \\    /// Returns bravo.
+        \\    fn bravo(&self) -> u32;
+        \\
+        \\    /// Returns charlie.
+        \\    fn charlie(&self) -> u32;
+        \\
+        \\    /// Returns delta.
+        \\    fn delta(&self) -> u32;
+        \\}
+    ;
+    const after =
+        \\/// Example transport.
+        \\///
+        \\/// Implementations own their lifecycle.
+        \\pub trait Example {
+        \\    /// Returns alpha.
+        \\    fn alpha(&self) -> u32;
+        \\
+        \\    /// Returns bravo.
+        \\    fn bravo(&self) -> u32;
+        \\
+        \\    /// Returns charlie.
+        \\    fn charlie(&self) -> u32;
+        \\
+        \\    /// Returns delta.
+        \\    fn delta(&self) -> u32;
+        \\
+        \\    /// Returns echo.
+        \\    fn echo(&self) -> u32 { 5 }
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_trait_doc = false;
+    var trait_row: ?usize = null;
+    var echo_row: ?usize = null;
+    for (result.view.unified, 0..) |ln, row| {
+        if (std.mem.indexOf(u8, ln.text, "Example transport") != null) saw_trait_doc = true;
+        if (std.mem.indexOf(u8, ln.text, "pub trait Example") != null) trait_row = row;
+        if (std.mem.indexOf(u8, ln.text, "fn echo") != null) echo_row = row;
+    }
+
+    try testing.expect(saw_trait_doc);
+    const start = trait_row orelse return error.MissingTraitStart;
+    const change = echo_row orelse return error.MissingAddedMethod;
+    try testing.expect(start < change);
+    try testing.expectEqual(line_mod.LineKind.elided, result.view.unified[start + 1].kind);
+    var saw_elided_between = false;
+    for (result.view.unified[start + 1 .. change]) |ln| {
+        if (ln.kind == .elided) saw_elided_between = true;
+    }
+    try testing.expect(saw_elided_between);
+}
+
+test "build: added enum variant keeps only nearby leaf context" {
+    const before =
+        \\/// Example categories.
+        \\enum ExampleError {
+        \\    Alpha,
+        \\    Bravo,
+        \\    Charlie,
+        \\    /// Documents delta.
+        \\    /// More delta details.
+        \\    /// Documents echo.
+        \\    /// More echo details.
+        \\    Echo,
+        \\    Foxtrot,
+        \\}
+    ;
+    const after =
+        \\/// Example categories.
+        \\enum ExampleError {
+        \\    Alpha,
+        \\    Bravo,
+        \\    Charlie,
+        \\    /// Documents delta.
+        \\    /// More delta details.
+        \\    Delta,
+        \\    /// Documents echo.
+        \\    /// More echo details.
+        \\    Echo,
+        \\    Foxtrot,
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_enum_doc = false;
+    var enum_row: ?usize = null;
+    var saw_charlie = false;
+    var saw_delta = false;
+    for (result.view.unified, 0..) |ln, row| {
+        if (std.mem.indexOf(u8, ln.text, "Example categories") != null) saw_enum_doc = true;
+        if (std.mem.indexOf(u8, ln.text, "enum ExampleError") != null) enum_row = row;
+        if (std.mem.indexOf(u8, ln.text, "Charlie") != null) saw_charlie = true;
+        if (std.mem.indexOf(u8, ln.text, "Delta") != null) {
+            try testing.expectEqual(line_mod.Marker.added, ln.marker);
+            saw_delta = true;
+        }
+    }
+
+    try testing.expect(saw_enum_doc);
+    const start = enum_row orelse return error.MissingEnumStart;
+    try testing.expectEqual(line_mod.LineKind.elided, result.view.unified[start + 1].kind);
+    try testing.expect(saw_charlie);
+    try testing.expect(saw_delta);
 }
 
 test "build: nested decl's first source line preserves source-column indent" {

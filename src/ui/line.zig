@@ -130,6 +130,9 @@ pub const StyledLine = struct {
     /// Stable identity of the elided gap this row represents. Set only
     /// on `.elided` rows; `null` everywhere else.
     gap_id: ?GapId = null,
+    /// Preserve this row and its preceding context during unchanged-line
+    /// elision. Set on the opening landmark of an expanded changed container.
+    elision_anchor: bool = false,
     /// Trailing dim annotation rendered to the right of `text`. Used by
     /// the file-wide builder to stamp a decl's `(name, ts_kind[, moved
     /// N → M])` onto its first source row in lieu of a dedicated

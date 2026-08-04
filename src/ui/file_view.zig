@@ -566,7 +566,7 @@ fn projectChanged(
             stampDeclAnnotationOnFirstSource(out.items[start_idx..], annotation, id);
         },
         .leaf => |script| {
-            try projectChangedLeaf(arena, out, file_diff, script, c.old, c.new, id, indent + 1, cursors, annotation);
+            try projectChangedLeaf(arena, out, file_diff, script, c.old, c.new, id, indent, cursors, annotation);
         },
         .import_group => |group| {
             // Import-group annotation reads `(<prefix>, use_group)` rather
@@ -1638,6 +1638,48 @@ test "build: nested container decl emits correct per-side line numbers" {
     }
     try testing.expect(saw_one);
     try testing.expect(saw_two);
+}
+
+test "build: changed method aligns with an added sibling" {
+    const before =
+        \\impl Example {
+        \\    pub fn beta(&self) -> u32 {
+        \\        self.value
+        \\    }
+        \\}
+    ;
+    const after =
+        \\impl Example {
+        \\    pub fn alpha(&self) -> u32 {
+        \\        0
+        \\    }
+        \\
+        \\    pub fn beta(&self) -> u32 {
+        \\        self.value + 1
+        \\    }
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var added_col: ?usize = null;
+    var changed_col: ?usize = null;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        const text_col = std.mem.indexOf(u8, ln.text, "pub fn ") orelse continue;
+        const source_col = @as(usize, ln.indent) * 2 + text_col;
+        if (std.mem.indexOf(u8, ln.text, "alpha") != null) added_col = source_col;
+        if (std.mem.indexOf(u8, ln.text, "beta") != null) changed_col = source_col;
+    }
+
+    try testing.expectEqual(
+        added_col orelse return error.MissingAddedMethod,
+        changed_col orelse return error.MissingChangedMethod,
+    );
 }
 
 test "build: nested decl's first source line preserves source-column indent" {

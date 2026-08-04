@@ -1312,8 +1312,8 @@ fn drawLine(
     drawStyledText(body, row, text_col, sl, base_style, focused, search_query);
 }
 
-/// Render a `… N unchanged lines …` row. Centred dim italic text with a
-/// `⋯` gutter to read as a structural break rather than a source line.
+/// Render a left-aligned `… N unchanged lines …` row. Dim italic text with a
+/// `⋯` gutter reads as a structural break rather than a source line.
 /// When focused, the gutter swaps to `>` and the body text loses the dim
 /// bit so it reads as "press space to expand".
 fn drawElidedLine(
@@ -1339,20 +1339,10 @@ fn drawElidedLine(
     else
         .{ .dim = true, .italic = true };
 
-    // Centre `sl.text` inside the body width past the line-number gutter
-    // and the 2-col marker gutter. Use vaxis's grapheme-width function so
-    // the multi-byte ellipsis (`\u{2026}`) counts as one column rather
-    // than three (its UTF-8 byte length); without this the text would
-    // drift right of centre.
-    const prefix_cols: u16 = ln_prefix + 2;
-    const avail: u16 = if (body.width > prefix_cols) body.width - prefix_cols else 0;
-    const text_cols: u16 = @min(avail, vaxis.gwidth.gwidth(sl.text, .unicode));
-    const pad: u16 = if (avail > text_cols) (avail - text_cols) / 2 else 0;
-    const text_col: u16 = prefix_cols + pad;
     _ = body.print(&.{.{
         .text = sl.text,
         .style = dimUnlessFocused(text_style, focused),
-    }}, .{ .row_offset = row, .col_offset = text_col, .wrap = .none });
+    }}, .{ .row_offset = row, .col_offset = ln_prefix + 2, .wrap = .none });
 }
 
 /// Render a `.decl_anchor` landmark row above a decl's first source line.
@@ -2810,6 +2800,39 @@ test "drawLineNumber: width=0 is a no-op" {
     while (col < 4) : (col += 1) {
         try testing.expect(screen.readCell(col, 0).?.default);
     }
+}
+
+test "drawElidedLine: aligns text after the marker gutter" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{
+        .cols = 80,
+        .rows = 1,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(testing.allocator);
+
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 80,
+        .height = 1,
+        .screen = &screen,
+    };
+    win.clear();
+
+    const line: StyledLine = .{
+        .indent = 0,
+        .marker = .blank,
+        .kind = .elided,
+        .text = "… 85 unchanged lines …",
+    };
+    const line_number_prefix = 4;
+    drawElidedLine(win, 0, line, line_number_prefix, false, true);
+
+    try testing.expectEqualStrings("⋯", screen.readCell(line_number_prefix, 0).?.char.grapheme);
+    try testing.expectEqualStrings("…", screen.readCell(line_number_prefix + 2, 0).?.char.grapheme);
 }
 
 // ── line-number gutter: end-to-end render ───────────────────────────────

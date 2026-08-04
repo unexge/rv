@@ -1682,6 +1682,56 @@ test "build: changed method aligns with an added sibling" {
     );
 }
 
+test "build: adding a trait method keeps existing signatures unchanged" {
+    const before =
+        \\pub trait Example {
+        \\    /// Returns alpha.
+        \\    fn alpha(&self) -> u32;
+        \\}
+    ;
+    const after =
+        \\pub trait Example {
+        \\    /// Returns alpha.
+        \\    fn alpha(&self) -> u32;
+        \\
+        \\    /// Returns beta.
+        \\    fn beta(&self) -> u32 { 2 }
+        \\}
+    ;
+
+    var fd = try rv.diffSources(testing.allocator, .rust, before, after);
+    defer fd.deinit();
+
+    var result = try buildForTest(testing.allocator, &fd, .unified);
+    defer result.deinit();
+
+    var saw_trait = false;
+    var saw_alpha = false;
+    var saw_beta = false;
+    var removed_rows: usize = 0;
+    for (result.view.unified) |ln| {
+        if (ln.kind != .source) continue;
+        if (ln.marker == .removed) removed_rows += 1;
+        if (std.mem.indexOf(u8, ln.text, "trait Example") != null) {
+            try testing.expect(ln.marker != .added and ln.marker != .removed);
+            saw_trait = true;
+        }
+        if (std.mem.indexOf(u8, ln.text, "fn alpha") != null) {
+            try testing.expect(ln.marker != .added and ln.marker != .removed);
+            saw_alpha = true;
+        }
+        if (std.mem.indexOf(u8, ln.text, "fn beta") != null) {
+            try testing.expectEqual(line_mod.Marker.added, ln.marker);
+            saw_beta = true;
+        }
+    }
+
+    try testing.expect(saw_trait);
+    try testing.expect(saw_alpha);
+    try testing.expect(saw_beta);
+    try testing.expectEqual(@as(usize, 0), removed_rows);
+}
+
 test "build: nested decl's first source line preserves source-column indent" {
     // Regression: tree-sitter's `byte_range.start` for a nested decl
     // points at the first non-whitespace token (e.g. `async` / `fn`),

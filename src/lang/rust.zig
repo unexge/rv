@@ -78,6 +78,7 @@ pub const config: config_mod.LangConfig = .{
     .comment_ts_kinds = &.{ "line_comment", "block_comment" },
     .decl_ts_kinds = &.{
         "function_item",
+        "function_signature_item",
         "struct_item",
         "enum_item",
         "union_item",
@@ -105,6 +106,7 @@ pub const config: config_mod.LangConfig = .{
 
 fn classify(ts_kind: []const u8) result.DeclKind {
     if (std.mem.eql(u8, ts_kind, "function_item")) return .function;
+    if (std.mem.eql(u8, ts_kind, "function_signature_item")) return .function;
     if (std.mem.eql(u8, ts_kind, "struct_item")) return .container;
     if (std.mem.eql(u8, ts_kind, "enum_item")) return .container;
     if (std.mem.eql(u8, ts_kind, "union_item")) return .container;
@@ -173,6 +175,7 @@ fn firstNonKeywordAtom(list: *const node.List) ?[]const u8 {
 fn extractName(list: *const node.List, source: []const u8) ?[]const u8 {
     const ts = list.ts_kind;
     if (std.mem.eql(u8, ts, "function_item") or
+        std.mem.eql(u8, ts, "function_signature_item") or
         std.mem.eql(u8, ts, "struct_item") or
         std.mem.eql(u8, ts, "enum_item") or
         std.mem.eql(u8, ts, "union_item") or
@@ -540,6 +543,7 @@ fn findTopDecl(root: *const node.List, ts_kind: []const u8) ?*const node.List {
 
 test "classify: every listed decl_ts_kind maps to a DeclKind" {
     try testing.expectEqual(result.DeclKind.function, classify("function_item"));
+    try testing.expectEqual(result.DeclKind.function, classify("function_signature_item"));
     try testing.expectEqual(result.DeclKind.container, classify("struct_item"));
     try testing.expectEqual(result.DeclKind.container, classify("enum_item"));
     try testing.expectEqual(result.DeclKind.container, classify("union_item"));
@@ -566,6 +570,19 @@ test "extractName: function_item identifier" {
     const fd = findTopDecl(&fx.res.tree.root.list, "function_item").?;
     const name = extractName(fd, fx.res.tree.source).?;
     try testing.expectEqualStrings("foo", name);
+}
+
+test "extractName: function_signature_item identifier" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var fx = try convertRust(arena.allocator(), "trait Example { fn alpha(&self) -> u32; }\n");
+    defer fx.deinit();
+
+    const trait_decl = findTopDecl(&fx.res.tree.root.list, "trait_item").?;
+    const body = containerListOf(trait_decl).?;
+    const signature = findTopDecl(body, "function_signature_item").?;
+    const name = extractName(signature, fx.res.tree.source).?;
+    try testing.expectEqualStrings("alpha", name);
 }
 
 test "extractName: function_item with pub and async" {
